@@ -7,7 +7,7 @@ sys.path.insert(0, str(root_dir))
 
 
 try:
-    from agent.test_agent_a2a import langchain_agent
+    from agent.report_agent import langchain_agent
 except ImportError:
     print("❌ Error: Could not import 'langchain_agent'.")
     print("Please ensure this test file is in the same directory as your agent file,")
@@ -156,23 +156,35 @@ def test_5_tool_check():
     Test 4: check whether tool call messages would be seen during conversation 
     """
 
-    config = {"configurable": {"thread_id": "test-5-tool-call"}} 
+    config = {"configurable": {"thread_id": "test-6-tool-call"}} 
 
     # --- turn 1 ---
     p1 = "tell me about yourself, tools you can see and give small evaluation on what you think about it. Please reply in exactly one short paragraph."
     print(f"\n[Turn 1 - User]: {p1}")
     r1 = langchain_agent.invoke({"messages": [{"role": "user", "content": p1}]}, config=config)
     print(f"[Turn 1 - Agent]: {r1['messages'][-1].content}")
-    time.sleep(1.5)
+    time.sleep(6)
 
     # --- turn 2 ---
     p1 = "check weather in washington and also tell me your small anaysis of it. Please reply in exactly one short paragraph."
     print(f"\n[Turn 2 - User]: {p1}")
     r1 = langchain_agent.invoke({"messages": [{"role": "user", "content": p1}]}, config=config)
     print(f"[Turn 2 - Agent]: {r1['messages'][-1].content}")
-    time.sleep(1.5)
+    time.sleep(6)
 
 
+    p1 = "tell me what weather in paris. Please reply in exactly one short paragraph."
+    print(f"\n[Turn 3 - User]: {p1}")
+    r1 = langchain_agent.invoke({"messages": [{"role": "user", "content": p1}]}, config=config)
+    print(f"[Turn 3 - Agent]: {r1['messages'][-1].content}")
+    time.sleep(6)
+
+
+    p1 = "tell me what i asked you?. Please reply in exactly one short paragraph."
+    print(f"\n[Turn 4 - User]: {p1}")
+    r1 = langchain_agent.invoke({"messages": [{"role": "user", "content": p1}]}, config=config)
+    print(f"[Turn 4 - Agent]: {r1['messages'][-1].content}")
+    time.sleep(6)
 
 
 if __name__ == "__main__":

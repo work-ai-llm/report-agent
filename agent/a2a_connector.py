@@ -1,19 +1,14 @@
-import os
-from pathlib import Path
-from dotenv import load_dotenv
-from langchain.agents import create_agent
-from langchain.tools import tool
-from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.checkpoint.postgres import PostgresSaver  
-from psycopg_pool import ConnectionPool
-from psycopg.rows import dict_row
+import uvicorn
+from starlette.applications import Starlette
 
+import uuid
 # A2A SDK Imports
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
 from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
+from a2a.types import Task, TaskStatus, TaskState
 from a2a.types import (
     AgentCapabilities,
     AgentCard,
@@ -21,7 +16,6 @@ from a2a.types import (
     AgentSkill,
     TaskState
 )
-
 from a2a.helpers import (
     new_task_from_user_message,
     get_message_text,
@@ -29,69 +23,16 @@ from a2a.helpers import (
     new_text_part,
 )
 
-
-import uuid
-import uvicorn
-from starlette.applications import Starlette
-
-load_dotenv()
-
-
-@tool
-def get_weather(city: str) -> str:
-    """Get the current weather for a specific city."""
-    # In a real app, this would call a weather API
-    return f"The weather in {city} is sunny and 70°C."
-
-
-sys_prompt_path = Path(__file__).parent / "reports.md"
-
-if not sys_prompt_path.exists():
-    raise FileNotFoundError(f"Could not find prompt file at {sys_prompt_path}")
-
-# Read the entire contents of the file into a string
-system_prompt_text = sys_prompt_path.read_text(encoding="utf-8")
-print(f"✅ Loaded system prompt ({len(system_prompt_text)} characters)")
-
-
-DB_URI = os.getenv("POSTGRES_URI")
-
-
-
-# 1. Manually create the connection pool
-# This opens the connection and keeps it alive for the lifetime of the script
-pool = ConnectionPool(
-    conninfo=DB_URI,
-    kwargs={
-        "autocommit": True,       # Required by LangGraph
-        "prepare_threshold": 0,   # Recommended for connection pools
-        "row_factory": dict_row,  # Required by LangGraph to read rows as dictionaries
-    }
-)
-
-
-checkpointer = PostgresSaver(pool)
-
-checkpointer.setup()
-
-langchain_agent = create_agent(
-    model="mistral-large-2512",
-    system_prompt=system_prompt_text,
-    tools=[get_weather],
-    #checkpointer=InMemorySaver()
-    checkpointer=checkpointer
-)
-
-
+# Import the agent from the agent folder
+from report_agent import langchain_agent
+import pprint
 
 # ==========================================
-# 2. Create the A2A Executor (The Bridge)
+# 1. Create the A2A Executor (The Bridge)
 # ==========================================
 class MistralA2AExecutor(AgentExecutor):
-    """
-    Bridges the A2A protocol to the LangChain agent.
-    """
     def __init__(self) -> None:
+        # Attach the imported agent
         self.agent = langchain_agent
 
     async def execute(
@@ -99,14 +40,25 @@ class MistralA2AExecutor(AgentExecutor):
         context: RequestContext,
         event_queue: EventQueue,
     ) -> None:
-        """Process user request."""
         # 1. Collect a task from request context
+        #pprint.pprint(vars(context))
         if context.current_task:
             task = context.current_task
+            #print("current", task)
         else:
-            # 1.1 If there is no task, create one and add it to event queue
-            task = new_task_from_user_message(context.message)
+            #task = new_task_from_user_message(context.message)
+
+            ctx_id = context.message.context_id
+            
+            task = Task(
+                id=context.message.task_id, # <-- auto generated task_id by request handler
+                context_id=ctx_id, # <--- THIS PRESERVES THE CLIENT'S CONTEXT ID
+                status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
+                history=[context.message],
+            )
+
             await event_queue.enqueue_event(task)
+            #print("new task:\n", task)
 
         # 2. Update task status in EventQueue using TaskUpdater class object
         task_updater = TaskUpdater(
@@ -120,10 +72,10 @@ class MistralA2AExecutor(AgentExecutor):
         # 3. Collect user request and invoke LLM agent to generate content
         query = get_message_text(context.message)
         if query:
-            # Invoking LangChain agent using simple role/content format as requested
-            # Prefix the text to indicate it's from another agent
+            # Prefix to indicate it's from another agent
             agent_query = f"[Incoming message from another AI Agent]: {query}"
             config = {"configurable": {"thread_id": task.context_id}}
+            
             result = self.agent.invoke(
                 {"messages": [{"role": "user", "content": agent_query}]}, 
                 config=config
@@ -147,9 +99,8 @@ class MistralA2AExecutor(AgentExecutor):
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         pass
 
-
 # ==========================================
-# 3. Setup and Run the A2A Server
+# 2. Setup and Run the A2A Server
 # ==========================================
 def main():
     # Define the agent's skills (capabilities)
@@ -163,6 +114,10 @@ def main():
         examples=['What is the weather in Paris?', 'Hello!'],
     )
 
+    # DEFINE YOUR LOCAL NETWORK IP HERE
+    LOCAL_IP = "192.168.0.107"
+    PORT = 9999
+    
     # Define the public-facing Agent Card
     public_agent_card = AgentCard(
         name='Mistral Weather Agent',
@@ -174,7 +129,7 @@ def main():
         supported_interfaces=[
             AgentInterface(
                 protocol_binding='JSONRPC',
-                url='http://127.0.0.1:9999',
+                url=f'http://{LOCAL_IP}:{PORT}', # Advertise the network IP
             )
         ],
         skills=[skill],
@@ -194,12 +149,11 @@ def main():
 
     app = Starlette(routes=routes)
 
-    print("🚀 A2A Server running at http://127.0.0.1:9999")
-    print("📇 Agent Card available at: http://127.0.0.1:9999/.well-known/agent-card.json")
+    print(f"🚀 A2A Server running at http://{LOCAL_IP}:{PORT}")
+    print(f"📇 Agent Card available at: http://{LOCAL_IP}:{PORT}/.well-known/agent-card.json")
     
-    # Run the server
-    uvicorn.run(app, host='127.0.0.1', port=9999)
+    # CRITICAL: host='0.0.0.0' allows connections from the local network
+    uvicorn.run(app, host=LOCAL_IP, port=PORT)
 
 if __name__ == "__main__":
-    #main()
-    pass
+    main()
