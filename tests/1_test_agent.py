@@ -15,6 +15,17 @@ except ImportError:
     sys.exit(1)
 
 
+def resume_interrupted_thread(thread_id: str):
+    print(f"Resuming thread: {thread_id}")
+    config = {"configurable": {"thread_id": thread_id}}
+    
+    # PASSING 'None' AS INPUT IS THE MAGIC KEY TO RESUME
+    result = langchain_agent.invoke(None, config=config)
+    
+    print("Resumed successfully!")
+    print(result["messages"][-1].content)
+
+
 def system_prompt_test():
     
     # ==========================================
@@ -187,6 +198,71 @@ def test_5_tool_check():
     time.sleep(6)
 
 
+
+def test_6_virtual_filesystem_check():
+    """
+    Test 6: check whether agent sees seeded context files and can write in there 
+    """
+
+    config = {"configurable": {"thread_id": "test-6.12-virtual-filesystem"}} 
+
+    # --- turn 1 ---
+    p1 = "Can you check what files are available for you, report it to me and also make a small description on each of them"
+    print(f"\n[Turn 1 - User]: {p1}")
+    r1 = langchain_agent.invoke({"messages": [{"role": "user", "content": p1}]}, config=config)
+    print(f"[Turn 1 - Agent]: {r1['messages'][-1].content}")
+
+    # --- turn 2 ---
+    p1 = "can you read part of them, and then give me short descrition?"
+    print(f"\n[Turn 2 - User]: {p1}")
+    r1 = langchain_agent.invoke({"messages": [{"role": "user", "content": p1}]}, config=config)
+    print(f"[Turn 2 - Agent]: {r1['messages'][-1].content}")
+
+    # --- turn 3 ---
+    p1 = "no. you can read files, read files and then tell me about them, do not make guesses, do not lie you read them"
+    print(f"\n[Turn 3 - User]: {p1}")
+    r1 = langchain_agent.invoke({"messages": [{"role": "user", "content": p1}]}, config=config)
+    print(f"[Turn 3 - Agent]: {r1['messages'][-1].content}")
+
+def test_7_full_report_generation():
+    """
+    Test 7: Full end-to-end report generation.
+    Tests: Virtual FS (ls, read, write), Tool Emulator (list, get, export), 
+    Rate Limiter (long duration), and ModelRetryMiddleware.
+    """
+    config = {"configurable": {"thread_id": "test-7.4-full-report"}}
+    
+    # These prompts are designed to force sequential, multi-step tool usage
+    turns = [
+        "Initialize the report generation for the 'recon' phase. First, list the available context files in /context/, read the recon template, and read the recon interpretation guide. Then, list available findings for session 'sess_001', target '192.168.1.50', phase 'recon'.",
+        
+        "Now, retrieve the 'hosts.md' and 'shares_map.md' from the 'environment_information' layer for that session. Once you have them, start drafting the 'Host Inventory' section of the report based on the template. Write this draft to '/scratchpad/1_host_inventory.md'.",
+        
+        "Next, retrieve 'forest_domains_trusts.md' from the 'environment_information' layer. Draft the 'Active Directory Infrastructure' section and write it to '/scratchpad/2_ad_infrastructure.md'.",
+        
+        "Now, retrieve the 'agent_context.md' from the 'agent_context' layer to understand the reasoning. Draft the 'Security Findings' section (make up some realistic mock findings based on the context) and write it to '/scratchpad/3_security_findings.md'.",
+        
+        "Now that you have written the technical sections in /scratchpad/, read them back one by one. Based on what you wrote, draft an 'Executive Summary' and write it to '/scratchpad/0_executive_summary.md'.",
+        
+        "Finally, read all the files you just created in /scratchpad/ (the executive summary and the 3 technical sections), concatenate them into a single complete markdown report, and save the final compiled report to '/context/reports/sess_001_recon_final.md' using write_file.",
+        
+        "Great. Now, use the export tool to save this final report to the local disk for session 'sess_001' and filename 'sess_001_recon_final.md'."
+    ]
+    
+    for i, prompt in enumerate(turns, 1):
+        print(f"\n{'='*20} [Turn {i} - User] {'='*20}")
+        print(prompt)
+        print(f"{'='*60}")
+        
+        # Invoke the agent
+        r = langchain_agent.invoke({"messages": [{"role": "user", "content": prompt}]}, config=config)
+        
+        print(f"\n[Turn {i} - Agent]:")
+        # Print the last AI message content
+        print(r['messages'][-1].content)
+        print(f"{'='*60}\n")
+
+
 if __name__ == "__main__":
 
 
@@ -197,7 +273,10 @@ if __name__ == "__main__":
     #system_prompt_test()
     #test_3_postgres_sequential()
     #test_4_session_resumption()
-    test_5_tool_check()
+    #test_5_tool_check()
+    #test_6_virtual_filesystem_check()
+    test_7_full_report_generation()
+    #resume_interrupted_thread("test-6.10-virtual-filesystem")
     
     # ==========================================
     # TEST COMPLETE
