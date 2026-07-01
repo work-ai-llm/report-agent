@@ -19,14 +19,31 @@ from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain.agents.middleware import LLMToolEmulator, ModelRetryMiddleware
 from langchain_mistralai import ChatMistralAI # Required to attach rate limiter to the model
 
+# --- NEW: LANGFUSE INITIALIZATION ---
+from langfuse.langchain import CallbackHandler
+from langfuse import get_client
+
+load_dotenv()
+
+ 
+langfuse = get_client()
+ 
+# Verify connection
+if langfuse.auth_check():
+    print("Langfuse client is authenticated and ready!")
+else:
+    print("Authentication failed. Please check your credentials and host.")
+
+# Initialize the handler. It automatically reads LANGFUSE_PUBLIC_KEY, 
+# LANGFUSE_SECRET_KEY, and LANGFUSE_BASE_URL from your .env file.
+langfuse_handler = CallbackHandler()
+
 
 # 1. FORCE LANGCHAIN TO SHOW REAL ERRORS
 #logging.basicConfig(level=logging.DEBUG)
 #logging.getLogger("httpx").setLevel(logging.DEBUG)
 #logging.getLogger("httpcore").setLevel(logging.DEBUG) 
 #logging.getLogger("langchain").setLevel(logging.DEBUG)
-
-load_dotenv()
 
 
 CONTEXT_DIR = Path(__file__).parent / "context"
@@ -69,13 +86,13 @@ def export_report_to_local_disk(
     
     # 1. Define where the FilesystemMiddleware saved it
     # If the agent wrote to "/context/reports/final_recon_report.md"
-    namespace = ("context", "reports")
-    key = report_filename
+    namespace = ("filesystem",)
+    key = f"reports/{report_filename}" 
     
     # 2. Retrieve the JSON document from the Postgres Store
     item = runtime.store.get(namespace, key)
     if not item:
-        return f"ERROR: Could not find report '{key}' in the virtual filesystem."
+        return f"ERROR: Could not find report '{key}' in namespace {namespace}."
         
     # FilesystemMiddleware stores the file content. We extract it safely.
     content = item.value
@@ -214,3 +231,4 @@ langchain_agent = create_agent(
 )
 
 
+langchain_agent = langchain_agent.with_config({"callbacks": [langfuse_handler]})

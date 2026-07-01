@@ -5,7 +5,7 @@ import datetime
 # Add the parent directory to the path so we can import from 'agent'
 sys.path.append(str(Path(__file__).parent.parent))
 
-from agent.report_agent import store, CONTEXT_DIR
+from agent.report_agent import store, langchain_agent
 
 def seed_context_to_store(store_instance, local_context_dir: Path):
     print("Seeding virtual filesystem from local context...")
@@ -57,30 +57,64 @@ def wipe_entire_store(store_instance):
     print("Store is completely empty.\n")
 
 
-def verify_seeded_content(store_instance):
-    """Queries the Postgres Store to verify what was actually saved."""
-    print("Verifying seeded content in Postgres Store...")
+def inspect_global_store(store_instance):
+    """Inspects the PostgresStore (Global '/context/' path)."""
+    print("="*60)
+    print("1. INSPECTING POSTGRES STORE (Global '/context/')")
+    print("="*60)
     
-    # Search the root "context" namespace
-    items = store_instance.search(("context",))
+    # Search the namespace defined in your FilesystemMiddleware
+    items = store_instance.search(("filesystem",)) 
     
     if not items:
-        print("WARNING: No items found in the 'context' namespace.")
+        print("No items found in the ('filesystem',) namespace.")
         return
         
     for item in items:
-        # item.namespace is a tuple, e.g., ('context', 'templates')
-        ns_str = "/".join(item.namespace)
-        print(f"Found: /{ns_str}/{item.key}")
+        print(f"Virtual Path: /context/{item.key}")
+        print(f"Raw Namespace: {item.namespace}")
         
-        # Print a tiny preview to confirm it's not empty
-        content = item.value.get("content", "")
-        preview = content[:60].replace('\n', ' ').strip()
-        print(f"  Preview: '{preview}...'")
+        content = item.value
+        if isinstance(content, dict):
+            content = content.get("content") or content.get("text") or str(content)
+            
+        preview = str(content)[:100].replace('\n', ' ')
+        print(f"Preview: {preview}...\n")
+
+
+def inspect_session_store(agent, thread_id: str):
+    """Inspects the StateBackend (Session-tied '/scratchpad/' path)."""
+    print("="*60)
+    print("2. INSPECTING STATE BACKEND (Session-tied)")
+    print("="*60)
+    
+    config = {"configurable": {"thread_id": thread_id}}
+    state = agent.get_state(config)
+    
+    if not state or not state.values:
+        print("No state found for this thread.")
+        return
         
-    print("Verification complete.")
+    print(f"Available state keys: {list(state.values.keys())}")
+    
+    # Check common keys used by FilesystemMiddleware for session files
+    found_session_files = False
+    for key in ['files', 'filesystem', 'virtual_fs', 'store']:
+        if key in state.values:
+            found_session_files = True
+            print(f"\nFound session files in state key: '{key}'")
+            session_files = state.values[key]
+            if isinstance(session_files, dict):
+                for file_path, file_content in session_files.items():
+                    print(f"  Path: {file_path}")
+                    preview = str(file_content)[:100].replace('\n', ' ')
+                    print(f"  Preview: {preview}...\n")
+                    
+    if not found_session_files:
+        print("No session-specific files found in the state.")
 
 if __name__ == "__main__":
-    seed_context_to_store(store, CONTEXT_DIR)
+    #seed_context_to_store(store, CONTEXT_DIR)
     #wipe_entire_store(store)
-    verify_seeded_content(store)
+    inspect_global_store(store)
+    inspect_session_store(langchain_agent, "test-7.4-full-report")

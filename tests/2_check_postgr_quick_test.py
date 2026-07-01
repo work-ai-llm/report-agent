@@ -78,5 +78,5 @@ if __name__ == "__main__":
     #inspect_thread("test-7.2-full-report") # tool emulator blocked the api access, rate limiter dropped http client tcp connection, requires custom httpx client, also testing vpn access
     #inspect_thread("test-7.3-full-report") # vpn broke connection
     # starting from this, i need another way of monitoring, cmd output exceeds the cmd window limit already
-    inspect_thread("test-7.4-full-report") # worked pretty sweet, the issue was large mistral models was blocked without vpn
-
+    #inspect_thread("test-7.4-full-report") # worked pretty sweet, the issue was large mistral models was blocked without vpn
+    inspect_thread("test-7.5-full-report")

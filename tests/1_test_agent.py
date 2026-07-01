@@ -230,7 +230,7 @@ def test_7_full_report_generation():
     Tests: Virtual FS (ls, read, write), Tool Emulator (list, get, export), 
     Rate Limiter (long duration), and ModelRetryMiddleware.
     """
-    config = {"configurable": {"thread_id": "test-7.4-full-report"}}
+    config = {"configurable": {"thread_id": "test-7.5-full-report"}}
     
     # These prompts are designed to force sequential, multi-step tool usage
     turns = [
