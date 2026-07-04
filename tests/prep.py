@@ -117,4 +117,4 @@ if __name__ == "__main__":
     #seed_context_to_store(store, CONTEXT_DIR)
     #wipe_entire_store(store)
     inspect_global_store(store)
-    inspect_session_store(langchain_agent, "test-7.4-full-report")
+    inspect_session_store(langchain_agent, "737280d4-4a28-4427-b851-de581174c3eb")
