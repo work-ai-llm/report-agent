@@ -6,13 +6,14 @@ from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain.tools import tool, ToolRuntime
 #from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.checkpoint.postgres import PostgresSaver  
-from psycopg_pool import ConnectionPool
+from langgraph.checkpoint.postgres import PostgresSaver
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg_pool import ConnectionPool, AsyncConnectionPool
 from psycopg.rows import dict_row
 
 
 # NEW IMPORTS for Persistent Virtual Filesystem
-from langgraph.store.postgres import PostgresStore
+from langgraph.store.postgres import PostgresStore, AsyncPostgresStore
 from deepagents.middleware import FilesystemMiddleware
 from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
 from langchain_core.rate_limiters import InMemoryRateLimiter
@@ -40,32 +41,14 @@ langfuse_handler = CallbackHandler()
 
 
 # 1. FORCE LANGCHAIN TO SHOW REAL ERRORS
-#logging.basicConfig(level=logging.DEBUG)
-#logging.getLogger("httpx").setLevel(logging.DEBUG)
-#logging.getLogger("httpcore").setLevel(logging.DEBUG) 
-#logging.getLogger("langchain").setLevel(logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG)
+logging.getLogger("httpx").setLevel(logging.DEBUG)
+logging.getLogger("httpcore").setLevel(logging.DEBUG) 
+logging.getLogger("langchain").setLevel(logging.DEBUG)
 
 
 CONTEXT_DIR = Path(__file__).parent / "context"
 
-
-@tool
-def get_finding_file(session_id: str, target: str, phase: str, layer: str, file_name: str) -> str:
-    """
-    Retrieves a specific finding file from the central artifact database.
-    Use this to get context on-demand (e.g., layer='environment_information', file_name='hosts.md').
-    """
-    # MOCK IMPLEMENTATION FOR NOW
-    return f"[MOCK DB] Retrieved content for {file_name} in {layer} for target {target}."
-    
-    # REAL IMPLEMENTATION LATER:
-    # query = "SELECT content FROM pentest_artifacts WHERE ..."
-    # with pool.connection() as conn: ...
-
-@tool
-def list_available_findings(session_id: str, target: str, phase: str) -> str:
-    """Lists all available finding files in the central database for a specific session, target, and phase."""
-    return f"[MOCK DB] Available files for target '{target}' in phase '{phase}': hosts.md, shares_map.md, forest_domains_trusts.md, agent_context.md"
 
 
 @tool
@@ -109,11 +92,6 @@ def export_report_to_local_disk(
     return f"✅ Successfully exported report to local disk: {final_path.absolute()}"
 
 
-@tool
-def get_weather(city: str) -> str:
-    """Get the current weather for a specific city."""
-    # In a real app, this would call a weather API
-    return f"The weather in {city} is sunny and 70°C."
 
 
 sys_prompt_path = Path(__file__).parent / "reports.md"
@@ -131,21 +109,26 @@ DB_URI = os.getenv("POSTGRES_URI")
 
 # 1. Manually create the connection pool
 # This opens the connection and keeps it alive for the lifetime of the script
-pool = ConnectionPool(
+"""pool = ConnectionPool(
     conninfo=DB_URI,
     kwargs={
         "autocommit": True,       # Required by LangGraph
         "prepare_threshold": 0,   # Recommended for connection pools
         "row_factory": dict_row,  # Required by LangGraph to read rows as dictionaries
-    }
+    },
 )
+"""
 
+#checkpointer = PostgresSaver(pool)
+#checkpointer.setup()
 
-checkpointer = PostgresSaver(pool)
-checkpointer.setup()
+#store = PostgresStore(pool)
+#store.setup() # for async it shouldn't be called
 
-store = PostgresStore(pool)
-store.setup() # Call this once at startup to ensure tables exist
+pool = None
+checkpointer = None
+store = None
+langchain_agent = None
 
 
 # 3. Configure the Filesystem Middleware
@@ -193,7 +176,7 @@ llm_small = ChatMistralAI(
 
 # LLM Tool Emulator (Intercepts ONLY these two tools for testing)
 tool_emulator = LLMToolEmulator(
-    tools=["get_finding_file", "export_report_to_local_disk", "list_available_findings"],
+    tools=["export_report_to_local_disk"],
     model=llm_small # Use a fast/cheap model to generate the mock responses
 )
 
@@ -219,16 +202,36 @@ retry_middleware = ModelRetryMiddleware(
     jitter=True
 )
 
+async def initiate_connection():
 
-langchain_agent = create_agent(
-    model=llm,
-    system_prompt=system_prompt_text,
-    tools=[get_weather, get_finding_file, export_report_to_local_disk, list_available_findings],
-    #checkpointer=InMemorySaver()
-    store=store,
-    middleware=[fs_middleware, tool_emulator, retry_middleware],
-    checkpointer=checkpointer
+    global pool, checkpointer, store, langchain_agent
+
+    pool = AsyncConnectionPool(
+    conninfo=DB_URI,
+    kwargs={
+        "autocommit": True,       # Required by LangGraph
+        "prepare_threshold": 0,   # Recommended for connection pools
+        "row_factory": dict_row,  # Required by LangGraph to read rows as dictionaries
+    },
+    open=False 
 )
+    await pool.open()
+    
+    checkpointer = AsyncPostgresSaver(pool)
+    await checkpointer.setup()
+
+    store = AsyncPostgresStore(pool)
+    await store.setup()
+
+    langchain_agent = create_agent(
+        model=llm,
+        system_prompt=system_prompt_text,
+        tools=[export_report_to_local_disk],
+        #checkpointer=InMemorySaver()
+        store=store,
+        middleware=[fs_middleware, tool_emulator, retry_middleware],
+        checkpointer=checkpointer
+    )
 
 
-langchain_agent = langchain_agent.with_config({"callbacks": [langfuse_handler]})
+    langchain_agent = langchain_agent.with_config({"callbacks": [langfuse_handler]})

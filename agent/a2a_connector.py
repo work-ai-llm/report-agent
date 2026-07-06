@@ -1,5 +1,16 @@
+import sys
+import asyncio
+
+# NOTE, this fix loop creation for postgres async connection ONLY if you make "uvicorn<0.36.0"
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 import uvicorn
+from contextlib import asynccontextmanager
 from starlette.applications import Starlette
+import httpx
+import logging
+
 
 import uuid
 # A2A SDK Imports
@@ -7,7 +18,12 @@ from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
-from a2a.server.tasks import InMemoryTaskStore, TaskUpdater
+from a2a.server.tasks import (
+    InMemoryTaskStore, 
+    TaskUpdater, 
+    BasePushNotificationSender,
+    InMemoryPushNotificationConfigStore
+)
 from a2a.types import Task, TaskStatus, TaskState
 from a2a.types import (
     AgentCapabilities,
@@ -23,17 +39,33 @@ from a2a.helpers import (
     new_text_part,
 )
 
-# Import the agent from the agent folder
-from report_agent import langchain_agent
-import pprint
+# Import global variables from report_agent for initialization in lifespan
+import report_agent
+from langchain_core.messages import AIMessage, ToolMessage
+
+
+# Configure standard logger
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# 2. Silence the noisy A2A internal event queue and executor debug spam
+logging.getLogger("a2a.server.events").setLevel(logging.WARNING)
+logging.getLogger("a2a.server.agent_execution").setLevel(logging.WARNING)
+logging.getLogger("a2a.utils").setLevel(logging.WARNING)
+
+# 3. KEEP the route logs at INFO so you can see HTTP requests, 
+# 200 OKs, and client disconnects (e.g., "POST / HTTP/1.1" 200 OK)
+logging.getLogger("a2a.server.routes").setLevel(logging.INFO)
 
 # ==========================================
 # 1. Create the A2A Executor (The Bridge)
 # ==========================================
-class MistralA2AExecutor(AgentExecutor):
+class ReportA2AExecutor(AgentExecutor):
     def __init__(self) -> None:
-        # Attach the imported agent
-        self.agent = langchain_agent
+        self.agent = None
 
     async def execute(
         self,
@@ -42,25 +74,22 @@ class MistralA2AExecutor(AgentExecutor):
     ) -> None:
         # 1. Collect a task from request context
         #pprint.pprint(vars(context))
+        if not self.agent:
+            self.agent = report_agent.langchain_agent
+            if not self.agent:
+                raise RuntimeError("Agent not initialized. Check lifespan startup.")
+
         if context.current_task:
             task = context.current_task
-            #print("current", task)
         else:
-            #task = new_task_from_user_message(context.message)
-
-            ctx_id = context.message.context_id
-            
             task = Task(
                 id=context.message.task_id, # <-- auto generated task_id by request handler
-                context_id=ctx_id, # <--- THIS PRESERVES THE CLIENT'S CONTEXT ID
+                context_id=context.message.context_id, # <--- THIS PRESERVES THE CLIENT'S CONTEXT ID
                 status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
                 history=[context.message],
             )
-
             await event_queue.enqueue_event(task)
-            #print("new task:\n", task)
 
-        # 2. Update task status in EventQueue using TaskUpdater class object
         task_updater = TaskUpdater(
             event_queue=event_queue, task_id=task.id, context_id=task.context_id
         )
@@ -69,49 +98,131 @@ class MistralA2AExecutor(AgentExecutor):
             message=new_text_message('Processing request...'),
         )
 
-        # 3. Collect user request and invoke LLM agent to generate content
-        query = get_message_text(context.message)
-        if query:
-            # Prefix to indicate it's from another agent
-            agent_query = f"[Incoming message from another AI Agent]: {query}"
-            config = {"configurable": {"thread_id": task.context_id}}
-            
-            result = self.agent.invoke(
-                {"messages": [{"role": "user", "content": agent_query}]}, 
-                config=config
-            )
-            response_text = result["messages"][-1].content
-        else:
-            response_text = 'No text input is provided!'
+        # Extract the text trigger from the A2A message
+        text_query = get_message_text(context.message)
+        if not text_query:
+            text_query = "Generate the report based on the findings currently available in the virtual filesystem."
 
-        # 4. Add generated response as an artifact to EventQueue (Clean helper used!)
+        agent_query = f"[Incoming message from another AI Agent]: {text_query}"
+        
+        # CRITICAL: High recursion limit for the multi-step scratchpad workflow
+        config = {
+            "configurable": {"thread_id": task.context_id},
+            "metadata": {"session.id": task.context_id}, # Add this line for Langfuse
+            "recursion_limit": 30 
+        }
+        
+        logger.info(f"Invoking agent with thread_id: {task.context_id}")
+         # --- STREAMING LOOP ---
+        # We stream the LangGraph agent execution node-by-node
+        async for chunk in self.agent.astream(
+            {"messages": [{"role": "user", "content": agent_query}]},
+            config=config,
+            stream_mode="updates"
+        ):
+            # chunk is a dict like {'model': {'messages': [AIMessage(...)]}}
+            for node_name, node_output in chunk.items():
+                if 'messages' in node_output:
+                    for msg in node_output['messages']:
+                        # CASE A: The Agent (LLM) is making a tool call
+                        if isinstance(msg, AIMessage):
+                            if msg.tool_calls:
+                                # Extract the names of the tools being called
+                                tool_names = [tc['name'] for tc in msg.tool_calls]
+                                update_text = f"Agent is calling tools: {', '.join(tool_names)}"
+                                
+                                # Push this as an A2A Status Update Event
+                                await task_updater.update_status(
+                                    state=TaskState.TASK_STATE_WORKING,
+                                    message=new_text_message(update_text)
+                                )
+                            elif msg.content:
+                                # This is the final text response from the LLM
+                                response_text = msg.content
+                                
+                        # CASE B: The Tools node has finished executing a tool
+                        elif isinstance(msg, ToolMessage):
+                            update_text = f"Agent received result from tool: {msg.name}"
+                            
+                            # Push this as an A2A Status Update Event
+                            await task_updater.update_status(
+                                state=TaskState.TASK_STATE_WORKING,
+                                message=new_text_message(update_text)
+                            )
+                
+                # CRITICAL: Send an A2A status update to keep the client connection alive!
+                # This prevents the HTTP timeout because data is actively flowing to the client.
+                await task_updater.update_status(
+                    state=TaskState.TASK_STATE_WORKING,
+                    message=new_text_message(f"Agent executing node: {node_name}...")
+                )
+
+        # --- FIX 1: Sanitize response_text ---
+        if isinstance(response_text, list):
+            # LangChain sometimes returns a list of content blocks
+            response_text = "\n".join([
+                block.get("text", "") for block in response_text 
+                if isinstance(block, dict) and block.get("type") == "text"
+            ])
+        if not isinstance(response_text, str):
+            response_text = str(response_text) if response_text is not None else "Agent finished without text output."
+
+
+        # The client will pull the report directly from the DB using export_report.
+        # We just return a text confirmation here.
         await task_updater.add_artifact(
             parts=[new_text_part(text=response_text, media_type='text/plain')]
         )
-        print('Result: ', response_text)
+        logger.info("Agent execution completed. Report should be available in the shared store.")
 
-        # 5. Update task status to completed
         await task_updater.update_status(
             state=TaskState.TASK_STATE_COMPLETED,
-            message=new_text_message('Request is completed!'),
+            message=new_text_message('Request completed. Report generated in shared store.'),
         )
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
         pass
 
+
+
+# ==========================================
+# 2. Starlette Lifespan (core fix)
+# ==========================================
+@asynccontextmanager
+async def lifespan(app: Starlette):
+    """
+    Executed when the Starlette application starts and shuts down.
+    The asyncio event loop is now running, so it's safe to open the database connection.
+    """
+    logger.info("Opening database pool and setting up tables...")
+    
+    # 1. Open the connection pool
+    await report_agent.initiate_connection()
+    
+    logger.info("Database setup complete. Agent is ready to accept requests.")
+    
+    yield  # <--- Application runs normally here, handling requests
+    
+    # 3. Clean up resources on shutdown
+    logger.info("Shutting down and closing database pool...")
+    if report_agent.pool:
+        await report_agent.pool.close()
+
+
 # ==========================================
 # 2. Setup and Run the A2A Server
 # ==========================================
 def main():
+
     # Define the agent's skills (capabilities)
     skill = AgentSkill(
-        id='weather_chat',
-        name='Weather Chat',
-        description='Chat with a Mistral AI agent that can check the weather.',
-        input_modes=['text/plain'],
-        output_modes=['text/plain'],
-        tags=['weather', 'chat', 'mistral'],
-        examples=['What is the weather in Paris?', 'Hello!'],
+        id='report_generation',
+        name='Pentest Report Generation',
+        description='Generates comprehensive pentest reports. Triggered via text after findings are injected into the shared Postgres store.',
+        input_modes=['text/plain'], 
+        output_modes=['text/plain', 'text/markdown'],
+        tags=['pentest', 'report', 'files', 'mistral'],
+        examples=['Generate a report from the uploaded findings.', 'Analyze the attached port scan results.'],
     )
 
     # DEFINE YOUR LOCAL NETWORK IP HERE
@@ -120,12 +231,11 @@ def main():
     
     # Define the public-facing Agent Card
     public_agent_card = AgentCard(
-        name='Mistral Weather Agent',
-        description='A LangChain-powered Mistral agent exposed via the A2A protocol.',
-        version='1.0.0',
+        name='Pentest Report Agent',
+        description='A LangChain-powered agent that processes finding files from a shared DB and generates markdown reports.',
         default_input_modes=['text/plain'],
-        default_output_modes=['text/plain'],
-        capabilities=AgentCapabilities(streaming=False),
+        default_output_modes=['text/plain', 'text/markdown'],
+        capabilities=AgentCapabilities(streaming=True, push_notifications=True), #Streaming enabled, push notif -> later
         supported_interfaces=[
             AgentInterface(
                 protocol_binding='JSONRPC',
@@ -135,11 +245,17 @@ def main():
         skills=[skill],
     )
 
+    
     # Wire up the request handler
+    httpx_client = httpx.AsyncClient()
+    push_config_store = InMemoryPushNotificationConfigStore()
     request_handler = DefaultRequestHandler(
-        agent_executor=MistralA2AExecutor(),
+        agent_executor=ReportA2AExecutor(),
         task_store=InMemoryTaskStore(),
         agent_card=public_agent_card,
+        push_config_store=push_config_store,
+        push_sender = BasePushNotificationSender(httpx_client=httpx_client,
+                    config_store=push_config_store)
     )
 
     # Create routes for the Starlette app
@@ -147,10 +263,10 @@ def main():
     routes.extend(create_agent_card_routes(public_agent_card))
     routes.extend(create_jsonrpc_routes(request_handler, '/'))
 
-    app = Starlette(routes=routes)
+    app = Starlette(routes=routes, lifespan=lifespan)
 
-    print(f"🚀 A2A Server running at http://{LOCAL_IP}:{PORT}")
-    print(f"📇 Agent Card available at: http://{LOCAL_IP}:{PORT}/.well-known/agent-card.json")
+    print(f"A2A Server running at http://{LOCAL_IP}:{PORT}")
+    print(f"Agent Card available at: http://{LOCAL_IP}:{PORT}/.well-known/agent-card.json")
     
     # CRITICAL: host='0.0.0.0' allows connections from the local network
     uvicorn.run(app, host=LOCAL_IP, port=PORT)
