@@ -212,7 +212,14 @@ async def initiate_connection():
         "autocommit": True,       # Required by LangGraph
         "prepare_threshold": 0,   # Recommended for connection pools
         "row_factory": dict_row,  # Required by LangGraph to read rows as dictionaries
-    },
+
+        # --- CRITICAL: TCP KEEPALIVES ---
+        # Prevents the OS/Firewall from dropping idle connections during long LLM generations
+        "keepalives": 1,
+        "keepalives_idle": 30,       # Send heartbeat after 30s of idle time
+        "keepalives_interval": 10,   # Resend every 10s if no ack
+        "keepalives_count": 3,       # Drop connection after 3 failed heartbeats
+        },
     open=False 
 )
     await pool.open()

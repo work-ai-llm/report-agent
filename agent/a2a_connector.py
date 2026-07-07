@@ -10,9 +10,8 @@ from contextlib import asynccontextmanager
 from starlette.applications import Starlette
 import httpx
 import logging
+import json
 
-
-import uuid
 # A2A SDK Imports
 from a2a.server.agent_execution import AgentExecutor, RequestContext
 from a2a.server.events import EventQueue
@@ -42,6 +41,7 @@ from a2a.helpers import (
 # Import global variables from report_agent for initialization in lifespan
 import report_agent
 from langchain_core.messages import AIMessage, ToolMessage
+from langfuse import observe, propagate_attributes
 
 
 # Configure standard logger
@@ -90,6 +90,8 @@ class ReportA2AExecutor(AgentExecutor):
             )
             await event_queue.enqueue_event(task)
 
+        # NOTE, ideally i need to add schema output enforcment on server side, to make chunk schema the same everytime
+        # but.... to lazy
         task_updater = TaskUpdater(
             event_queue=event_queue, task_id=task.id, context_id=task.context_id
         )
@@ -109,55 +111,94 @@ class ReportA2AExecutor(AgentExecutor):
         config = {
             "configurable": {"thread_id": task.context_id},
             "metadata": {"session.id": task.context_id}, # Add this line for Langfuse
-            "recursion_limit": 30 
+            "recursion_limit": 40, 
         }
-        
+        # 1. Initialize the flag BEFORE the streaming loop starts
+        report_artifact_sent = False
         logger.info(f"Invoking agent with thread_id: {task.context_id}")
+        response_text = ""
          # --- STREAMING LOOP ---
         # We stream the LangGraph agent execution node-by-node
-        async for chunk in self.agent.astream(
-            {"messages": [{"role": "user", "content": agent_query}]},
-            config=config,
-            stream_mode="updates"
-        ):
-            # chunk is a dict like {'model': {'messages': [AIMessage(...)]}}
-            for node_name, node_output in chunk.items():
-                if 'messages' in node_output:
-                    for msg in node_output['messages']:
-                        # CASE A: The Agent (LLM) is making a tool call
-                        if isinstance(msg, AIMessage):
-                            if msg.tool_calls:
-                                # Extract the names of the tools being called
-                                tool_names = [tc['name'] for tc in msg.tool_calls]
-                                update_text = f"Agent is calling tools: {', '.join(tool_names)}"
-                                
-                                # Push this as an A2A Status Update Event
-                                await task_updater.update_status(
-                                    state=TaskState.TASK_STATE_WORKING,
-                                    message=new_text_message(update_text)
-                                )
-                            elif msg.content:
-                                # This is the final text response from the LLM
-                                response_text = msg.content
-                                
-                        # CASE B: The Tools node has finished executing a tool
-                        elif isinstance(msg, ToolMessage):
-                            update_text = f"Agent received result from tool: {msg.name}"
-                            
-                            # Push this as an A2A Status Update Event
-                            await task_updater.update_status(
-                                state=TaskState.TASK_STATE_WORKING,
-                                message=new_text_message(update_text)
-                            )
-                
-                # CRITICAL: Send an A2A status update to keep the client connection alive!
-                # This prevents the HTTP timeout because data is actively flowing to the client.
-                await task_updater.update_status(
-                    state=TaskState.TASK_STATE_WORKING,
-                    message=new_text_message(f"Agent executing node: {node_name}...")
-                )
+        # Manually added langfuse observation
+        # NOTE, unfortenatly there is no way to handle trace root level input, output, the functions for that are depreciated
+        # and langfuse langchain hanlder isn't populating langfuse properly, so only manual way remains.
+        with report_agent.langfuse.start_as_current_observation(
+            as_type="span",
+            name="my-pipeline",
+            input={"query": text_query}
+        ) as root_span:
+            # Propagate session_id to all child observations
+            with propagate_attributes(
+                session_id=task.context_id,
+                trace_name="A2A-report-agent",
+                version="2.2"
+            ):
+                # All observations created here automatically have session_id
+                with root_span.start_as_current_observation(
+                    as_type="generation",
+                    name="generate-response",
+                    model="mistral"
+                ) as gen:
+                    async for chunk in self.agent.astream(
+                        {"messages": [{"role": "user", "content": agent_query}]},
+                        config=config,
+                        stream_mode="updates"
+                    ):
+                        # chunk is a dict like {'model': {'messages': [AIMessage(...)]}}
+                        for node_name, node_output in chunk.items():
+                            if 'messages' in node_output:
+                                for msg in node_output['messages']:
+                                    # CASE A: The Agent (LLM) is making a tool call
+                                    if isinstance(msg, AIMessage):
+                                        if msg.tool_calls:
+                                            for tc in msg.tool_calls:
+                                                tool_name = tc['name']
+                                                tool_args = tc.get('args', {})
 
-        # --- FIX 1: Sanitize response_text ---
+                                                preview_args = tool_args.copy()
+
+                                                if tool_name == 'write_file' and 'content' in preview_args:
+                                                    # Grab first 50 chars of the file content and remove newlines
+                                                    preview_content = preview_args['content'][:100].replace('\n', ' ')
+                                                    preview_args['content'] = f"{preview_content}..."
+                                                
+                                                # Check if the agent is writing the final report to the store
+                                                if tool_name == 'write_file' and not report_artifact_sent and 'report' in tool_args.get('file_path', ''):
+                                                    await task_updater.add_artifact(
+                                                        parts=[new_text_part(text="Report creation process started.", media_type='text/plain')]
+                                                    )
+                                                    report_artifact_sent = True # <--- Prevents spam on subsequent calls
+                                                    logger.info("Detected report write_file tool call. Artifact sent to client.")
+                                                
+                                                args_json = json.dumps(preview_args, indent=2)
+                                                # Send a clean status update with ONLY the tool name
+                                                update_text = f"Agent is calling tool: {tool_name} with args: {args_json}"
+                                                await task_updater.update_status(
+                                                    state=TaskState.TASK_STATE_WORKING,
+                                                    message=new_text_message(update_text)
+                                                )
+                                        elif msg.content:
+                                            # This is the final text response from the LLM
+                                            response_text = msg.content
+
+                                            gen.update(
+                                                output={"response": response_text}
+                                            )
+                                    # CASE B: The Tools node has finished executing a tool
+                                    elif isinstance(msg, ToolMessage):
+                                        update_text = f"Agent received result from tool: {msg.status}"
+                                        
+                                        # Push this as an A2A Status Update Event
+                                        await task_updater.update_status(
+                                            state=TaskState.TASK_STATE_WORKING,
+                                            message=new_text_message(update_text)
+                                        )
+            root_span.update(
+                output={"response": response_text}
+            )
+                            
+
+        # --- FIX 1: Sanitize response_text --- #
         if isinstance(response_text, list):
             # LangChain sometimes returns a list of content blocks
             response_text = "\n".join([

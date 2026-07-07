@@ -5,7 +5,20 @@ from pathlib import Path
 
 # Adjust path to import the store and agent
 sys.path.append(str(Path(__file__).parent.parent))
-from agent.report_agent import store, langchain_agent
+from agent.report_agent import langchain_agent, DB_URI
+# 1. Import ONLY the sync pool and store
+from psycopg_pool import ConnectionPool
+from langgraph.store.postgres import PostgresStore
+
+# 2. Initialize the sync pool and store DIRECTLY in the CLI
+print("Connecting to Postgres for CLI...")
+cli_pool = ConnectionPool(
+    conninfo=DB_URI,
+    kwargs={"autocommit": True, "prepare_threshold": 0}
+)
+store = PostgresStore(cli_pool)
+store.setup()
+print("Store initialized successfully.\n")
 
 
 # NOTE, let's call this whole file as a stupid way to debug store db.
@@ -227,4 +240,9 @@ Examples:
         parser.print_help()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        # 3. Clean up the pool when the CLI exits
+        if cli_pool:
+            cli_pool.close()

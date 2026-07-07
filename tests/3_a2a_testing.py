@@ -12,6 +12,8 @@ from dotenv import load_dotenv
 from a2a.client import A2ACardResolver, ClientConfig, create_client
 # (Protobuf-based)
 from a2a.types.a2a_pb2 import Message, Part, Role, SendMessageRequest
+# for protobuf object conversion
+from google.protobuf.json_format import MessageToDict
 
 load_dotenv()
 
@@ -21,9 +23,49 @@ SERVER_URL = 'http://192.168.0.107:9999'
 # Import store CLI functions directly from your existing tool
 from store_cli import seed_store, inspect_store, delete_file
 
+# ==========================================
+# broken text extraction FUNCTION
+# ==========================================
+def extract_text_heuristically(chunk_dict):
+    """Recursively search any dictionary/object for textual data."""
+    # 2. Extract Status Updates (e.g., "Agent is calling tools...")
+    if "status_update" in chunk_dict:
+        status = chunk_dict["status_update"].get("status", {})
+        message = status.get("message", {})
+        parts = message.get("parts", [])
+        for part in parts:
+            if "text" in part:
+                return f"[STATUS]: {part['text']}"
+
+    # 3. Extract Artifacts (The final report)
+    elif "artifact_update" in chunk_dict:
+        artifact = chunk_dict["artifact_update"].get("artifact", {})
+        parts = artifact.get("parts", [])
+        for part in parts:
+            if "text" in part:
+                return f"[ARTIFACT]: {part['text']}"   
+    # 4. Handle initial task acknowledgment
+    elif 'task' in chunk_dict:
+        task_dict = chunk_dict['task']
+        task_id = task_dict.get('id')
+        status = task_dict.get("status", {}).get("state")
+        history_list = task_dict.get("history", [])
+    
+        task_text = None
+        
+        for history_item in history_list:
+            parts = history_item.get("parts", [])
+            for part in parts:
+                if "text" in part:
+                    task_text = part['text']
+                    
+        return f"[TASK STATE]: {status}\nTask Id: {task_id}\nText: {task_text}"
+    return None
+
+
 
 # ==========================================
-# 1. CORE HELPER FUNCTION
+# CORE HELPER FUNCTION
 # ==========================================
 async def send_and_get_response(client, text, context_id=None):
     """
@@ -59,47 +101,15 @@ async def send_and_get_response(client, text, context_id=None):
     
     returned_context_id = context_id
     full_response_text = ""
+    agent_response = ""
     chunk_count = 0
 
     async for chunk in client.send_message(request):
-        """try:
-            if chunk.task.context_id:
-                returned_context_id = chunk.task.context_id
-        except Exception:
-            pass
-
-        # 1. Initial Task Object (Sent once at the start)
-        if getattr(chunk, 'task', None):
-            returned_context_id = chunk.task.context_id
-            if chunk.task.status and chunk.task.status.message:
-                for p in chunk.task.status.message.parts:
-                    if p.text: full_response_text += p.text + " "
-
-        # 2. Intermediate Status Updates (e.g., "Agent is calling tools...")
-        elif getattr(chunk, 'status_update', None):
-            event = chunk.status_update
-            returned_context_id = event.context_id
-            if event.status and event.status.message:
-                for p in event.status.message.parts:
-                    if p.text: 
-                        print(f"[STATUS]: {p.text}")
-                        full_response_text += p.text + " "
-
-        # 3. Final Artifact Updates (The actual report text)
-        elif getattr(chunk, 'artifact_update', None):
-            event = chunk.artifact_update
-            returned_context_id = event.context_id
-            if event.artifact:
-                for p in event.artifact.parts:
-                    if p.text: 
-                        print(f"[ARTIFACT]: {p.text[:100]}...")
-                        full_response_text += p.text + " "
-                        """
         chunk_count += 1
         print("\n" + "-"*50)
-        print(f"CHUNK #{chunk_count} RECEIVED")
+        #print(f"CHUNK #{chunk_count} RECEIVED")
         
-        # Print the exact Python type (e.g., Pydantic model, Protobuf, dict)
+        """# Print the exact Python type (e.g., Pydantic model, Protobuf, dict)
         print(f"TYPE: {type(chunk)}")
         
         # Print the raw object representation
@@ -107,7 +117,20 @@ async def send_and_get_response(client, text, context_id=None):
         
         # Print available attributes so we can see what fields actually exist
         attrs = [attr for attr in dir(chunk) if not attr.startswith('_')]
-        print(f"ATTRIBUTES: {attrs}")
+        print(f"ATTRIBUTES: {attrs}")"""
+        converted = MessageToDict(chunk,  preserving_proto_field_name=True)
+
+        extracted_text = extract_text_heuristically(converted)
+
+        if "artifact_update" in converted:
+            agent_response = extracted_text
+        elif extracted_text:
+            full_response_text += extracted_text + " "
+            print(extracted_text) # Optional: see what was found
+        else:
+            # Fallback: Print warning if the heuristic failed
+            print(f"[WARNING] Chunk extraction didn't work, possible that schema is different. \n"
+                f"Raw chunk: {chunk}")
 
     print("\n" + "-"*50)
     if chunk_count == 0:
@@ -116,7 +139,8 @@ async def send_and_get_response(client, text, context_id=None):
         print(f"RESULT: Stream finished. Total chunks received: {chunk_count}")
 
     print("----------------------")
-    print(f"[AGENT RESPONSE]: {full_response_text.strip()}")
+    #print(f"[AGENT RESPONSE]: {full_response_text.strip()}")
+    print(f"[AGENT RESPONSE]: {agent_response.strip()}")
     return returned_context_id, full_response_text.strip()
 
 # ==========================================
