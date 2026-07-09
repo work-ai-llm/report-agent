@@ -21,7 +21,7 @@ load_dotenv()
 SERVER_URL = 'http://192.168.0.107:9999'
 
 # Import store CLI functions directly from your existing tool
-from store_cli import seed_store, inspect_store, delete_file
+from dev_tools.store_cli import seed_store, inspect_store, delete_file
 
 # ==========================================
 # broken text extraction FUNCTION

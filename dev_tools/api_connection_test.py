@@ -1,3 +1,7 @@
+# tool description
+# initial way to confirm rough api working or not (used to discover that api didn't work without vpn)
+# no further use
+
 import os
 import httpx
 from dotenv import load_dotenv

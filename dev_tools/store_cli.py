@@ -1,3 +1,10 @@
+# tool description
+# convinient tool to inspect,delete,add files from pc filesystem to postgress virtual filesystem
+# filesystem control
+
+
+
+
 import argparse
 import datetime
 import sys

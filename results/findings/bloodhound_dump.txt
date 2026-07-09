@@ -1,0 +1,14 @@
+BloodHound CE Data Dump
+Session: sess_001
+Domain: CORP.LOCAL
+Total Users: 145
+Total Computers: 42
+High Value Targets: 3
+
+Shortest Path to Domain Admin:
+'svc_backup' -> 'Backup Operators' -> 'Domain Admins'
+
+Notes:
+- svc_backup has SeBackupPrivilege enabled.
+- Anonymous login allowed on SMB shares for 192.168.1.50.
+- AS-REP Roasting possible for user 'jdoe'.

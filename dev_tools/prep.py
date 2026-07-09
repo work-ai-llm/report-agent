@@ -1,3 +1,7 @@
+# tool description
+# initial way set up virtual filesystem for report agent
+# initial setup preparation (require remaking)
+
 import sys
 from pathlib import Path
 import datetime

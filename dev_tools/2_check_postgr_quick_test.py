@@ -1,3 +1,7 @@
+# tool description
+# main use case is inspection of llm sessions with all the tool calls, messages
+# not needed, once langfuse is properly set up.
+
 import sys
 import json
 from pathlib import Path
