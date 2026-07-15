@@ -11,6 +11,7 @@ from starlette.applications import Starlette
 import httpx
 import logging
 import json
+from time import sleep
 
 # A2A SDK Imports
 from a2a.server.agent_execution import AgentExecutor, RequestContext
@@ -66,14 +67,66 @@ logging.getLogger("a2a.server.routes").setLevel(logging.INFO)
 class ReportA2AExecutor(AgentExecutor):
     def __init__(self) -> None:
         self.agent = None
+        # --- SCHEDULER STATE ---
+        # TODO, queue in memmory only, with server restart tasks would disapper
+        self.task_queue = asyncio.Queue()
+        self.worker_started = False
+        self._worker_lock = asyncio.Lock()
+        self.running_tasks = {}
 
+    async def _ensure_worker(self):
+        """Lazily starts the background worker on the first request."""
+        async with self._worker_lock:
+            if not self.worker_started:
+                logger.info("Starting background task scheduler worker...")
+                asyncio.create_task(self._background_worker())
+                self.worker_started = True
+
+    async def _background_worker(self):
+        """The single consumer that processes tasks strictly one by one."""
+        while True:
+            # Wait for a task from the queue
+            # this can be expanded to have multiple concurrent executions, if api load would allow
+            # currently 1 agent call per 1 task, can be expanded by making get(5)
+            context, event_queue, done_event, execution_started_event, exc_info, task = await self.task_queue.get()
+            try:
+                # CRITICAL FIX: Signal to execute() that we have started processing this task!
+                execution_started_event.set()
+
+                logger.info(f"Worker picked up task: {context.message.task_id}")
+                # wrapping agent running in async event to be able to cancel it by client request
+                process_task = asyncio.create_task(self._process_task(context, event_queue, task))
+                self.running_tasks[task.id] = process_task
+                await process_task
+                logger.info(f"Worker finished task: {context.message.task_id}")
+            except asyncio.CancelledError:
+                logger.warning(f"Task {task.id} was cancelled by client request.")
+            except Exception as e:
+                logger.error(f"Task execution failed: {e}", exc_info=True)
+                # Capture exception to propagate back to the specific client stream
+                exc_info.append(e)
+            finally:
+                # Signal the waiting HTTP connection that we are done
+                done_event.set()
+                self.task_queue.task_done()
+                
+                # freeze for 10 seconds to send the remaining chunks to the client.
+                # to make passage from 1 client to another smoother
+                await asyncio.sleep(10)
     async def execute(
         self,
         context: RequestContext,
         event_queue: EventQueue,
     ) -> None:
-        # 1. Collect a task from request context
-        #pprint.pprint(vars(context))
+        # Ensure the background worker is running
+        await self._ensure_worker()
+        
+        # Create a synchronization primitive for this specific request
+        done_event = asyncio.Event()
+        execution_started_event = asyncio.Event() # <--- NEW EVENT
+        exc_info = []
+        
+        # --- [INITIALIZATION LOGIC] ---
         if not self.agent:
             self.agent = report_agent.langchain_agent
             if not self.agent:
@@ -84,7 +137,7 @@ class ReportA2AExecutor(AgentExecutor):
         else:
             task = Task(
                 id=context.message.task_id, # <-- auto generated task_id by request handler
-                context_id=context.message.context_id, # <--- THIS PRESERVES THE CLIENT'S CONTEXT ID
+                context_id=context.message.context_id, # <--- THIS PRESERVES THE CLIENT'S CONTEXT ID, or otherwise known as 1 session interaction
                 status=TaskStatus(state=TaskState.TASK_STATE_SUBMITTED),
                 history=[context.message],
             )
@@ -95,10 +148,81 @@ class ReportA2AExecutor(AgentExecutor):
         task_updater = TaskUpdater(
             event_queue=event_queue, task_id=task.id, context_id=task.context_id
         )
+
+        # ==========================================
+        # FIX 1: IMMEDIATE ACKNOWLEDGMENT
+        # ==========================================
+        # Tell the client IMMEDIATELY that we got the request.
+        # This prevents the client from timing out while it sits in the queue.
         await task_updater.update_status(
             state=TaskState.TASK_STATE_WORKING,
-            message=new_text_message('Processing request...'),
+            message=new_text_message('Task received. Waiting in execution queue...'),
         )
+        
+        logger.info(f"Enqueuing task: {task.id}")
+        await self.task_queue.put((context, event_queue, done_event, execution_started_event, exc_info, task))
+        
+        # ==========================================
+        # FIX 2: THE KEEP-ALIVE LOOP
+        # ==========================================
+        try:
+            # FIX: Wait for EITHER the task to finish OR the worker to start executing it
+            while not done_event.is_set() and not execution_started_event.is_set():
+                done_waiter = asyncio.create_task(done_event.wait())
+                start_waiter = asyncio.create_task(execution_started_event.wait())
+                
+                # Wait up to 30 seconds for one of them to trigger
+                finished, pending = await asyncio.wait(
+                    [done_waiter, start_waiter], 
+                    timeout=30.0, 
+                    return_when=asyncio.FIRST_COMPLETED
+                )
+                
+                # Clean up the waiter that didn't finish
+                for p in pending:
+                    p.cancel()
+                    
+                if execution_started_event.is_set():
+                    break # Worker started! Exit the keep-alive loop.
+                    
+                if not done_event.is_set():
+                    # Timeout occurred, and worker hasn't started yet. Send keep-alive.
+                    user_text = get_message_text(task.history[0]) if task.history else "No text"
+                    logger.info(f"Task {task.id} still in queue, sending keep-alive...")
+                    await task_updater.update_status(
+                        state=TaskState.TASK_STATE_WORKING,
+                        message=new_text_message(f'Task with id: {task.id} and content{user_text[:50]}.....\nStill waiting in queue for previous tasks to finish...'),
+                    )
+                    
+            # If the worker started, we just wait for it to finish without sending keep-alives
+            if execution_started_event.is_set() and not done_event.is_set():
+                logger.info(f"Task {task.id} is actively executing. Waiting for completion...")
+                await done_event.wait()
+                
+        except asyncio.CancelledError:
+            logger.warning(f"Client choose to cancel task {task.id}.")
+            raise
+                    
+        # ==========================================
+        # FIX 3: COMPLETION
+        # ==========================================
+        # The background worker finished the task and set the event!
+        # If the worker encountered an error, raise it here.
+        if exc_info:
+            raise exc_info[0]
+
+    async def _process_task(
+        self,
+        context: RequestContext,
+        event_queue: EventQueue,
+        task: Task,
+    ) -> None:
+        # recreate the task updater 
+        # using the task object passed from the queue.
+        task_updater = TaskUpdater(
+            event_queue=event_queue, task_id=task.id, context_id=task.context_id
+        )
+        
 
         # Extract the text trigger from the A2A message
         text_query = get_message_text(context.message)
@@ -106,7 +230,13 @@ class ReportA2AExecutor(AgentExecutor):
             text_query = "Generate the report based on the findings currently available in the virtual filesystem."
 
         agent_query = f"[Incoming message from another AI Agent]: {text_query}"
-        
+
+
+        await task_updater.update_status(
+            state=TaskState.TASK_STATE_WORKING,
+            message=new_text_message(f'Processing request...\nTask id:{task.id}\nTask conetent:{text_query[:60]}....'),
+        )
+
         # CRITICAL: High recursion limit for the multi-step scratchpad workflow
         config = {
             "configurable": {"thread_id": task.context_id},
@@ -117,6 +247,7 @@ class ReportA2AExecutor(AgentExecutor):
         report_artifact_sent = False
         logger.info(f"Invoking agent with thread_id: {task.context_id}")
         response_text = ""
+        
          # --- STREAMING LOOP ---
         # We stream the LangGraph agent execution node-by-node
         # Manually added langfuse observation
@@ -222,8 +353,15 @@ class ReportA2AExecutor(AgentExecutor):
         )
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        pass
-
+        task_id = context.task_id
+        logger.warning(f"Cancel requested for task: {task_id}")
+        
+        # --- THE FIX ---
+        # Look up the running task and cancel it!
+        if task_id in self.running_tasks:
+            self.running_tasks[task_id].cancel()
+        else:
+            logger.warning(f"Task {task_id} is not currently running, cannot cancel.")
 
 
 # ==========================================
