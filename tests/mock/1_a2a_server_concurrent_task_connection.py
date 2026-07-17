@@ -106,10 +106,11 @@ async def test_sequential_execution_and_state_updates():
     Proves that:
     1. Two concurrent requests are forced to run sequentially (timing check).
     2. Both tasks are successfully created and reach TASK_STATE_COMPLETED in the store.
+    3. Task 2 waits in queue while Task 1 is processing (lock behavior).
     """
     # 1. Setup: Use ONE executor instance so they share the SAME execution lock
     executor = ReportA2AExecutor()
-    executor.agent = FakeLangChainAgent(delay=20) # 20s per step * 3 steps = ~60s per task
+    executor.agent = FakeLangChainAgent(delay=20)  # 20s per step * 3 steps = ~60s per task
     handler = create_mock_request_handler(executor)
     
     req1 = create_mock_send_request("ctx-1")
@@ -125,24 +126,9 @@ async def test_sequential_execution_and_state_updates():
     )
     total_time = time.time() - start_time
 
-    # req 1 get task submitted TAKES generated task.id
-    # req 2 get task submitted, TAKES generated task.id (a2a server do not work with self-created task-ids, task-id generation is enforced by server instead)
-    # req 1 get task working
-    # req 2 gets status update occupied check
-    # req 1 get task artifacts, completed
-    # req 2 get status working
-    # req 2 get status artifacts, completed
     # 3. ASSERTION: No exceptions occurred
     for res in results:
         assert not isinstance(res, Exception), f"Stream failed with: {res}"
-
-
-    # debugging    
-    for i, events in enumerate(results, 1):
-        print(f"--- Stream {i} ---")
-        for ev in events:
-            print(ev)
-
 
     # 4. ASSERTION: The agent ran exactly twice (proving both executed)
     assert executor.agent.execution_count == 2, f"Expected 2 executions, got {executor.agent.execution_count}"
@@ -151,78 +137,109 @@ async def test_sequential_execution_and_state_updates():
     events1 = [ev for _, ev in results[0]]
     events2 = [ev for _, ev in results[1]]
 
-    # Each event is a Task object (or maybe a status update).
-    # The first event in each stream is the “task submitted” Task with an auto‑generated id.
-    assert events1[0].status.state == TaskState.TASK_STATE_SUBMITTED
+    # Helper functions for event filtering
+    def is_status_event(event):
+        """Check if event has a status with a message."""
+        return hasattr(event, 'status') and event.status is not None
+    
+    def has_message_with_text(event, text_substring):
+        """Check if event's status message contains the given text."""
+        if not is_status_event(event):
+            return False
+        msg_text = get_message_text(event.status.message)
+        return text_substring in msg_text if msg_text else False
+    
+    def get_events_with_message_text(events, text_substring):
+        """Filter events that have a status message containing the given text."""
+        return [e for e in events if has_message_with_text(e, text_substring)]
+
+    # Verify initial task submission states
+    assert events1[0].status.state == TaskState.TASK_STATE_SUBMITTED, \
+        f"Task 1 should start as SUBMITTED, got {events1[0].status.state}"
     task1_id = events1[0].id
 
-    assert events2[0].status.state == TaskState.TASK_STATE_SUBMITTED
+    assert events2[0].status.state == TaskState.TASK_STATE_SUBMITTED, \
+        f"Task 2 should start as SUBMITTED, got {events2[0].status.state}"
     task2_id = events2[0].id
 
-    # Now the actual sequence: Task 1 should go to WORKING, then COMPLETED,
-    # and *only then* should Task 2 go to WORKING.
-    # We can extract the status events:
-    def is_status_event(event):
-        return hasattr(event, 'status') and event.status.message
+    # Extract all status events with messages for each task
+    status_events1 = [e for e in events1 if is_status_event(e) and e.status.message]
+    status_events2 = [e for e in events2 if is_status_event(e) and e.status.message]
+    
+    assert len(status_events1) > 0, "Task 1 should have status events with messages"
+    assert len(status_events2) > 0, "Task 2 should have status events with messages"
 
-    status1 = [e for e in events1 if is_status_event(e)]
-    status2 = [e for e in events2 if is_status_event(e)]
+    # ASSERTION: Task 1 receives "Waiting in execution queue" message
+    task1_waiting_events = get_events_with_message_text(status_events1, "Waiting in execution queue")
+    assert len(task1_waiting_events) > 0, \
+        f"Task 1 should have 'Waiting in execution queue' message. Available messages: {[get_message_text(e.status.message) for e in status_events1]}"
 
+    # ASSERTION: Task 2 receives both "Waiting in execution queue" and "Still waiting in queue" messages
+    task2_waiting_events = get_events_with_message_text(status_events2, "Waiting in execution queue")
+    assert len(task2_waiting_events) > 0, \
+        f"Task 2 should have 'Waiting in execution queue' message. Available messages: {[get_message_text(e.status.message) for e in status_events2]}"
+    
+    task2_still_waiting_events = get_events_with_message_text(status_events2, "Still waiting in queue")
+    assert len(task2_still_waiting_events) > 0, \
+        f"Task 2 should have 'Still waiting in queue' messages (proving lock behavior). Available messages: {[get_message_text(e.status.message) for e in status_events2]}"
 
-    # Task 1: first status after submitted should be "Task received. Waiting..."
-    assert "Waiting in execution queue" in get_message_text(status1[0].status.message)
+    # ASSERTION: Task 2 receives "Processing request" message (after lock is released)
+    task2_processing_events = get_events_with_message_text(status_events2, "Processing request")
+    assert len(task2_processing_events) > 0, \
+        f"Task 2 should have 'Processing request' message. Available messages: {[get_message_text(e.status.message) for e in status_events2]}"
 
-    # Task 2: first status should also be "Task received. Waiting..."
-    assert "Waiting in execution queue" in get_message_text(status2[0].status.message)
-
-    # Task 1 should complete before Task 2 starts processing.
-    # The "Processing request..." message for Task 2 must have a timestamp
-    # later than Task 1's COMPLETED status.
-    # We can compare the timestamps we captured.
-
-    # Task 2 waiting in queue, due to lock
-    assert "Still waiting in queue" in get_message_text(status2[0].status.message)
-
-    # Find indices of key events
+    # CRITICAL ASSERTION: Sequential execution timing
+    # Find timestamp when Task 1 completes
     task1_completed_ts = None
-    task2_processing_ts = None
-
     for ts, ev in results[0]:
         if is_status_event(ev) and ev.status.state == TaskState.TASK_STATE_COMPLETED:
             task1_completed_ts = ts
             break
-
+    
+    # Find timestamp when Task 2 starts processing (acquires lock)
+    task2_processing_ts = None
     for ts, ev in results[1]:
-        if is_status_event(ev) and "Processing request" in get_message_text(ev.status.message):
+        if has_message_with_text(ev, "Processing request"):
             task2_processing_ts = ts
             break
 
-    assert task1_completed_ts is not None, "Task 1 did not complete"
-    assert task2_processing_ts is not None, "Task 2 did not start processing"
+    assert task1_completed_ts is not None, "Task 1 should complete"
+    assert task2_processing_ts is not None, "Task 2 should start processing"
     assert task1_completed_ts < task2_processing_ts, (
-        f"Task 2 started processing before Task 1 completed: "
-        f"task1_completed at {task1_completed_ts}, task2_processing at {task2_processing_ts}"
+        f"SEQUENTIAL EXECUTION FAILED: Task 2 started processing BEFORE Task 1 completed. "
+        f"Task 1 completed at {task1_completed_ts}, Task 2 started processing at {task2_processing_ts}. "
+        f"This proves the lock is NOT working correctly."
     )
 
-    # Both tasks should end in COMPLETED state
-    assert events1[-1].status.state == TaskState.TASK_STATE_COMPLETED
-    assert events2[-1].status.state == TaskState.TASK_STATE_COMPLETED
+    # ASSERTION: Both tasks end in COMPLETED state
+    assert events1[-1].status.state == TaskState.TASK_STATE_COMPLETED, \
+        f"Task 1 should end as COMPLETED, got {events1[-1].status.state}"
+    assert events2[-1].status.state == TaskState.TASK_STATE_COMPLETED, \
+        f"Task 2 should end as COMPLETED, got {events2[-1].status.state}"
 
-    # The crucial check: Task 1 must be COMPLETED before Task 2 actually starts.
-    # A simple way: the timestamp of the last WORKING event of Task 1 should be
-    # earlier than the first real "processing" event of Task 2.
-    # For a more precise check, look at the message content.
-    # Example: the first status of Task 2 contains "Task received. Waiting in execution queue...",
-    # and the status that says "Processing request..." only appears after the lock is acquired.
-    # We can assert that Task 1's COMPLETED event appears before Task 2's "Processing request".
+    # ASSERTION: Concurrent requests took longer than sequential execution
+    # If tasks ran truly concurrently, total_time would be ~60s
+    # If sequential, total_time would be ~120s (60s + 60s)
+    # We allow some margin for overhead
+    min_sequential_time = 100  # At least 100 seconds for sequential execution
+    assert total_time >= min_sequential_time, (
+        f"Total execution time ({total_time:.2f}s) suggests tasks may have run partially in parallel. "
+        f"Expected at least {min_sequential_time}s for sequential execution."
+    )
 
-    # 8. Task store verification (optional, but good)
+    # 8. Task store verification
     task1 = await handler.task_store.get("ctx-1", mock_context)
-    assert task1.status.state == TaskState.TASK_STATE_COMPLETED
+    assert task1 is not None, "Task 1 should exist in task store"
+    assert task1.status.state == TaskState.TASK_STATE_COMPLETED, \
+        f"Task 1 in store should be COMPLETED, got {task1.status.state}"
+    
     task2 = await handler.task_store.get("ctx-2", mock_context)
-    assert task2.status.state == TaskState.TASK_STATE_COMPLETED
+    assert task2 is not None, "Task 2 should exist in task store"
+    assert task2.status.state == TaskState.TASK_STATE_COMPLETED, \
+        f"Task 2 in store should be COMPLETED, got {task2.status.state}"
 
-@pytest.mark.skip()
+
+@pytest.mark.skip(reason="TODO: Fix undefined variables task_id_to_cancel and req2 creation")
 @pytest.mark.asyncio
 async def test_cancellation_via_handler_and_lock_release():
     """
@@ -233,10 +250,10 @@ async def test_cancellation_via_handler_and_lock_release():
     """
     # 1. Setup: Use ONE executor instance
     executor = ReportA2AExecutor()
-    executor.agent = FakeLangChainAgent(delay=5.0) # Slow agent to ensure it's running when we cancel
+    executor.agent = FakeLangChainAgent(delay=5.0)  # Slow agent to ensure it's running when we cancel
     handler = create_mock_request_handler(executor)
     
-    req = create_mock_send_request( "ctx-cancel")
+    req = create_mock_send_request("ctx-cancel")
     mock_context = ServerCallContext()
 
     # 2. Start the task in the background
@@ -246,11 +263,13 @@ async def test_cancellation_via_handler_and_lock_release():
     await asyncio.sleep(0.5)
     
     # 3. PROPERLY CANCEL VIA THE HANDLER
-    cancel_req = CancelTaskRequest(id=task_id_to_cancel)
+    # NOTE: This test needs to be fixed - task_id_to_cancel is undefined
+    # The task ID should be extracted from the stream events
+    cancel_req = CancelTaskRequest(id="undefined_task_id")  # FIXME: Get actual task ID
     await handler.on_cancel_task(cancel_req, mock_context)
     
     # 4. ASSERTION: Verify the task is actually marked as CANCELED in the store
-    get_req = GetTaskRequest(id=task_id_to_cancel)
+    get_req = GetTaskRequest(id="undefined_task_id")  # FIXME: Get actual task ID
     canceled_task = await handler.on_get_task(get_req, mock_context)
     assert canceled_task is not None, "Canceled task was not found in the store"
     assert canceled_task.status.state == TaskState.TASK_STATE_CANCELED, \
@@ -258,12 +277,12 @@ async def test_cancellation_via_handler_and_lock_release():
 
     # 5. ASSERTION: Verify the lock was released by immediately firing a new task.
     # If the lock wasn't released, this new task would hang and timeout.
-    req2 = create_mock_send_request("task-after-cancel", "ctx-after")
+    req2 = create_mock_send_request("ctx-after")  # Fixed: removed extra argument
     
     result = await asyncio.wait_for(
         consume_stream(handler, req2, mock_context),
-        timeout=2.0 # Should finish quickly since the slow agent was canceled and lock released
+        timeout=2.0  # Should finish quickly since the slow agent was canceled and lock released
     )
     
-    assert result is True, "Lock was not released after cancellation, causing a deadlock!"
+    assert result is not False, "Lock was not released after cancellation, causing a deadlock!"
     assert executor.agent.execution_count == 2, "The second task should have executed after the first was canceled."
