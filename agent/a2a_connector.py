@@ -174,6 +174,8 @@ class ReportA2AExecutor(AgentExecutor):
         # Manually added langfuse observation
         # NOTE, unfortenatly there is no way to handle trace root level input, output, the functions for that are depreciated
         # and langfuse langchain hanlder isn't populating langfuse properly, so only manual way remains.
+        # NOTE UPDATE, weirdly simple metadata tag worked properly with tailscale db test
+        # hence for later, check the manual root construction, how to properly populate langfuse traces to include input/output
         with report_agent.langfuse.start_as_current_observation(
             as_type="span",
             name="my-pipeline",
