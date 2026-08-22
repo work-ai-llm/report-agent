@@ -9,7 +9,8 @@ import datetime
 # Add the parent directory to the path so we can import from 'agent'
 sys.path.append(str(Path(__file__).parent.parent))
 
-from agent.report_agent import store, langchain_agent
+from agent.report_agent import runtime
+# TODO, reintegrate it into report_agent initialization, for agent to seed context upon creation if db is empty
 
 def seed_context_to_store(store_instance, local_context_dir: Path):
     print("Seeding virtual filesystem from local context...")
@@ -118,7 +119,7 @@ def inspect_session_store(agent, thread_id: str):
         print("No session-specific files found in the state.")
 
 if __name__ == "__main__":
-    #seed_context_to_store(store, CONTEXT_DIR)
-    #wipe_entire_store(store)
-    inspect_global_store(store)
-    inspect_session_store(langchain_agent, "737280d4-4a28-4427-b851-de581174c3eb")
+    #seed_context_to_store(runtime.store, CONTEXT_DIR)
+    #wipe_entire_store(runtime.store)
+    inspect_global_store(runtime.store)
+    inspect_session_store(runtime.agent, "737280d4-4a28-4427-b851-de581174c3eb")

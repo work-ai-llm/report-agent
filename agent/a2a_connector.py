@@ -39,8 +39,8 @@ from a2a.helpers import (
     new_text_part,
 )
 
-# Import global variables from report_agent for initialization in lifespan
-from agent import report_agent
+# Import runtime from report_agent for initialization in lifespan
+from agent.report_agent import runtime
 from langchain_core.messages import AIMessage, ToolMessage
 from langfuse import observe, propagate_attributes
 
@@ -82,7 +82,7 @@ class ReportA2AExecutor(AgentExecutor):
     ) -> None:
         
         if not self.agent:
-            self.agent = report_agent.langchain_agent
+            self.agent = runtime.agent
             if not self.agent:
                 raise RuntimeError("Agent not initialized. Check lifespan startup.")
             
@@ -176,7 +176,7 @@ class ReportA2AExecutor(AgentExecutor):
         # and langfuse langchain hanlder isn't populating langfuse properly, so only manual way remains.
         # NOTE UPDATE, weirdly simple metadata tag worked properly with tailscale db test
         # hence for later, check the manual root construction, how to properly populate langfuse traces to include input/output
-        with report_agent.langfuse.start_as_current_observation(
+        with runtime.langfuse.start_as_current_observation(
             as_type="span",
             name="my-pipeline",
             input={"query": text_query}
@@ -290,8 +290,8 @@ async def lifespan(app: Starlette):
     """
     logger.info("Opening database pool and setting up tables...")
     
-    # 1. Open the connection pool
-    await report_agent.initiate_connection()
+    # 1. Initialize the runtime (langfuse, prompt, middleware, pool, agent)
+    await runtime.initialize()
     
     logger.info("Database setup complete. Agent is ready to accept requests.")
     
@@ -299,8 +299,8 @@ async def lifespan(app: Starlette):
     
     # 3. Clean up resources on shutdown
     logger.info("Shutting down and closing database pool...")
-    if report_agent.pool:
-        await report_agent.pool.close()
+    if runtime.pool:
+        await runtime.pool.close()
 
 
 # ==========================================

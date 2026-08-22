@@ -12,7 +12,7 @@ from pathlib import Path
 
 # Adjust path to import the store and agent
 sys.path.append(str(Path(__file__).parent.parent))
-from agent.report_agent import langchain_agent, DB_URI
+from agent.report_agent import runtime, DB_URI
 # 1. Import ONLY the sync pool and store
 from psycopg_pool import ConnectionPool
 from langgraph.store.postgres import PostgresStore
@@ -117,7 +117,7 @@ def inspect_session_store(thread_id: str):
     config = {"configurable": {"thread_id": thread_id}}
     
     try:
-        state = langchain_agent.get_state(config)
+        state = runtime.agent.get_state(config)
     except Exception as e:
         print(f"Error fetching state: {e}")
         return

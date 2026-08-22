@@ -9,9 +9,9 @@ from pathlib import Path
 root_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(root_dir))
 
-from agent.report_agent import langchain_agent
+from agent.report_agent import runtime
 from langchain_core.messages import RemoveMessage
-
+# TODO, useless file, delete for later, since the logic is moved to store_cli.py
 def inspect_thread(thread_id: str):
     print(f"\n--- Inspecting: {thread_id} ---")
     
@@ -19,7 +19,7 @@ def inspect_thread(thread_id: str):
     config = {"configurable": {"thread_id": thread_id}}
     
     # 2. The magic built-in method. It handles all the Postgres/msgpack decoding!
-    state = langchain_agent.get_state(config)
+    state = runtime.agent.get_state(config)
     
     if not state or not state.values:
         print("No data found.")
@@ -43,14 +43,14 @@ def pop_and_retry(thread_id: str):
     config = {"configurable": {"thread_id": thread_id}}
     
     # 1. Get the current state
-    state = langchain_agent.get_state(config)
+    state = runtime.agent.get_state(config)
     
     # 2. Find the ID of the message you want to remove (e.g., the last AI message that crashed)
     # Let's say we want to remove the last message in the history
     last_msg_id = state.values["messages"][-1].id
     
     # 3. Update the state by "removing" that message
-    langchain_agent.update_state(
+    runtime.agent.update_state(
         config, 
         {"messages": [RemoveMessage(id=last_msg_id)]}
     )
