@@ -2,99 +2,75 @@
 # convinient tool to inspect,delete,add files from pc filesystem to postgress virtual filesystem
 # filesystem control
 
-
-
-
 import argparse
+import asyncio
 import datetime
 import sys
 from pathlib import Path
 
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 # Adjust path to import the store and agent
 sys.path.append(str(Path(__file__).parent.parent))
-from agent.report_agent import runtime, DB_URI
-# 1. Import ONLY the sync pool and store
-from psycopg_pool import ConnectionPool
-from langgraph.store.postgres import PostgresStore
+from agent.report_agent import runtime
 
-# 2. Initialize the sync pool and store DIRECTLY in the CLI
-print("Connecting to Postgres for CLI...")
-cli_pool = ConnectionPool(
-    conninfo=DB_URI,
-    kwargs={"autocommit": True, "prepare_threshold": 0}
-)
-store = PostgresStore(cli_pool)
-store.setup()
-print("Store initialized successfully.\n")
+# No pool/store created at import - reused from runtime (same file as AgentRuntime LOCAL_DB_PATH)
+# via await runtime._init_pool() in main(). No extra pool.
 
+async def _ensure_runtime_store():
+    if runtime.store is None or runtime.checkpointer is None:
+        await runtime._init_pool()
 
-# NOTE, let's call this whole file as a stupid way to debug store db.
-
-def seed_store(local_dir: Path):
+async def seed_store(local_dir: Path):
     print(f"Seeding virtual filesystem from {local_dir}...")
     if not local_dir.exists():
         print(f"Error: Local context folder not found at {local_dir}")
         return
-
     namespace = ("filesystem",)
     now = datetime.datetime.now().isoformat()
     count = 0
-
     for file_path in local_dir.rglob("*"):
         if file_path.is_file():
             relative_path = file_path.relative_to(local_dir)
             content = file_path.read_text(encoding="utf-8")
-            
-            # Ensure leading slash for consistency with FilesystemMiddleware
             file_key = "/" + relative_path.as_posix() 
-            
             file_data = {
                 "content": content, 
                 "encoding": "utf-8",
                 "created_at": now,
                 "modified_at": now,
             }
-            
-            store.put(namespace, file_key, file_data)
+            await runtime.store.aput(namespace, file_key, file_data)
             print(f"  Seeded: {file_key} ({len(content)} chars)")
             count += 1
-            
     print(f"Seeding complete. {count} files added.\n")
 
-def wipe_store(namespace_str: str):
-    print(f"Wiping store for namespace: '{namespace_str}'...")
+async def wipe_store(namespace_str: str):
+    print(f"Wiping virtual filesystem namespace: '{namespace_str}'...")
     ns_tuple = tuple(namespace_str.split(".")) if namespace_str else ()
-    
-    items = store.search(ns_tuple)
+    items = await runtime.store.asearch(ns_tuple)
     if not items:
         print("No items found to delete.")
         return
-        
     for item in items:
-        store.delete(item.namespace, item.key)
+        await runtime.store.adelete(item.namespace, item.key)
         print(f"  Deleted: {item.namespace} -> {item.key}")
-        
     print(f"Store wiped. {len(items)} items deleted.\n")
 
-def inspect_store(namespace_str: str, show_size: bool, show_dates: bool, preview_chars: int):
-    print(f"Inspecting namespace: '{namespace_str}'...")
+async def inspect_store(namespace_str: str, show_size: bool, show_dates: bool, preview_chars: int):
+    print(f"Inspecting virtual filesystem namespace: '{namespace_str}'...")
     ns_tuple = tuple(namespace_str.split(".")) if namespace_str else ()
-    
-    items = store.search(ns_tuple) 
+    items = await runtime.store.asearch(ns_tuple)
     if not items:
         print("No items found in this namespace.")
         return
-        
     for item in items:
-        # Always print the path
         print(f"Path: {item.key}")
-        
-        # Only process content if we need to show extra details
         if show_size or show_dates or preview_chars > 0:
             content = item.value.get("content", "")
             if isinstance(content, list):
                 content = "\n".join(content)
-                
             details = []
             if show_size:
                 details.append(f"Size: {len(content)} chars")
@@ -102,154 +78,313 @@ def inspect_store(namespace_str: str, show_size: bool, show_dates: bool, preview
                 created = item.value.get("created_at", "N/A")
                 modified = item.value.get("modified_at", "N/A")
                 details.append(f"Created: {created} | Modified: {modified}")
-                
             if details:
                 print(f"  {' | '.join(details)}")
-                
             if preview_chars > 0:
                 preview = content[:preview_chars].replace('\n', ' ')
                 print(f"  Preview: {preview}...")
-        print("") # Empty line for readability
+        print("")
 
+async def list_sessions():
+    """List all thread_ids chronologically with created/last timestamps."""
+    print("Listing sessions in checkpointer (agent_session.db) chronologically...")
+    try:
+        import aiosqlite
+        from agent.report_agent import LOCAL_DB_PATH
+        # Get thread_ids, then sort by earliest checkpoint ts
+        async with aiosqlite.connect(str(LOCAL_DB_PATH)) as conn:
+            async with conn.execute("SELECT DISTINCT thread_id FROM checkpoints") as cur:
+                rows = await cur.fetchall()
+                if not rows:
+                    print("No sessions found.")
+                    return
+                tids = [r[0] for r in rows]
+        # For each tid, get full history via alist to extract created/last ts
+        sessions = []
+        for tid in tids:
+            try:
+                checkpoints = [t async for t in runtime.checkpointer.alist({"configurable": {"thread_id": tid}})]
+                if not checkpoints:
+                    sessions.append((tid, None, None, 0, "?"))
+                    continue
+                checkpoints = list(reversed(checkpoints))  # chronological
+                first_ts = checkpoints[0].checkpoint.get("ts") if isinstance(checkpoints[0].checkpoint, dict) else None
+                last_ts = checkpoints[-1].checkpoint.get("ts") if isinstance(checkpoints[-1].checkpoint, dict) else None
+                # Fallback to metadata if ts missing
+                if not first_ts and checkpoints[0].metadata:
+                    first_ts = checkpoints[0].metadata.get("created_at") or checkpoints[0].checkpoint.get("id")
+                if not last_ts and checkpoints[-1].metadata:
+                    last_ts = checkpoints[-1].metadata.get("updated_at")
+                tup = checkpoints[-1]
+                vals = tup.checkpoint.get("channel_values", {}) if isinstance(tup.checkpoint, dict) else {}
+                msgs = vals.get("messages", [])
+                step = tup.metadata.get("step", "?") if tup.metadata else "?"
+                sessions.append((tid, first_ts, last_ts, len(msgs), step))
+            except Exception as e:
+                sessions.append((tid, None, None, 0, f"error:{e}"))
+        # Sort chronologically by created ts (ISO strings sort correctly)
+        sessions.sort(key=lambda x: x[1] or "")
+        def _explain_ts(ts: str) -> str:
+            # 2026-08-25T16:05:27.221455+00:00 -> 2026 year - 08 month - 25 day T 16 hour:05 minute:27 second .221455 microseconds +00:00 UTC
+            if not ts or ts == "unknown":
+                return ""
+            try:
+                date, time_tz = ts.split("T") if "T" in ts else (ts, "")
+                year, month, day = date.split("-") if "-" in date else (date, "", "")
+                tz = ""
+                if "+" in time_tz:
+                    time_part, tz = time_tz.split("+", 1)
+                    tz = "+" + tz + " UTC"
+                elif time_tz.endswith("Z"):
+                    time_part = time_tz[:-1]
+                    tz = "Z UTC"
+                else:
+                    time_part = time_tz
+                hour = minute = second = micro = ""
+                if ":" in time_part:
+                    h, m, rest = time_part.split(":", 2)
+                    hour, minute = h, m
+                    if "." in rest:
+                        second, micro = rest.split(".", 1)
+                    else:
+                        second = rest
+                micro = f".{micro} microseconds" if micro else ""
+                # keep leading space for parenthesis, don't strip it
+                return f" (Date {year}:{month}:{day}, Time {hour}:{minute}, {second} seconds, {micro})"
+            except Exception:
+                return ""
+        print(f"Found {len(sessions)} session(s) (chronological):")
+        for tid, created, last, msg_count, step in sessions:
+            print(f" - {tid}")
+            print(f"   created: {created or 'unknown'}{_explain_ts(created) if created else ''}")
+            print(f"   last message: {last or 'unknown'}{_explain_ts(last) if last else ''}")
+            print(f"   (messages: {msg_count}, step: {step})")
+    except Exception as e:
+        print(f"Error listing sessions: {e}")
+        import traceback
+        traceback.print_exc()
 
-def inspect_session_store(thread_id: str):
+async def inspect_session_store(thread_id: str):
     print(f"Inspecting session state for thread_id: '{thread_id}'...")
     config = {"configurable": {"thread_id": thread_id}}
-    
+    # Use alist for full history (all checkpoints), not just latest
+    # alist = async iterator over CheckpointTuple history for thread_id
+    # aget_tuple = single latest checkpoint
     try:
-        state = runtime.agent.get_state(config)
+        # Use alist to show full message chain across all steps
+        checkpoints = []
+        async for tup in runtime.checkpointer.alist(config):
+            checkpoints.append(tup)
+        if not checkpoints:
+            print("No state found for this thread.")
+            return
+        # alist returns newest first, reverse to show chronological
+        checkpoints = list(reversed(checkpoints))
+        print(f"Found {len(checkpoints)} checkpoint(s) for this thread.")
+        # Show latest checkpoint's full state
+        latest = checkpoints[-1]
+        checkpoint = latest.checkpoint
+        values = checkpoint.get("channel_values", {}) if isinstance(checkpoint, dict) else {}
+        print(f"Available state keys: {list(values.keys())}")
+        if latest.metadata:
+            print(f"Metadata: {latest.metadata}")
+        # files check: files in checkpoint is StateBackend scratchpad (/scratchpad/draft.md)
+        # User can write via write_file("/scratchpad/...") tool, LLM can too.
+        # StoreBackend (/context/...) is in virtual filesystem (inspect), not here.
+        if 'files' in values:
+            session_files = values['files']
+            if isinstance(session_files, dict) and session_files:
+                print(f"\nVirtual filesystem (scratchpad) files in session ({len(session_files)}):")
+                for file_path, file_content in session_files.items():
+                    print(f"\nPath: {file_path}")
+                    content = file_content.get("content", "") if isinstance(file_content, dict) else str(file_content)
+                    size = len(content)
+                    print(f"  Size: {size} chars")
+                    print(f"  Content:\n{content}")
+            elif isinstance(session_files, dict):
+                print("\nNo scratchpad files in this session (virtual filesystem files are in Store via `inspect`).")
+            else:
+                print("Session files format is unexpected.")
+        else:
+            print("\nNo scratchpad files in state (virtual filesystem files are in Store via `inspect`).")
+
+        # Show ALL messages in full (the entire purpose of this function)
+        if 'messages' in values:
+            msgs = values['messages']
+            print(f"\n=== Full session messages ({len(msgs)}) ===")
+            for idx, m in enumerate(msgs, 1):
+                # Handle both LangChain message objects and dicts
+                if isinstance(m, dict):
+                    mtype = m.get('type', 'unknown')
+                    content = m.get('content', '')
+                    tool_calls = m.get('tool_calls', [])
+                    tool_call_id = m.get('tool_call_id')
+                    name = m.get('name')
+                else:
+                    mtype = getattr(m, 'type', type(m).__name__)
+                    content = getattr(m, 'content', '')
+                    tool_calls = getattr(m, 'tool_calls', None)
+                    tool_call_id = getattr(m, 'tool_call_id', None)
+                    name = getattr(m, 'name', None)
+                # Format content
+                if isinstance(content, list):
+                    parts = []
+                    for c in content:
+                        if isinstance(c, dict):
+                            if c.get('type') == 'tool_call':
+                                parts.append(f"[tool_call id={c.get('id')} name={c.get('name')} args={c.get('args')}]")
+                            elif 'text' in c:
+                                parts.append(str(c.get('text')))
+                            else:
+                                parts.append(str(c))
+                        else:
+                            parts.append(str(c))
+                    content = "\n".join(parts) if parts else ""
+                elif content is None:
+                    content = ""
+                content = str(content)
+                print(f"\n--- Message {idx} [{mtype}] ---")
+                if name:
+                    print(f"  name: {name}")
+                if tool_call_id:
+                    print(f"  tool_call_id: {tool_call_id}")
+                # Print content in full (no truncation)
+                if content.strip():
+                    print(content)
+                else:
+                    print("(no content)")
+                # Show tool call details if present
+                if tool_calls:
+                    for tc in tool_calls:
+                        if isinstance(tc, dict):
+                            print(f"  [tool_call] {tc.get('name')} id={tc.get('id')} args={tc.get('args')}")
+                        else:
+                            # LangChain ToolCall object
+                            print(f"  [tool_call] {getattr(tc, 'name', tc)} id={getattr(tc, 'id', '')} args={getattr(tc, 'args', '')}")
+        # Also show history length via alist
+        if len(checkpoints) > 1:
+            print(f"\n--- History: {len(checkpoints)} checkpoints, latest step {latest.metadata.get('step', '?') if latest.metadata else '?'} ---")
     except Exception as e:
         print(f"Error fetching state: {e}")
+        import traceback
+        traceback.print_exc()
         return
-        
-    if not state or not state.values:
-        print("No state found for this thread.")
-        return
-        
-    print(f"Available state keys: {list(state.values.keys())}")
-    
-    if 'files' in state.values:
-        session_files = state.values['files']
-        if isinstance(session_files, dict):
-            for file_path, file_content in session_files.items():
-                print(f"\nPath: {file_path}")
-                content = file_content.get("content", "") if isinstance(file_content, dict) else str(file_content)
-                size = len(content)
-                print(f"  Size: {size} chars")
-                preview = content[:100].replace('\n', ' ')
-                print(f"  Preview: {preview}...")
-        else:
-            print("Session files format is unexpected.")
-    else:
-        print("No session files found in state.")
 
-def export_file(store_path: str, local_path: Path):
+async def export_file(store_path: str, local_path: Path):
     print(f"Exporting '{store_path}' to '{local_path}'...")
-    item = store.get(("filesystem",), store_path)
+    item = await runtime.store.aget(("filesystem",), store_path)
     if not item:
         print(f"Error: File not found at '{store_path}' in the store.")
         return
-        
     content = item.value.get("content", "")
     if isinstance(content, list):
         content = "\n".join(content)
-        
     local_path.parent.mkdir(parents=True, exist_ok=True)
     local_path.write_text(content, encoding="utf-8")
     print(f"Successfully exported to {local_path.absolute()} ({len(content)} chars)\n")
 
-def delete_file(store_path: str):
-    print(f"Deleting '{store_path}' from store...")
+async def delete_file(store_path: str):
+    print(f"Deleting '{store_path}' from virtual filesystem...")
     namespace = ("filesystem",)
     try:
-        store.delete(namespace, store_path)
+        await runtime.store.adelete(namespace, store_path)
         print(f"Successfully deleted '{store_path}'.\n")
     except Exception as e:
         print(f"Error deleting file: {e}\n")
 
-def main():
+async def main():
     examples = """
 Examples:
-  # Wipe the entire store
+  # Wipe the entire virtual filesystem
   python store_cli.py wipe --namespace all
 
-  # Seed the store from a local directory
+  # Seed the virtual filesystem from a local directory
   python store_cli.py seed --dir ./context
 
-  # Inspect the store (simple list)
+  # Inspect the virtual filesystem (simple list)
   python store_cli.py inspect
 
-  # Inspect the store with metadata and preview
+  # Inspect the virtual filesystem with metadata and preview
   python store_cli.py inspect --show-size --show-dates --preview 50
 
-  # Export a file from the store to local disk
-  python store_cli.py export --store-path /context/templates/recon.md --local-path ./exported_test.md
+  # List all sessions in checkpointer
+  python store_cli.py list-sessions
 
-  # Delete a specific file from the store
-  python store_cli.py delete --store-path /context/templates/recon.md
+  # Export a file from the virtual filesystem to local disk
+  python store_cli.py export --store-path /findings/bloodhound_dump.txt --local-path ./exported_test.md
 
-  # inspect store in session
+  # Delete a specific file from the virtual filesystem
+  python store_cli.py delete --store-path /findings/bloodhound_dump.txt
+
+  # inspect session history
   python store_cli.py inspect-session --thread-id 737280d4-4a28-4427-b851-de581174c3eb
 """
 
     parser = argparse.ArgumentParser(
-        description="LangChain PostgresStore Debugging CLI",
+        description="LangChain Store Debugging CLI (reuses AgentRuntime store/checkpointer, same agent_session.db)",
         epilog=examples,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
-    # 1. Seed
-    p_seed = subparsers.add_parser("seed", help="Seed the store from a local directory")
+    p_seed = subparsers.add_parser("seed", help="Seed the virtual filesystem from a local directory")
     p_seed.add_argument("--dir", type=Path, default=Path("./context"), help="Local directory to seed from")
 
-    # 2. Wipe
-    p_wipe = subparsers.add_parser("wipe", help="Wipe the store")
+    p_wipe = subparsers.add_parser("wipe", help="Wipe the virtual filesystem")
     p_wipe.add_argument("--namespace", type=str, default="filesystem", help="Namespace to wipe (e.g., 'filesystem'). Use 'all' for root.")
 
-    # 3. Inspect
-    p_inspect = subparsers.add_parser("inspect", help="Inspect the store contents")
+    p_inspect = subparsers.add_parser("inspect", help="Inspect the virtual filesystem contents")
     p_inspect.add_argument("--namespace", type=str, default="filesystem", help="Namespace to inspect")
     p_inspect.add_argument("--show-size", action="store_true", help="Show file sizes")
     p_inspect.add_argument("--show-dates", action="store_true", help="Show creation/modification dates")
     p_inspect.add_argument("--preview", type=int, default=0, help="Number of characters for file preview (0 to disable)")
 
-    # 4. Export
-    p_export = subparsers.add_parser("export", help="Export a file from the store to local disk")
-    p_export.add_argument("--store-path", type=str, required=True, help="Path in the store (e.g., /context/reports/report.md)")
+    p_list = subparsers.add_parser("list-sessions", help="List all thread_ids in checkpointer")
+
+    p_export = subparsers.add_parser("export", help="Export a file from the virtual filesystem to local disk")
+    p_export.add_argument("--store-path", type=str, required=True, help="Path in the virtual filesystem (e.g., /findings/bloodhound_dump.txt)")
     p_export.add_argument("--local-path", type=Path, required=True, help="Local path to save to")
 
-    # 5. Delete
-    p_delete = subparsers.add_parser("delete", help="Delete a specific file from the store")
-    p_delete.add_argument("--store-path", type=str, required=True, help="Path in the store to delete")
+    p_delete = subparsers.add_parser("delete", help="Delete a specific file from the virtual filesystem")
+    p_delete.add_argument("--store-path", type=str, required=True, help="Path in the virtual filesystem to delete")
 
-    # 6. Inspect Session
-    p_session = subparsers.add_parser("inspect-session", help="Inspect session-tied scratchpad files")
+    p_session = subparsers.add_parser("inspect-session", help="Inspect full session history from checkpointer")
     p_session.add_argument("--thread-id", type=str, required=True, help="The thread_id (context_id) of the session")
 
     args = parser.parse_args()
 
+    # Ensure runtime store/checkpointer ready (no LLM needed for store/session inspect)
+    await _ensure_runtime_store()
+
     if args.command == "seed":
-        seed_store(args.dir)
+        await seed_store(args.dir)
     elif args.command == "wipe":
         ns = "" if args.namespace.lower() == "all" else args.namespace
-        wipe_store(ns)
+        await wipe_store(ns)
     elif args.command == "inspect":
-        # FIX: Pass all the parsed arguments to the function
-        inspect_store(args.namespace, args.show_size, args.show_dates, args.preview)
+        await inspect_store(args.namespace, args.show_size, args.show_dates, args.preview)
+    elif args.command == "list-sessions":
+        await list_sessions()
     elif args.command == "export":
-        export_file(args.store_path, args.local_path)
+        await export_file(args.store_path, args.local_path)
     elif args.command == "delete":
-        delete_file(args.store_path)
+        await delete_file(args.store_path)
     elif args.command == "inspect-session":
-        inspect_session_store(args.thread_id)
+        await inspect_session_store(args.thread_id)
     else:
         parser.print_help()
 
-if __name__ == "__main__":
+    # Close async connections to allow loop to exit (aiosqlite keeps background thread)
     try:
-        main()
-    finally:
-        # 3. Clean up the pool when the CLI exits
-        if cli_pool:
-            cli_pool.close()
+        if runtime.checkpointer is not None and hasattr(runtime.checkpointer, 'conn'):
+            await runtime.checkpointer.conn.close()
+    except Exception:
+        pass
+    try:
+        if runtime.store is not None and hasattr(runtime.store, 'conn'):
+            await runtime.store.conn.close()
+    except Exception:
+        pass
+
+if __name__ == "__main__":
+    asyncio.run(main())

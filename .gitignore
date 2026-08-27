@@ -1,5 +1,14 @@
 .env
 
+# local SQLite fallback (single file, WAL aux files)
+agent_session.db
+agent_session.db-shm
+agent_session.db-wal
+*.db
+*.db-shm
+*.db-wal
+exported_reports/
+
 # python cache
 __pycache__/
 *.pyc

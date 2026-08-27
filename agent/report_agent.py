@@ -1,6 +1,11 @@
+import asyncio
+import sys
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 import os
 import logging
 import httpx
+import aiosqlite
 from pathlib import Path
 from dotenv import load_dotenv
 from langchain.agents import create_agent
@@ -8,12 +13,14 @@ from langchain.tools import tool, ToolRuntime
 #from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.postgres import PostgresSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from psycopg_pool import ConnectionPool, AsyncConnectionPool
 from psycopg.rows import dict_row
 
 
 # NEW IMPORTS for Persistent Virtual Filesystem
 from langgraph.store.postgres import PostgresStore, AsyncPostgresStore
+from langgraph.store.sqlite.aio import AsyncSqliteStore
 from deepagents.middleware import FilesystemMiddleware
 from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
 from langchain_core.rate_limiters import InMemoryRateLimiter
@@ -30,11 +37,24 @@ load_dotenv()
 # ==========================================
 # Logging setup (global process state, stays at module level)
 # ==========================================
-# 1. FORCE LANGCHAIN TO SHOW REAL ERRORS
-logging.basicConfig(level=logging.DEBUG)
-logging.getLogger("httpx").setLevel(logging.DEBUG)
-logging.getLogger("httpcore").setLevel(logging.DEBUG) 
-logging.getLogger("langchain").setLevel(logging.DEBUG)
+# Selectable via env: LOG_LEVEL=DEBUG for httpx/langchain, else INFO (default)
+# Best practice (vs hard-coded DEBUG): use env var so import doesn't force verbose
+# Professional codebases use logging.getLogger(__name__) + dictConfig/env, not basicConfig(DEBUG) at import
+LOG_LEVEL_STR = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = getattr(logging, LOG_LEVEL_STR, logging.INFO)
+logging.basicConfig(level=LOG_LEVEL)
+# Only enable verbose for httpx/httpcore/langchain when explicitly DEBUG
+if LOG_LEVEL == logging.DEBUG:
+    logging.getLogger("httpx").setLevel(logging.DEBUG)
+    logging.getLogger("httpcore").setLevel(logging.DEBUG)
+    logging.getLogger("langchain").setLevel(logging.DEBUG)
+else:
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("langchain").setLevel(logging.WARNING)
+# aiosqlite DEBUG is noisy (every PRAGMA/SELECT) - keep at INFO unless LOG_LEVEL==DEBUG
+if LOG_LEVEL != logging.DEBUG:
+    logging.getLogger("aiosqlite").setLevel(logging.WARNING)
 
 
 # ==========================================
@@ -46,6 +66,9 @@ DB_URI = os.getenv("POSTGRES_URI")
 CONTEXT_DIR = Path(__file__).parent / "context"
 
 sys_prompt_path = Path(__file__).parent / "reports.md"
+
+# Local SQLite fallback (single file, two tables inside - same pattern as Postgres)
+LOCAL_DB_PATH = Path(__file__).parent / "agent_session.db"
 
 
 # ==========================================
@@ -141,18 +164,24 @@ class AgentRuntime:
     # ==========================================
     
     def _init_langfuse(self):
-        """Initialize Langfuse observability client."""
-        self.langfuse = get_client()
-        
-        # Verify connection
-        if self.langfuse.auth_check():
-            print("Langfuse client is authenticated and ready!")
-        else:
-            print("Authentication failed. Please check your credentials and host.")
-        
-        # Initialize the handler. It automatically reads LANGFUSE_PUBLIC_KEY, 
-        # LANGFUSE_SECRET_KEY, and LANGFUSE_BASE_URL from your .env file.
-        self.langfuse_handler = CallbackHandler()
+        """Initialize Langfuse observability client (optional, fails gracefully offline)."""
+        try:
+            self.langfuse = get_client()
+            # auth_check does network I/O - guard with try so offline doesn't crash initialize()
+            try:
+                if self.langfuse.auth_check():
+                    print("Langfuse client is authenticated and ready!")
+                else:
+                    print("Authentication failed. Please check your credentials and host.")
+            except Exception as e:
+                print(f"Langfuse auth_check failed ({e}), running without observability")
+                self.langfuse_handler = None
+                return
+            self.langfuse_handler = CallbackHandler()
+        except Exception as e:
+            print(f"Langfuse init failed ({e}), running without observability")
+            self.langfuse = None
+            self.langfuse_handler = None
     
     def _init_system_prompt(self):
         """Load the system prompt from disk."""
@@ -233,8 +262,11 @@ class AgentRuntime:
         )
     
     async def _init_pool(self):
-        """Initialize database pool, checkpointer, and store."""
+        """Initialize database pool, checkpointer, and store.
         
+        Tries remote Postgres first (if POSTGRES_URI is set and reachable).
+        Falls back to local SQLite (single file, two tables) for offline/dev.
+        """
         # Legacy code: sync pool implementation (just a reminder for devs)
         # """self.pool = ConnectionPool(
         #     conninfo=DB_URI,
@@ -250,30 +282,72 @@ class AgentRuntime:
         # self.store.setup() # for async it shouldn't be called
         # """   
         
-        # Async implementation
-        self.pool = AsyncConnectionPool(
-            conninfo=DB_URI,
-            kwargs={
-                "autocommit": True,       # Required by LangGraph
-                "prepare_threshold": 0,   # Recommended for connection pools
-                "row_factory": dict_row,  # Required by LangGraph to read rows as dictionaries
-
-                # --- CRITICAL: TCP KEEPALIVES ---
-                # Prevents the OS/Firewall from dropping idle connections during long LLM generations
-                "keepalives": 1,
-                "keepalives_idle": 30,       # Send heartbeat after 30s of idle time
-                "keepalives_interval": 10,   # Resend every 10s if no ack
-                "keepalives_count": 3,       # Drop connection after 3 failed heartbeats
-                },
-            open=False 
-        )
-        await self.pool.open()
+        # --- Try Postgres if DB_URI is configured ---
+        if DB_URI:
+            try:
+                # Append connect_timeout so psycopg fails fast (not 30s) when offline
+                conninfo = DB_URI
+                if "connect_timeout" not in conninfo:
+                    sep = "&" if "?" in conninfo else "?"
+                    conninfo = f"{conninfo}{sep}connect_timeout=3"
+                self.pool = AsyncConnectionPool(
+                    conninfo=conninfo,
+                    kwargs={
+                        "autocommit": True,
+                        "prepare_threshold": 0,
+                        "row_factory": dict_row,
+                        "keepalives": 1,
+                        "keepalives_idle": 30,
+                        "keepalives_interval": 10,
+                        "keepalives_count": 3,
+                    },
+                    open=False,
+                    timeout=3.0,
+                )
+                # Short timeout so local fallback is fast when offline
+                await asyncio.wait_for(self.pool.open(), timeout=4.0)
+                
+                self.checkpointer = AsyncPostgresSaver(self.pool)
+                await self.checkpointer.setup()
+                
+                self.store = AsyncPostgresStore(self.pool)
+                await self.store.setup()
+                print(f"Using Postgres backend: {DB_URI[:30]}...")
+                return
+            except Exception as e:
+                print(f"Postgres unreachable ({e}), falling back to local SQLite: {LOCAL_DB_PATH}")
+                if self.pool is not None:
+                    try:
+                        await self.pool.close()
+                    except Exception:
+                        pass
+                    self.pool = None
         
-        self.checkpointer = AsyncPostgresSaver(self.pool)
+        # --- Fallback: local SQLite (same file, two tables - checkpoints + store) ---
+        # This mirrors Postgres pattern: one server/file, separate tables for saver vs store.
+        # Reuses same self.checkpointer / self.store variables, just different backend.
+        self.pool = None  # No pg pool in local mode
+        LOCAL_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Two connections to same file - mirrors pool's ability to serve both saver+store
+        # (see explanation below why pool can't be used for SQLite)
+        # timeout/busy_timeout must match sync CLI (dev_tools/store_cli.py) to avoid 'database is locked'
+        # when both async agent and sync CLI share same file (WAL mode)
+        conn_checkpointer = await aiosqlite.connect(str(LOCAL_DB_PATH), timeout=30.0, isolation_level=None)
+        conn_store = await aiosqlite.connect(str(LOCAL_DB_PATH), timeout=30.0, isolation_level=None)
+        await conn_checkpointer.execute("PRAGMA journal_mode=WAL;")
+        await conn_checkpointer.execute("PRAGMA busy_timeout=30000;")
+        await conn_checkpointer.execute("PRAGMA synchronous=NORMAL;")
+        await conn_store.execute("PRAGMA journal_mode=WAL;")
+        await conn_store.execute("PRAGMA busy_timeout=30000;")
+        await conn_store.execute("PRAGMA synchronous=NORMAL;")
+        
+        self.checkpointer = AsyncSqliteSaver(conn_checkpointer)
         await self.checkpointer.setup()
         
-        self.store = AsyncPostgresStore(self.pool)
+        self.store = AsyncSqliteStore(conn_store)
         await self.store.setup()
+        print(f"Using local SQLite backend: {LOCAL_DB_PATH}")
     
     async def _create_agent(self):
         """Create the LangChain agent with all middleware."""
@@ -287,7 +361,12 @@ class AgentRuntime:
             checkpointer=self.checkpointer
         )
         
-        self.agent = self.agent.with_config({"callbacks": [self.langfuse_handler]})
+        callbacks = [self.langfuse_handler] if self.langfuse_handler else []
+        # Phoenix alternative (when added): OpenTelemetry instrumentation, not callbacks:
+        #   from phoenix.otel import register; register()
+        #   from openinference.instrumentation.langchain import LangChainInstrumentor
+        #   LangChainInstrumentor().instrument()  -- auto-captures spans, no handler needed
+        self.agent = self.agent.with_config({"callbacks": callbacks}) if callbacks else self.agent
 
 
 # ==========================================
