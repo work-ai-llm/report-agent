@@ -174,8 +174,11 @@ class ReportA2AExecutor(AgentExecutor):
         # Manually added langfuse observation
         # NOTE, unfortenatly there is no way to handle trace root level input, output, the functions for that are depreciated
         # and langfuse langchain hanlder isn't populating langfuse properly, so only manual way remains.
-        # NOTE UPDATE, weirdly simple metadata tag worked properly with tailscale db test
-        # hence for later, check the manual root construction, how to properly populate langfuse traces to include input/output
+        # TODO: The simple metadata tag approach worked properly in tailscale db test (tests/acceptance/4_tailscale_db.py:34)
+        # via config["metadata"]["langfuse_session_id"]. Investigate whether manual span creation below can be replaced
+        # or simplified by relying on the metadata-based tracing instead.
+        # TODO: Langfuse may not be the only tracing option. Arize Phoenix is an alternative that could work with
+        # SQLite as a local DB instead of a remote server, which would simplify dev/test environments.
         with runtime.langfuse.start_as_current_observation(
             as_type="span",
             name="my-pipeline",
@@ -276,7 +279,29 @@ class ReportA2AExecutor(AgentExecutor):
         )
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        pass
+        """
+        Cancel an ongoing task and publish the terminal CANCELED event.
+
+        Called by the A2A SDK when a client sends CancelTaskRequest. The SDK has
+        already cancelled the producer task (raising asyncio.CancelledError inside
+        execute(), whose finally block releases the execution lock). The actual
+        execution STOPPING is done entirely by the SDK internals.
+
+        NOTE: This method does NOT stop the task. Its only job is to inform the
+        client that the task was actually canceled, by publishing a
+        TaskStatusUpdateEvent(TASK_STATE_CANCELED) to the event queue. The consumer
+        then updates the task store so clients querying task state see CANCELED
+        instead of the stale WORKING state.
+        """
+        if not context.task_id:
+            return
+
+        task_updater = TaskUpdater(
+            event_queue=event_queue,
+            task_id=context.task_id,
+            context_id=context.context_id,
+        )
+        await task_updater.cancel(message=new_text_message('Task canceled.'))
 
 
 # ==========================================
