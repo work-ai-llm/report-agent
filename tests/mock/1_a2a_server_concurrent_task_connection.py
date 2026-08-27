@@ -1,11 +1,45 @@
 # tests/mock/1_a2a_server_concurrent_task_connection.py
+#
+# ============================================================================
+# PURPOSE OF THIS FILE
+# ============================================================================
+# These tests validate TWO SEPARATE layers of the A2A report server WITHOUT any
+# external services. All real dependencies are swapped for in-memory stand-ins:
+#
+#   FakeLangChainAgent  → replaces the real LangChain agent (no LLM API calls,
+#                         no token cost). Simulates a full agent run by yielding
+#                         a tool call, a tool result, and a final answer.
+#   MagicMock           → replaces runtime.langfuse (no Langfuse server reachable).
+#                         _process_task() uses langfuse spans as context managers;
+#                         a MagicMock satisfies that protocol with zero setup.
+#   InMemoryTaskStore   → replaces the Postgres-backed task store.
+#
+# The two layers under test:
+#
+#   1. test_sequential_execution_and_state_updates
+#      → CONCURRENCY LOCKING. Proves the global execution lock (in
+#        ReportA2AExecutor) serializes concurrent client requests so exactly one
+#        agent runs at a time, while every request still completes.
+#
+#   2. test_cancellation_via_handler_and_lock_release
+#      → TASK LIFECYCLE. Proves a CancelTaskRequest stops a running task, marks
+#        it TASK_STATE_CANCELED in the store, and frees the execution lock so the
+#        next task runs immediately.
+#
+# NOTE: Layer 1 and layer 2 test DIFFERENT things. The lock does NOT manage the
+# task lifecycle; the task lifecycle is managed by the A2A SDK. They interact:
+# cancelling a running task releases the lock it held, which is why the lifecycle
+# test also asserts the lock is free afterwards.
+# ============================================================================
 
 import asyncio
 import time
 import pytest
+from unittest.mock import MagicMock
 
 # Import the REAL components
 from agent.a2a_connector import ReportA2AExecutor
+from agent.report_agent import runtime
 from a2a.server.request_handlers import DefaultRequestHandler
 from a2a.server.tasks import InMemoryTaskStore, InMemoryPushNotificationConfigStore
 from a2a.server.context import ServerCallContext
@@ -17,11 +51,42 @@ from a2a.types.a2a_pb2 import (
 from a2a.helpers import get_message_text
 
 # ==========================================
-# 1. THE MOCK DEPENDENCIES
+# 1. MOCK LANGFUSE (no real server needed)
+# ==========================================
+# MagicMock supports __enter__/__exit__ so it works as a context manager.
+# .start_as_current_observation() returns another MagicMock (root_span),
+# which itself supports .start_as_current_observation() → gen, and .update().
+# This satisfies all of _process_task's langfuse usage without a real server.
+
+mock_langfuse = MagicMock()
+
+@pytest.fixture(autouse=True)
+def patch_runtime_langfuse():
+    """Replace runtime.langfuse with a no-op mock for every test."""
+    original = runtime.langfuse
+    runtime.langfuse = mock_langfuse
+    yield
+    runtime.langfuse = original
+
+
+# ==========================================
+# 2. THE MOCK DEPENDENCIES
 # ==========================================
 
 class FakeLangChainAgent:
-    """Simulates the LangChain agent, yielding proper LangChain message objects."""
+    """
+    Simulates ONE full agent run (what the real agent's astream() produces).
+
+    It yields three LangGraph updates, one per await step, each preceded by
+    `delay` seconds so we can control how long a "run" takes:
+      1. an AIMessage requesting a tool call (read_file)
+      2. a ToolMessage with the tool's result (success)
+      3. a final AIMessage with the report text
+
+    `execution_count` increments on every astream() invocation. Tests use it to
+    assert how many times the agent actually ran (e.g. exactly twice when two
+    tasks execute sequentially, or once+once when one task is cancelled).
+    """
     def __init__(self, delay: float = 0.1):
         self.delay = delay
         self.execution_count = 0
@@ -83,7 +148,7 @@ def create_mock_send_request(context_id: str) -> SendMessageRequest:
 
 
 # ==========================================
-# 2. HELPER TO CONSUME STREAMS
+# 3. HELPER TO CONSUME STREAMS
 # ==========================================
 async def consume_stream(handler, req, context):
     """Wraps an async generator stream into a standard coroutine that asyncio.gather can handle."""
@@ -97,20 +162,76 @@ async def consume_stream(handler, req, context):
 
 
 # ==========================================
-# 3. THE INTEGRATION TESTS
+# 4. THE INTEGRATION TESTS
 # ==========================================
 
 @pytest.mark.asyncio
 async def test_sequential_execution_and_state_updates():
     """
-    Proves that:
-    1. Two concurrent requests are forced to run sequentially (timing check).
-    2. Both tasks are successfully created and reach TASK_STATE_COMPLETED in the store.
-    3. Task 2 waits in queue while Task 1 is processing (lock behavior).
+    ============================================================================
+    WHAT THIS TEST PROVES
+    ============================================================================
+    Two client requests fired concurrently are forced to run SEQUENTIALLY by the
+    global execution lock, and BOTH still reach TASK_STATE_COMPLETED.
+
+    ----------------------------------------------------------------------------
+    THE MECHANISM UNDER TEST (where the lock lives)
+    ----------------------------------------------------------------------------
+    ReportA2AExecutor.execute() wraps agent processing in a single global
+    asyncio.Lock. Before a task may run the agent, it must acquire the lock via
+    `asyncio.wait_for(lock.acquire(), timeout=30.0)`. If another task already
+    holds the lock, the waiting task loops: every 30s it times out and sends a
+    "Still waiting in queue..." status update to its client, until the lock frees.
+
+    WHY THIS MATTERS: without the lock, N concurrent clients would trigger N
+    simultaneous LLM calls, overwhelming the Mistral API rate limiter. The lock
+    serializes execution to exactly 1 agent run at a time.
+
+    ----------------------------------------------------------------------------
+    HOW THE TEST IS STRUCTURED (and why each piece exists)
+    ----------------------------------------------------------------------------
+    - ONE executor instance for both requests. The lock is module-global, so two
+      SEPARATE executors would still serialize — but a single instance mirrors
+      the real server and keeps the test honest.
+    - FakeLangChainAgent(delay=12). One full run = 3 steps x 12s = 36s. This is
+      deliberately LONGER than the 30s lock-wait timeout, which FORCES task 2 to
+      hit the timeout at least once and emit "Still waiting in queue...". If the
+      delay were shorter than 10s (3xdelay < 30s), task 2 would acquire the lock
+      before ever timing out, and the lock behavior would be invisible.
+    - Both requests fired via asyncio.gather → they genuinely start together.
+
+    EXPECTED EVENT TIMELINE
+      Task 1: SUBMITTED → "Task received. Waiting in execution queue..." →
+              acquires lock instantly → "Processing request..." → tool events →
+              COMPLETED
+      Task 2: SUBMITTED → "Task received. Waiting in execution queue..." →
+              BLOCKS on the lock → after 30s sends "Still waiting in queue..." →
+              Task 1 finishes at ~36s and releases the lock → Task 2 acquires →
+              "Processing request..." → COMPLETED
+
+    ----------------------------------------------------------------------------
+    ASSERTIONS → WHAT EACH ONE PROVES
+    ----------------------------------------------------------------------------
+      1. No exceptions in either stream           → both requests ran cleanly end-to-end.
+      2. agent.execution_count == 2               → astream() ran exactly twice; both tasks really executed.
+      3. First event of each stream is SUBMITTED  → the SDK created both tasks.
+      4. Task 1 got a waiting ACK message         → it entered execute() (the queue path).
+      5. Task 2 got >= 1 "Still waiting in queue" → IT WAS BLOCKED BY THE LOCK.
+                                                   THIS is the direct proof the lock serializes execution.
+      6. Task 2's first "Still waiting" precedes  → it waited FIRST, processed SECOND
+         its "Processing request"                   (correct queue discipline).
+      7. Task 1 COMPLETED before/at Task 2 start  → task 2's unblocking was caused by task 1 finishing,
+         (within 1s margin)                         not by any other reason.
+      8. Both streams end COMPLETED               → no task was dropped or left hanging.
+      9. Total wall time >= 60s                   → sequential (~72s), not parallel (~36s). Independent smoke check
+                                                    that reinforces #5.
+     10. Both tasks exist in the TaskStore and    → state persistence is correct after sequential execution.
+         are COMPLETED
+    ============================================================================
     """
     # 1. Setup: Use ONE executor instance so they share the SAME execution lock
     executor = ReportA2AExecutor()
-    executor.agent = FakeLangChainAgent(delay=20)  # 20s per step * 3 steps = ~60s per task
+    executor.agent = FakeLangChainAgent(delay=12)  # 12s per step * 3 steps = ~36s per task (>30s lock timeout)
     handler = create_mock_request_handler(executor)
     
     req1 = create_mock_send_request("ctx-1")
@@ -245,7 +366,7 @@ async def test_sequential_execution_and_state_updates():
     # If tasks ran truly concurrently, total_time would be ~60s
     # If sequential, total_time would be ~120s (60s + 60s)
     # We allow some margin for overhead
-    min_sequential_time = 100  # At least 100 seconds for sequential execution
+    min_sequential_time = 60  # At least 60 seconds for sequential execution (12s*3steps * 2tasks = 72s)
     assert total_time >= min_sequential_time, (
         f"Total execution time ({total_time:.2f}s) suggests tasks may have run partially in parallel. "
         f"Expected at least {min_sequential_time}s for sequential execution."
@@ -263,14 +384,75 @@ async def test_sequential_execution_and_state_updates():
         f"Task 2 in store should be COMPLETED, got {task2.status.state}"
 
 
-@pytest.mark.skip(reason="TODO: Fix undefined variables task_id_to_cancel and req2 creation")
 @pytest.mark.asyncio
 async def test_cancellation_via_handler_and_lock_release():
     """
-    Proves that:
-    1. Calling handler.on_cancel_task properly triggers the SDK's cancellation flow.
-    2. The task state in the TaskStore is updated to TASK_STATE_CANCELED.
-    3. The execution lock is released, allowing a subsequent task to run immediately.
+    ============================================================================
+    WHAT THIS TEST PROVES
+    ============================================================================
+    A CancelTaskRequest sent through the SDK's request handler:
+      1. stops the running task via the SDK's internal cancellation flow,
+      2. leaves the task marked TASK_STATE_CANCELED in the TaskStore, and
+      3. releases the global execution lock so the NEXT task runs immediately.
+
+    ----------------------------------------------------------------------------
+    CONTEXT 1 — WHY CANCELLATION FREES THE LOCK (this comes for free)
+    ----------------------------------------------------------------------------
+    execute() holds the lock inside a try/finally:
+        try:    await self._process_task(...)
+        finally: global_execution_lock.release()
+    When the SDK cancels a task it raises asyncio.CancelledError inside
+    execute(). That exception unwinds the try, so the finally ALWAYS releases the
+    lock — whether a run completes normally or is cancelled midway.
+
+    ----------------------------------------------------------------------------
+    CONTEXT 2 — WHAT THE EXECUTOR'S cancel() METHOD DOES AND DOES NOT DO
+    ----------------------------------------------------------------------------
+    Stopping the task is done ENTIRELY by the SDK internals
+    (ActiveTask.cancel() → producer_task.cancel() raises CancelledError in
+    execute()). The executor's own cancel() does NOT stop anything. Its only job
+    is to publish a TaskStatusUpdateEvent(TASK_STATE_CANCELED) to the event
+    queue. That event flows through the SDK consumer into the TaskStore so that
+    clients querying task state see CANCELED instead of a stale WORKING.
+
+    So: the SDK stops the work; our cancel() informs the client.
+
+    ----------------------------------------------------------------------------
+    WHY WE EXTRACT THE TASK ID (instead of reusing our context id)
+    ----------------------------------------------------------------------------
+    CancelTaskRequest targets a SPECIFIC task, not a context. Our request sets
+    context_id ("ctx-cancel"), but each task gets its OWN auto-generated task_id
+    (UUID) from the SDK. So we cannot cancel "the context"; we must cancel the
+    concrete task. We grab its id from the first (SUBMITTED) event of the stream
+    while it runs in the background.
+
+    ----------------------------------------------------------------------------
+    STEP-BY-STEP NARRATIVE
+    ----------------------------------------------------------------------------
+      1. Send one request in the background with a SLOW agent (5s/step) so it is
+         still mid-run when we cancel. Slow matters: if it finished instantly,
+         there would be nothing left to cancel.
+      2. Capture the task id from the first event of the background stream.
+      3. Wait 0.5s → lets the task acquire the lock and actually start processing.
+      4. Call handler.on_cancel_task(CancelTaskRequest(id=...)). This is the
+         real SDK path a client's cancel request goes through.
+      5. Call handler.on_get_task() and assert the task is CANCELED → proves the
+         SDK stopped it and our cancel() event updated the store.
+      6. Fire a SECOND request with a 20s timeout and assert it completes →
+         proves the lock was released. If the lock were still held, this second
+         task would loop sending "Still waiting in queue..." forever and the 20s
+         timeout would expire (test failure).
+      7. agent.execution_count == 2 → run #1 was the cancelled task's astream
+         beginning (count=1) and run #2 was the post-cancel task completing
+         (count=2). Confirms both tasks actually reached the agent.
+
+    ----------------------------------------------------------------------------
+    WHY THE 20s TIMEOUT IS NOT "just a generous limit"
+    ----------------------------------------------------------------------------
+    The post-cancel task runs ~15s (3 steps x 5s). A 20s timeout only trips if
+    the pipeline is STUCK — the specific stuck condition this test hunts for is
+    "lock never released, second task queue-blocked forever".
+    ============================================================================
     """
     # 1. Setup: Use ONE executor instance
     executor = ReportA2AExecutor()
@@ -280,20 +462,36 @@ async def test_cancellation_via_handler_and_lock_release():
     req = create_mock_send_request("ctx-cancel")
     mock_context = ServerCallContext()
 
+    # Shared state to capture task ID from stream
+    events_buffer = []
+    first_event_received = asyncio.Event()
+
+    async def consume_stream_tracked(handler, req, context):
+        try:
+            async for item in handler.on_message_send_stream(req, context):
+                events_buffer.append((time.time(), item))
+                if not first_event_received.is_set():
+                    first_event_received.set()
+            return events_buffer
+        except Exception as e:
+            return e
+
     # 2. Start the task in the background
-    stream_task = asyncio.create_task(consume_stream(handler, req, mock_context))
+    stream_task = asyncio.create_task(consume_stream_tracked(handler, req, mock_context))
+    
+    # Wait for the first event (SUBMITTED) which contains the task ID
+    await first_event_received.wait()
+    task_id_to_cancel = events_buffer[0][1].id
     
     # Let it acquire the lock and start "processing"
     await asyncio.sleep(0.5)
     
     # 3. PROPERLY CANCEL VIA THE HANDLER
-    # NOTE: This test needs to be fixed - task_id_to_cancel is undefined
-    # The task ID should be extracted from the stream events
-    cancel_req = CancelTaskRequest(id="undefined_task_id")  # FIXME: Get actual task ID
+    cancel_req = CancelTaskRequest(id=task_id_to_cancel)
     await handler.on_cancel_task(cancel_req, mock_context)
     
     # 4. ASSERTION: Verify the task is actually marked as CANCELED in the store
-    get_req = GetTaskRequest(id="undefined_task_id")  # FIXME: Get actual task ID
+    get_req = GetTaskRequest(id=task_id_to_cancel)
     canceled_task = await handler.on_get_task(get_req, mock_context)
     assert canceled_task is not None, "Canceled task was not found in the store"
     assert canceled_task.status.state == TaskState.TASK_STATE_CANCELED, \
@@ -301,12 +499,12 @@ async def test_cancellation_via_handler_and_lock_release():
 
     # 5. ASSERTION: Verify the lock was released by immediately firing a new task.
     # If the lock wasn't released, this new task would hang and timeout.
-    req2 = create_mock_send_request("ctx-after")  # Fixed: removed extra argument
+    req2 = create_mock_send_request("ctx-after")
     
     result = await asyncio.wait_for(
         consume_stream(handler, req2, mock_context),
-        timeout=2.0  # Should finish quickly since the slow agent was canceled and lock released
+        timeout=20.0  # Should finish quickly since the slow agent was canceled and lock released
     )
     
-    assert result is not False, "Lock was not released after cancellation, causing a deadlock!"
+    assert not isinstance(result, Exception), f"Lock was not released after cancellation: {result}"
     assert executor.agent.execution_count == 2, "The second task should have executed after the first was canceled."
