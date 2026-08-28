@@ -8,7 +8,7 @@ This project implements an intelligent agent that automates the creation of pene
 
 - **Mistral AI** (mistral-large-2512) for natural language understanding and report generation
 - **LangChain/LangGraph** for agent orchestration and tool management
-- **PostgreSQL** for persistent storage of conversation history and virtual filesystem
+- **PostgreSQL** (with automatic local SQLite fallback) for persistent storage of conversation history and virtual filesystem
 - **Langfuse** for observability and tracing
 - **deepagents** for virtual filesystem middleware
 - **A2A Server** for agent-to-agent communication
@@ -20,7 +20,7 @@ This project implements an intelligent agent that automates the creation of pene
 - **Tool Emulation**: Mock tools for testing report export functionality
 - **Rate Limiting**: Built-in rate limiter to respect API quotas (1 request per 20 seconds)
 - **Retry Middleware**: Automatic retry on API failures with exponential backoff
-- **Session Persistence**: PostgreSQL-based checkpointing for multi-turn conversations
+- **Session Persistence**: PostgreSQL/SQLite checkpointing for multi-turn conversations
 - **Observability**: Full tracing integration with Langfuse
 
 ## Installation
@@ -28,8 +28,8 @@ This project implements an intelligent agent that automates the creation of pene
 ### Prerequisites
 
 - Python 3.11 or higher
-- PostgreSQL database
 - Mistral AI API key
+- (Optional) PostgreSQL database — if unset or unreachable, the agent falls back to a local SQLite database
 - (Optional) Langfuse instance for observability
 
 ### Setup
@@ -54,7 +54,7 @@ This project implements an intelligent agent that automates the creation of pene
 
 4. **Set up the database**:
    
-   Ensure PostgreSQL is running and the database exists. The agent will automatically create required tables on first run.
+   Ensure PostgreSQL is running and the database exists. If `POSTGRES_URI` is unset or unreachable, the agent falls back to a local SQLite database at `agent/agent_session.db`. Tables are created automatically on first run.
 
 5. **Seed the virtual filesystem** (optional):
    
@@ -70,10 +70,11 @@ This project implements an intelligent agent that automates the creation of pene
 | Variable | Description | Required |
 |----------|-------------|----------|
 | `MISTRAL_API_KEY` | Your Mistral AI API key | Yes |
-| `POSTGRES_URI` | PostgreSQL connection string | Yes |
+| `POSTGRES_URI` | PostgreSQL connection string (fallback: local SQLite if unset/unreachable) | No |
 | `LANGFUSE_SECRET_KEY` | Langfuse secret key | No |
 | `LANGFUSE_PUBLIC_KEY` | Langfuse public key | No |
 | `LANGFUSE_BASE_URL` | Langfuse server URL | No (defaults to cloud) |
+| `LOG_LEVEL` | Logging verbosity: `INFO`, `DEBUG`, `WARNING` | No (defaults to `INFO`) |
 
 ### Rate Limits
 

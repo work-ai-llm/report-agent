@@ -5,7 +5,7 @@
 1. **Agent Core** (`report_agent.py`)
    - Creates the LangChain agent with Mistral AI
    - Configures middleware (filesystem, tool emulator, retry)
-   - Manages PostgreSQL connections
+   - Manages database connections (PostgreSQL with local SQLite fallback)
 
 2. **Virtual Filesystem**
    - `/context/` - Persistent, shared across sessions (PostgreSQL-backed)
@@ -47,10 +47,11 @@ The agent is built using LangGraph for stateful orchestration. It manages:
 
 ### Storage Layers
 
-1. **PostgreSQL**
+1. **PostgreSQL / SQLite**
    - Conversation history and checkpoints
    - Virtual filesystem context files
    - Session metadata
+   - SQLite (`agent/agent_session.db`) is used automatically when Postgres is unavailable
 
 2. **In-Memory**
    - Scratchpad files (session-specific)

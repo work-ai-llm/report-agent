@@ -8,7 +8,7 @@ An AI-powered penetration testing report generation agent built with LangChain, 
 - **Tool Emulation**: Mock tools for testing report export functionality
 - **Rate Limiting**: Built-in rate limiter to respect API quotas (1 request per 20 seconds)
 - **Retry Middleware**: Automatic retry on API failures with exponential backoff
-- **Session Persistence**: PostgreSQL-based checkpointing for multi-turn conversations
+- **Session Persistence**: PostgreSQL/SQLite checkpointing for multi-turn conversations
 - **Observability**: Full tracing integration with Langfuse
 - **A2A Server**: Agent-to-agent communication capabilities
 - **Concurrent Agent Connection Restriction**: Via asyncio lock for thread-safe operations
@@ -19,7 +19,7 @@ An AI-powered penetration testing report generation agent built with LangChain, 
 - **Python 3.11+**: Primary programming language
 - **LangChain/LangGraph**: Agent orchestration framework
 - **Mistral AI** (mistral-large-2512): LLM provider for natural language understanding and report generation
-- **PostgreSQL**: Database for persistent storage
+- **PostgreSQL / SQLite**: Database for persistent storage (PostgreSQL with automatic local SQLite fallback)
 - **Langfuse**: Observability and tracing platform
 - **deepagents**: Virtual filesystem middleware
 
@@ -74,7 +74,7 @@ Command-line interface for managing the virtual filesystem:
 - May need adjustment based on your API key's specific limits
 
 ### Database Dependencies
-- Requires PostgreSQL with proper network access
+- PostgreSQL is optional — if `POSTGRES_URI` is unset or unreachable, the agent uses a local SQLite backend (`agent/agent_session.db`)
 - TCP keepalives enabled by default to prevent firewall timeouts
 - Connection string must be properly configured in environment variables
 
