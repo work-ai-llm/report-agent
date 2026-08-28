@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retry middleware with exponential backoff
 - Store CLI for managing virtual filesystem
 - Development tools for testing and debugging
+- Acceptance test suite (`tests/acceptance/`) for agent structure, DB initialization, and A2A connectivity
+- Mock test suite (`tests/mock/`) for A2A concurrency lock and task cancellation
 
 ### Changed
 - N/A

@@ -66,6 +66,10 @@ Command-line interface for managing the virtual filesystem:
 - `2_check_postgr_quick_test.py`: Debug conversation history and inspect threads
 - `prep.py`: Store seeding utility
 
+### Test Suites
+- `tests/acceptance/`: Agent structure, DB initialization, and A2A connectivity (real runtime)
+- `tests/mock/`: A2A concurrency lock and task cancellation tests (fake agent, no external services)
+
 ## Limitations
 
 ### Rate Limiting

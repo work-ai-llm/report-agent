@@ -84,6 +84,19 @@ The agent is configured with conservative rate limits:
 
 Adjust in `agent/report_agent.py` if your API key has different limits.
 
+## Testing
+
+The test suite is split into two layers:
+
+- **Acceptance tests** (`tests/acceptance/`): end-to-end checks against the real agent runtime — agent structure (`AgentRuntime`), database initialization, and A2A connectivity.
+- **Mock tests** (`tests/mock/`): concurrency and task-lifecycle tests against a fake agent — sequential execution via the global execution lock and task cancellation (lock release). No external services required.
+
+Run from the repository root:
+
+```bash
+pytest
+```
+
 ## Usage
 
 WIP
