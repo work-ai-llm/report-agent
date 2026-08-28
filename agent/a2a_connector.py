@@ -39,8 +39,8 @@ from a2a.helpers import (
     new_text_part,
 )
 
-# Import global variables from report_agent for initialization in lifespan
-from agent import report_agent
+# Import runtime from report_agent for initialization in lifespan
+from agent.report_agent import runtime
 from langchain_core.messages import AIMessage, ToolMessage
 from langfuse import observe, propagate_attributes
 
@@ -82,7 +82,7 @@ class ReportA2AExecutor(AgentExecutor):
     ) -> None:
         
         if not self.agent:
-            self.agent = report_agent.langchain_agent
+            self.agent = runtime.agent
             if not self.agent:
                 raise RuntimeError("Agent not initialized. Check lifespan startup.")
             
@@ -174,7 +174,12 @@ class ReportA2AExecutor(AgentExecutor):
         # Manually added langfuse observation
         # NOTE, unfortenatly there is no way to handle trace root level input, output, the functions for that are depreciated
         # and langfuse langchain hanlder isn't populating langfuse properly, so only manual way remains.
-        with report_agent.langfuse.start_as_current_observation(
+        # TODO: The simple metadata tag approach worked properly in tailscale db test (tests/acceptance/4_tailscale_db.py:34)
+        # via config["metadata"]["langfuse_session_id"]. Investigate whether manual span creation below can be replaced
+        # or simplified by relying on the metadata-based tracing instead.
+        # TODO: Langfuse may not be the only tracing option. Arize Phoenix is an alternative that could work with
+        # SQLite as a local DB instead of a remote server, which would simplify dev/test environments.
+        with runtime.langfuse.start_as_current_observation(
             as_type="span",
             name="my-pipeline",
             input={"query": text_query}
@@ -274,7 +279,29 @@ class ReportA2AExecutor(AgentExecutor):
         )
 
     async def cancel(self, context: RequestContext, event_queue: EventQueue) -> None:
-        pass
+        """
+        Cancel an ongoing task and publish the terminal CANCELED event.
+
+        Called by the A2A SDK when a client sends CancelTaskRequest. The SDK has
+        already cancelled the producer task (raising asyncio.CancelledError inside
+        execute(), whose finally block releases the execution lock). The actual
+        execution STOPPING is done entirely by the SDK internals.
+
+        NOTE: This method does NOT stop the task. Its only job is to inform the
+        client that the task was actually canceled, by publishing a
+        TaskStatusUpdateEvent(TASK_STATE_CANCELED) to the event queue. The consumer
+        then updates the task store so clients querying task state see CANCELED
+        instead of the stale WORKING state.
+        """
+        if not context.task_id:
+            return
+
+        task_updater = TaskUpdater(
+            event_queue=event_queue,
+            task_id=context.task_id,
+            context_id=context.context_id,
+        )
+        await task_updater.cancel(message=new_text_message('Task canceled.'))
 
 
 # ==========================================
@@ -288,8 +315,8 @@ async def lifespan(app: Starlette):
     """
     logger.info("Opening database pool and setting up tables...")
     
-    # 1. Open the connection pool
-    await report_agent.initiate_connection()
+    # 1. Initialize the runtime (langfuse, prompt, middleware, pool, agent)
+    await runtime.initialize()
     
     logger.info("Database setup complete. Agent is ready to accept requests.")
     
@@ -297,8 +324,8 @@ async def lifespan(app: Starlette):
     
     # 3. Clean up resources on shutdown
     logger.info("Shutting down and closing database pool...")
-    if report_agent.pool:
-        await report_agent.pool.close()
+    if runtime.pool:
+        await runtime.pool.close()
 
 
 # ==========================================
