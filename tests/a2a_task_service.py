@@ -57,11 +57,12 @@ class A2ATaskService:
         if "task" in chunk_dict:
             chunk_type = "INITIAL_TASK"
             task_dict = chunk_dict['task']
-            task_id = task_dict.get('id')
+            task_id = task_dict.get('id')       # <--- FIX: Correctly extract nested ID
             context_id = task_dict.get('contextId')
             status = task_dict.get("status", {}).get("state")
             text_content = f"[TASK STATE]: {status}\nTask Id: {task_id}"
 
+            # Restore history extraction
             history_list = task_dict.get("history", [])
             for history_item in history_list:
                 parts = history_item.get("parts", [])
@@ -133,7 +134,7 @@ class A2ATaskService:
     async def subscribe_to_task(self, task_id, label=""):
         print(f"\n{label}[SUBSCRIBING TO TASK]: {task_id}")
 
-        # BaseClient requires a Protobuf request object and uses .subscribe()
+        # FIX: BaseClient requires a Protobuf request object and uses .subscribe()
         req = SubscribeToTaskRequest(id=task_id)
         stream = self.client.subscribe(req)
 
@@ -143,7 +144,7 @@ class A2ATaskService:
     async def get_task(self, task_id, label=""):
         print(f"\n{label}[GETTING TASK]: {task_id}")
 
-        # BaseClient requires a Protobuf request object
+        # FIX: BaseClient requires a Protobuf request object
         req = GetTaskRequest(id=task_id)
         task_data = await self.client.get_task(req)
         state = task_data.status.state
@@ -153,7 +154,7 @@ class A2ATaskService:
     async def cancel_task(self, task_id, label=""):
         print(f"\n{label}[CANCELLING TASK]: {task_id}")
 
-        # BaseClient requires a Protobuf request object
+        # FIX: BaseClient requires a Protobuf request object
         req = CancelTaskRequest(id=task_id)
         task_data = await self.client.cancel_task(req)
         state = task_data.status.state
