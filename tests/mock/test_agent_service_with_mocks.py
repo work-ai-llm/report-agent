@@ -19,6 +19,20 @@ python -m pytest tests/mock/test_agent_service_with_mocks.py -v
 ```
 
 All tests should pass in isolation without external services.
+
+## What These Tests Do and Don't Prove
+
+The mocks (PR #1) are permissive in-memory dictionaries - they accept any content
+and never reject or transform input (see their Permissiveness Caveat). As a result:
+
+- These tests DO verify the service layer's orchestration logic: path prefix
+  conventions (findings/, reports/), thread isolation via thread_id, None/default
+  handling, and correct forwarding of message/thread_id into the injected agent.
+- These tests DO NOT prove compatibility with real checkpointer/file store/agent
+  objects. Real LangGraph/Postgres objects expose different method signatures than
+  the protocols (e.g. aget_tuple/aput vs get/put), so they require adapter classes,
+  and those adapters must be validated by an integration test against a real
+  backend (SQLite fallback is enough) before production use.
 """
 
 import pytest
@@ -28,37 +42,6 @@ from tests.mock.mock_objects_streamlit import (
     MockFileStore,
     MockAgentRunner,
 )
-
-
-class TestPenTestAgentServiceInitialization:
-    """Test service initialization with dependency injection."""
-
-    def test_service_creates_with_mock_dependencies(self):
-        """Verify service accepts mock implementations correctly."""
-        mock_checkpointer = MockCheckpointer()
-        mock_file_store = MockFileStore()
-        mock_agent = MockAgentRunner()
-
-        service = PenTestAgentService(
-            thread_id="test_session",
-            checkpointer=mock_checkpointer,
-            file_store=mock_file_store,
-            agent_runner=mock_agent,
-        )
-
-        assert service.thread_id == "test_session"
-
-    def test_service_thread_id_immutable(self):
-        """Verify thread_id cannot be changed after initialization."""
-        service = PenTestAgentService(
-            thread_id="session_1",
-            checkpointer=MockCheckpointer(),
-            file_store=MockFileStore(),
-            agent_runner=MockAgentRunner(),
-        )
-
-        # thread_id is read-only property
-        assert service.thread_id == "session_1"
 
 
 class TestFindingsUpload:
@@ -183,6 +166,11 @@ class TestAgentStreaming:
         assert tool_call_events[0]["data"]["name"] == "nmap_scan"
         assert tool_call_events[1]["data"]["name"] == "nikto_scan"
 
+        # The mock ignores its args, so only these asserts catch a service bug
+        # that forwards the wrong message/thread_id to the agent runner.
+        assert mock_agent.last_thread_id == "session_1"
+        assert mock_agent.last_message == "Scan target"
+
     def test_send_message_yields_final_message(self):
         """Verify final agent response is yielded after tool calls."""
         mock_agent = MockAgentRunner()
@@ -200,6 +188,10 @@ class TestAgentStreaming:
         message_events = [e for e in events if e["type"] == "message"]
         assert len(message_events) == 1
         assert message_events[0]["data"] == "Scan complete. Found 2 open ports."
+
+        # Same guard as above: verify correct forwarding of inputs.
+        assert mock_agent.last_thread_id == "session_1"
+        assert mock_agent.last_message == "Scan target"
 
 
 class TestReportDownload:
