@@ -116,17 +116,44 @@ from tests.mock.mock_objects_streamlit import (
 )
 
 
+@st.cache_resource
+def _shared_mock_checkpointer() -> MockCheckpointer:
+    """Shared in-memory checkpointer for mock mode.
+
+    Cached so all sessions created during a session-of-the-app share one
+    checkpointer - which is what makes saved chats listable and switchable
+    from the session selector.
+    """
+    return MockCheckpointer()
+
+
+@st.cache_resource
+def _shared_mock_file_store() -> MockFileStore:
+    """Shared in-memory file store for mock mode.
+
+    Findings/reports are global by design (see upload_finding), so every
+    service in mock mode writes to the same store.
+    """
+    return MockFileStore()
+
+
+@st.cache_resource
+def _shared_mock_agent_runner() -> MockAgentRunner:
+    """Shared in-memory agent runner for mock mode."""
+    return MockAgentRunner()
+
+
 def _build_mock_service(thread_id: str) -> PenTestAgentService:
     """Build a service backed by in-memory mock dependencies.
 
     Used when STREAMLIT_USE_MOCKS=1 - lets you run the full UI without Postgres,
-    an LLM, or a live agent. All state is lost between runs.
+    an LLM, or a live agent. All state is lost between server restarts.
     """
     return PenTestAgentService(
         thread_id=thread_id,
-        checkpointer=MockCheckpointer(),
-        file_store=MockFileStore(),
-        agent_runner=MockAgentRunner(),
+        checkpointer=_shared_mock_checkpointer(),
+        file_store=_shared_mock_file_store(),
+        agent_runner=_shared_mock_agent_runner(),
     )
 
 
