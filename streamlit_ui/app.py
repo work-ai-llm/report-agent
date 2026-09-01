@@ -99,6 +99,7 @@ streamlit run streamlit_ui/app.py
 - `AGENT_MODEL`: LLM model name for agent execution
 """
 
+import os
 import streamlit as st
 from typing import Optional, Callable
 from streamlit_ui.services.agent_service import PenTestAgentService
@@ -108,43 +109,67 @@ from streamlit_ui.components.report_downloader import (
     render_report_downloader,
     render_report_selector,
 )
+from tests.mock.mock_objects_streamlit import (
+    MockCheckpointer,
+    MockFileStore,
+    MockAgentRunner,
+)
+
+
+def _build_mock_service(thread_id: str) -> PenTestAgentService:
+    """Build a service backed by in-memory mock dependencies.
+
+    Used when STREAMLIT_USE_MOCKS=1 - lets you run the full UI without Postgres,
+    an LLM, or a live agent. All state is lost between runs.
+    """
+    return PenTestAgentService(
+        thread_id=thread_id,
+        checkpointer=MockCheckpointer(),
+        file_store=MockFileStore(),
+        agent_runner=MockAgentRunner(),
+    )
+
+
+def _build_production_service(thread_id: str) -> PenTestAgentService:
+    """Build a service wired to the real backend.
+
+    TODO: implemented when the real adapters land. The production dependency
+    source is agent.report_agent.AgentRuntime, which exposes `agent`,
+    `checkpointer` and `store` after `await initialize()`. Those primitives need
+    protocol adapters (CheckpointerProtocol / FileStoreProtocol /
+    AgentRunnerProtocol) before they can be injected here. Until then, run with
+    STREAMLIT_USE_MOCKS=1.
+    """
+    raise NotImplementedError(
+        "Real backend wiring is not implemented yet. "
+        "Run with STREAMLIT_USE_MOCKS=1 to use in-memory mock dependencies."
+    )
 
 
 def get_or_create_service(thread_id: str) -> PenTestAgentService:
     """Get or create PenTestAgentService instance for current thread.
-    
-    In production mode, this initializes real PostgreSQL dependencies.
-    For testing, environment variables can trigger mock usage.
-    
+
+    In mock mode (STREAMLIT_USE_MOCKS=1) the service is built from in-memory
+    mocks. In production mode it is built from AgentRuntime-backed adapters
+    (not wired yet - see _build_production_service).
+
     Args:
         thread_id: Current session/thread identifier
-        
+
     Returns:
         Configured PenTestAgentService instance
-        
+
     Data Flow:
         App startup → get_or_create_service() → Initialize dependencies → Cache in session_state
     """
     if "service" not in st.session_state or st.session_state.service.thread_id != thread_id:
-        # Import production dependencies lazily
-        from agent import report_agent
-        from langgraph.checkpoint.postgres import PostgresSaver
-        from langgraph.store.postgres import PostgresStore
-        
-        # Ensure agent is initialized
-        if not hasattr(report_agent, 'langchain_agent') or report_agent.langchain_agent is None:
-            report_agent.initiate_connection()
-        
-        # Create service with production implementations
-        service = PenTestAgentService(
-            thread_id=thread_id,
-            checkpointer=report_agent.pg_saver,
-            file_store=report_agent.store,
-            agent_runner=report_agent.langchain_agent,
-        )
-        
+        if os.environ.get("STREAMLIT_USE_MOCKS", "").lower() in ("1", "true", "yes"):
+            service = _build_mock_service(thread_id)
+        else:
+            service = _build_production_service(thread_id)
+
         st.session_state.service = service
-    
+
     return st.session_state.service
 
 
@@ -162,7 +187,7 @@ def render_sidebar(service: PenTestAgentService) -> None:
         
         # Session selection
         st.markdown("### 📋 Sessions")
-        existing_sessions = service._checkpointer.list_threads()
+        existing_sessions = service.list_threads()
         
         if existing_sessions:
             selected_session = st.selectbox(
@@ -210,10 +235,10 @@ def render_sidebar(service: PenTestAgentService) -> None:
         
         # Reports section
         st.markdown("### 📄 Reports")
-        selected_report = render_report_selector(service)
-        
+        selected_report = render_report_selector(service.list_reports)
+
         if selected_report:
-            render_report_downloader(service, selected_report)
+            render_report_downloader(service.download_report, selected_report)
 
 
 def render_main_chat(service: PenTestAgentService) -> None:
