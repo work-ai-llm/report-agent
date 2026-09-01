@@ -32,6 +32,17 @@ mock_file_store.prepopulate_with_report("report.md", b"# Penetration Test Report
 These mocks use simple dictionaries and are NOT thread-safe. They are designed
 for single-threaded unit tests only. For concurrent tests, create separate
 instances per test case.
+
+## Permissiveness Caveat
+
+These mocks are self-respecting dictionaries: they accept ANY content, never
+reject or transform input, and make no structural guarantees. Tests built on
+them only prove the service layer works against in-memory storage (path
+prefixes, threading, defaults). Real LangGraph/Postgres objects have different
+method signatures than these protocols (e.g. aget_tuple/aput vs get/put), so
+swapping in production implementations is NOT drop-in - adapters are required
+and must be validated by an integration test against a real backend, not by
+these mocks.
 """
 
 from typing import Optional, List, Dict, Any, Iterator
@@ -208,6 +219,8 @@ class MockAgentRunner:
         """Initialize with empty tool call list."""
         self._tool_calls: List[Dict[str, Any]] = []
         self._final_message: str = "This is a mock agent response."
+        self.last_message: Optional[str] = None
+        self.last_thread_id: Optional[str] = None
     
     def set_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> None:
         """Configure which tool calls the mock should emit.
@@ -230,6 +243,8 @@ class MockAgentRunner:
         
         Yields pre-configured tool calls followed by final message.
         Ignores input parameters - behavior is fully controlled by set_tool_calls().
+        However, the inputs are captured on last_message/last_thread_id so tests
+        can assert the caller forwarded the correct values.
         
         Args:
             message: User input message (ignored in mock)
@@ -240,6 +255,9 @@ class MockAgentRunner:
             - {"type": "tool_call", "data": {"name": ..., "args": ...}}
             - {"type": "message", "data": "final response text"}
         """
+        self.last_message = message
+        self.last_thread_id = thread_id
+        
         # Yield tool call events
         for tool_call in self._tool_calls:
             yield {
