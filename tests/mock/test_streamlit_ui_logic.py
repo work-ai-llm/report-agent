@@ -19,8 +19,14 @@ python -m pytest tests/mock/test_streamlit_ui_logic.py -v
 Note: These tests use mock objects and do not require PostgreSQL or LLM APIs.
 """
 
+import os
 import pytest
+from pathlib import Path
 from streamlit.testing.v1 import AppTest
+
+os.environ["STREAMLIT_USE_MOCKS"] = "1"
+
+APP_PATH = str(Path(__file__).resolve().parent.parent.parent / "streamlit_ui" / "app.py")
 
 
 class TestAppInitialization:
@@ -28,7 +34,7 @@ class TestAppInitialization:
 
     def test_app_loads_without_errors(self):
         """Verify the app starts without exceptions."""
-        at = AppTest.from_file("streamlit_ui/app.py")
+        at = AppTest.from_file(APP_PATH)
         at.run()
         
         # Should not have exceptions
@@ -36,7 +42,7 @@ class TestAppInitialization:
 
     def test_session_id_created_on_startup(self):
         """Verify a session ID is generated when app starts."""
-        at = AppTest.from_file("streamlit_ui/app.py")
+        at = AppTest.from_file(APP_PATH)
         at.run()
         
         assert "current_thread_id" in at.session_state
@@ -44,7 +50,7 @@ class TestAppInitialization:
 
     def test_chat_messages_initialized_empty(self):
         """Verify chat history starts empty."""
-        at = AppTest.from_file("streamlit_ui/app.py")
+        at = AppTest.from_file(APP_PATH)
         at.run()
         
         assert "chat_messages" in at.session_state
@@ -52,7 +58,7 @@ class TestAppInitialization:
 
     def test_findings_list_initialized_empty(self):
         """Verify findings list starts empty."""
-        at = AppTest.from_file("streamlit_ui/app.py")
+        at = AppTest.from_file(APP_PATH)
         at.run()
         
         assert "findings" in at.session_state
@@ -64,7 +70,7 @@ class TestSidebarRendering:
 
     def test_sidebar_displays_title(self):
         """Verify sidebar shows the app title."""
-        at = AppTest.from_file("streamlit_ui/app.py")
+        at = AppTest.from_file(APP_PATH)
         at.run()
         
         # Sidebar should be rendered
@@ -73,7 +79,7 @@ class TestSidebarRendering:
 
     def test_new_session_button_exists(self):
         """Verify 'New Session' button is present."""
-        at = AppTest.from_file("streamlit_ui/app.py")
+        at = AppTest.from_file(APP_PATH)
         at.run()
         
         # Find the new session button in sidebar
@@ -86,7 +92,7 @@ class TestChatAreaRendering:
 
     def test_chat_input_exists(self):
         """Verify chat input field is present."""
-        at = AppTest.from_file("streamlit_ui/app.py")
+        at = AppTest.from_file(APP_PATH)
         at.run()
         
         # Chat input should exist
@@ -95,7 +101,7 @@ class TestChatAreaRendering:
 
     def test_main_area_has_title(self):
         """Verify main area displays chat title."""
-        at = AppTest.from_file("streamlit_ui/app.py")
+        at = AppTest.from_file(APP_PATH)
         at.run()
         
         # Main area should have content
@@ -107,7 +113,7 @@ class TestSessionStatePersistence:
 
     def test_session_id_persists_after_rerun(self):
         """Verify session ID remains the same after app rerun."""
-        at = AppTest.from_file("streamlit_ui/app.py")
+        at = AppTest.from_file(APP_PATH)
         at.run()
         
         first_session_id = at.session_state.current_thread_id
@@ -123,3 +129,4 @@ class TestSessionStatePersistence:
 # mocking the service layer. The above tests verify UI structure and
 # basic state management. For complete flow testing, see the service
 # layer tests in test_agent_service_with_mocks.py.
+
