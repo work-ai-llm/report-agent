@@ -59,11 +59,13 @@ def render_file_uploader(
     """
     st.markdown("### 📁 Upload Finding")
     
+    # Fixed widget key: id(on_upload) changes every rerun (new closure each time),
+    # which would remount the widget and lose any uploaded file between runs.
     uploaded_file = st.file_uploader(
         label="Choose a findings file",
         type=allowed_extensions,
         help="Upload reconnaissance data (nmap scans, bloodhound dumps, etc.)",
-        key=f"file_uploader_{id(on_upload)}"
+        key="finding_uploader"
     )
     
     if uploaded_file is not None:
