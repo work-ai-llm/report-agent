@@ -83,7 +83,7 @@ class TestSidebarRendering:
         at.run()
         
         # Find the new session button in sidebar
-        buttons = at.sidebar.buttons
+        buttons = at.sidebar.button
         assert any("New Session" in str(button) for button in buttons)
 
 
