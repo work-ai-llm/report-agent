@@ -32,18 +32,21 @@ optional token auth (``X-A2A-Notification-Token`` - validated only if you set
 note "exposed for all requests"), per-task delivery to client via
 ``ParsedPushEvent`` + ``wait_for_completion``.
 
-Usage (how unified ``A2ATaskService`` will use it):
+Usage (how unified ``A2ATaskService`` — ``tests/a2a_task_service.py`` -> ``client/a2a_client.py`` — will use it; see ``docs/push_receiver.md:49`` for full push pattern):
 
     from client.push_receiver import PushNotificationReceiver
+    # from client.a2a_client import A2ATaskService  # future location of tests/a2a_task_service.py
 
-    # client owns receiver lifetime
+    # client owns receiver lifetime; composition, not inheritance
     receiver = PushNotificationReceiver(host="127.0.0.1", port=0, on_event=lambda e: print(e.text))
     url = await receiver.start()  # http://127.0.0.1:XXXXX/webhook
     # give url to server: either ClientConfig(push_notification_config=TaskPushNotificationConfig(url=url))
     # or per-message: SendMessageRequest(configuration=SendMessageConfiguration(task_push_notification_config=...))
-    # or after creation: client.create_task_push_notification_config(TaskPushNotificationConfig(task_id=tid, url=url))
-    # ... then server pushes, client awaits ...
-    events = await receiver.wait_for_completion(task_id, timeout=300)  # unblocks when server sent COMPLETED
+    # or after creation: raw_client.create_task_push_notification_config(TaskPushNotificationConfig(task_id=tid, url=url))
+    # ... send via A2ATaskService to get task_id, then await ...
+    # async for chunk in raw_client.send_message(req): tid = svc._extract_chunk_info(chunk)[1]
+    ev = await receiver.wait_for_completion(tid, timeout=300)  # unblocks when server sent COMPLETED
+    task = await svc.get_task(tid)  # fetch result
     await receiver.stop()
 
     # context manager
