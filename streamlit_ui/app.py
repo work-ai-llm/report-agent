@@ -145,6 +145,12 @@ def _shared_mock_file_store() -> MockFileStore:
         b"# Demo Pentest Report\n\nSeeded by mock mode so the store + download "
         b"path can be tested without a real agent run.\n",
     )
+    store.prepopulate_with_report(
+        "demo_pentest_report_2.md",
+        b"# Demo check 2\n\nSeeded by mock mode so the store + download "
+        b"\n I want to check how download selector works.",
+    )
+    
     return store
 
 
@@ -235,23 +241,15 @@ def render_sidebar(service: PenTestAgentService) -> None:
         # Session selection
         st.markdown("### 📋 Sessions")
         existing_sessions = service.list_threads()
-        
+
+        selected_session = None
         if existing_sessions:
             selected_session = st.selectbox(
                 label="Select Session",
                 options=existing_sessions,
                 key="session_selector",
             )
-            
-            if selected_session != st.session_state.current_thread_id:
-                st.session_state.current_thread_id = selected_session
-                st.session_state.chat_messages = []
-                # main() rebinds the service and reloads this thread's history
-                st.session_state._service_thread = None
-        
-        # Handler for the New Session button. Runs BEFORE the script replays,
-        # so it can safely set the session_selector widget value (the widget
-        # has not been instantiated yet on this run).
+
         def _new_session():
             import uuid
             new_thread_id = f"session_{uuid.uuid4().hex[:8]}"
@@ -259,9 +257,7 @@ def render_sidebar(service: PenTestAgentService) -> None:
             st.session_state.chat_messages = []
             st.session_state._service_thread = None
             svc = get_or_create_service(new_thread_id)
-            # Register the thread so it immediately appears in the session selector
             svc.save_chat_history([])
-            # Make the session selector show the new thread on the next run.
             st.session_state["session_selector"] = new_thread_id
 
         st.button(
@@ -269,6 +265,11 @@ def render_sidebar(service: PenTestAgentService) -> None:
             on_click=_new_session,
             use_container_width=True,
         )
+
+        if selected_session and selected_session != st.session_state.current_thread_id:
+            st.session_state.current_thread_id = selected_session
+            st.session_state.chat_messages = []
+            st.session_state._service_thread = None
         
         st.divider()
         
@@ -370,6 +371,13 @@ def render_main_chat(service: PenTestAgentService) -> None:
     
     # Chat input
     if prompt := st.chat_input("Ask the agent to analyze findings..."):
+        # Create session on first message (not on page load)
+        if st.session_state.current_thread_id is None:
+            import uuid
+            st.session_state.current_thread_id = f"session_{uuid.uuid4().hex[:8]}"
+            service = get_or_create_service(st.session_state.current_thread_id)
+            service.save_chat_history([])
+
         # Add user message
         st.session_state.chat_messages.append({"type": "user", "content": prompt})
         render_message("user", prompt)
@@ -417,47 +425,44 @@ def main() -> None:
         layout="wide",
     )
     
-    # Initialize session state
+    # Session is only created when the first message is sent (not on page load).
     if "current_thread_id" not in st.session_state:
-        import uuid
-        st.session_state.current_thread_id = f"session_{uuid.uuid4().hex[:8]}"
-    
+        st.session_state.current_thread_id = None
+
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = []
-    
+
     if "findings" not in st.session_state:
         st.session_state.findings = []
-    
+
     if "processed_findings" not in st.session_state:
         st.session_state.processed_findings = set()
-    
+
     if "_service_thread" not in st.session_state:
         st.session_state._service_thread = None
-    
-    # Get or create service for current thread
-    service = get_or_create_service(st.session_state.current_thread_id)
 
-    # Register initial thread so it appears in session selector immediately
-    if st.session_state.current_thread_id not in service.list_threads():
-        service.save_chat_history([])
+    # Sidebar needs a service to list existing sessions even before a thread
+    # is active.  Use the latest existing thread or a placeholder.
+    if st.session_state.current_thread_id is not None:
+        service = get_or_create_service(st.session_state.current_thread_id)
+    else:
+        tmp_threads = get_or_create_service("___placeholder___").list_threads()
+        tmp_id = tmp_threads[-1] if tmp_threads else "___placeholder___"
+        service = get_or_create_service(tmp_id)
 
-    # Default the session selector to the latest thread on first load, but keep
-    # any value set by the New Session / switching handlers on later runs.
-    if "session_selector" not in st.session_state:
-        threads = service.list_threads()
-        if threads:
-            st.session_state["session_selector"] = threads[-1]
-
-    # Render sidebar (its handlers may change the active thread)
+    # Render sidebar — its handlers may change the active thread
     render_sidebar(service)
-    
+
     # If a New Session / session switch happened above, rebind the service for
     # the new thread and load that thread's saved history into the UI.
-    if st.session_state._service_thread != st.session_state.current_thread_id:
+    if (
+        st.session_state.current_thread_id is not None
+        and st.session_state._service_thread != st.session_state.current_thread_id
+    ):
         service = get_or_create_service(st.session_state.current_thread_id)
         st.session_state.chat_messages = service.get_chat_history()
         st.session_state._service_thread = st.session_state.current_thread_id
-    
+
     # Render UI
     render_main_chat(service)
 

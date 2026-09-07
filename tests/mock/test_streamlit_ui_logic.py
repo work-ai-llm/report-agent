@@ -61,13 +61,13 @@ class TestAppInitialization:
         # Should not have exceptions
         assert not at.exception, f"App failed to load: {at.exception}"
 
-    def test_session_id_created_on_startup(self):
-        """Verify a session ID is generated when app starts."""
+    def test_no_session_created_on_startup(self):
+        """A session must NOT be created on page load – only on first message."""
         at = AppTest.from_file(APP_PATH)
         at.run()
-        
+
         assert "current_thread_id" in at.session_state
-        assert at.session_state.current_thread_id.startswith("session_")
+        assert at.session_state.current_thread_id is None
 
     def test_chat_messages_initialized_empty(self):
         """Verify chat history starts empty."""
@@ -225,16 +225,33 @@ class TestIssue1NewSessionStaysInNewSession:
 
 
 class TestIssue4InitialSessionAppearsImmediately:
-    """Regression: the auto-created first session appears in the selector."""
+    """Regression: a session is only registered once a message is sent."""
 
-    def test_initial_session_registered_on_first_load(self):
-        """A fresh server's auto-created session must be listable right away."""
+    def test_no_session_registered_on_first_load(self):
+        """A fresh load must NOT create/register a session until a message."""
         at = AppTest.from_file(APP_PATH).run()
         assert "current_thread_id" in at.session_state
+        assert at.session_state["current_thread_id"] is None
+        assert not at.exception
+
+    def test_session_registered_after_first_message(self):
+        """On the first message a new session is created and appears in selector."""
+        at = AppTest.from_file(APP_PATH).run()
+        assert at.session_state["current_thread_id"] is None
+
+        at.chat_input[0].set_value("hello").run()
         tid = at.session_state["current_thread_id"]
-        # The session selector should list the initial thread immediately.
-        assert at.sidebar.selectbox[0].options is not None
-        assert tid in at.sidebar.selectbox[0].options
+        assert tid is not None
+        assert tid.startswith("session_")
+        assert not at.exception
+
+        # The sidebar rendered before the chat handler created the thread in the
+        # same run, so the selector picks it up on the next run (next interaction).
+        at.run()
+        assert any(
+            sb.label == "Select Session" and tid in sb.options
+            for sb in at.sidebar.selectbox
+        )
         assert not at.exception
 
 
