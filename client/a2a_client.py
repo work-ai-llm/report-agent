@@ -1,23 +1,23 @@
-# a2a_client.py
-#
-# UNIFIED A2A client (PR-B). Moved from tests/a2a_task_service.py -> client/a2a_client.py
-# per easy-fix: rename + add send_message / send_streaming_message split + list_tasks.
-#
-# Streaming vs non-streaming (fixed from alias):
-# - SDK `a2a.client.Client.send_message` in `a2a/client/base_client.py:send_message`
-#   multiplexes JSON-RPC `message/send` vs `message/stream` via
-#   `ClientConfig(streaming)` + `AgentCard.capabilities.streaming`. If either False,
-#   `transport.send_message` (single `SendMessageResponse`) -> one `StreamResponse`.
-#   If both True, `transport.send_message_streaming` -> many `StreamResponse`s.
-# - This wrapper now respects `self._streaming` / `client._config.streaming`
-#   (set via `A2AClient.create(streaming=...)` or `__init__(client, streaming=...)`).
-#   `send_message` (3.1.1) is true send-and-forget: consumes only first chunk (single
-#   Task|Message) - not `_process_stream`. `send_streaming_message` (3.1.2) streams
-#   to completion via `_process_stream` (former `send_message` behaviour).
-#   See `tests/acceptance/3_a2a_testing.py:259` for `ClientConfig(streaming=True)` origin.
-#
-# Source: tests/a2a_task_service.py (stash@{0} A2ATaskService) + 3_a2a_testing.py:254-260
-# client init pattern. Faithfully preserved; added list_tasks + push-free.
+"""
+client/a2a_client.py — Unified A2A client.
+
+Class: A2AClient (wraps a2a SDK Client from create_client)
+  Methods:
+    create(server_url, streaming, httpx_client, polling) -> A2AClient  # factory, mirrors 3_a2a_testing.py:254-260
+    close()                                                    # closes client + owned httpx
+    send_message(text, context_id) -> (task_id, context_id, text)             # 3.1.1 non-streaming, first chunk
+    send_streaming_message(text, context_id) -> (task_id, context_id, artifact) # 3.1.2 streaming, full loop
+    subscribe_to_task(task_id) -> (task_id, context_id, artifact)            # 3.1.6
+    get_task(task_id) -> Task                                                 # 3.1.3
+    list_tasks(context_id, status, page_size, ...) -> ListTasksResponse      # 3.1.4
+    cancel_task(task_id) -> Task                                              # 3.1.5
+    poll_until_complete(task_id) -> Task                                      # helper
+  Helpers:
+    _create_send_request(text, context_id) -> (SendMessageRequest, context_id)
+    _extract_chunk_info(chunk) -> (text, task_id, context_id, chunk_type)    # handles Task|Status|Artifact
+    _process_stream(stream) -> (task_id, context_id, artifact)                # consumes streaming iterator
+    _is_streaming() -> bool                                                   # effective streaming flag
+"""
 
 import uuid
 import asyncio
@@ -60,37 +60,44 @@ class A2AClient:
     """
 
     def __init__(self, client, streaming: Optional[bool] = None):
+        # Reference: SDK client holds _config.streaming and _card.capabilities.streaming
+        # High-level: explicit `streaming` overrides auto-detect; None means infer from the wrapped SDK client.
         self.client = client
-        # Explicit streaming param overrides auto-detect; None -> infer from client._config / _card
         if streaming is not None:
-            self._streaming: Optional[bool] = bool(streaming)
+            self._explicit_streaming: Optional[bool] = bool(streaming)
         else:
-            self._streaming = None
-        # compat for old create() stashed attrs
+            self._explicit_streaming = None
+        # Stashed by create() for close()
         self._httpx_client: Optional[httpx.AsyncClient] = None  # type: ignore[assignment]
         self._owns_httpx = False
         self._server_url: Optional[str] = None
 
     # ------------------------------------------------------------------
-    # Factory helpers (the "actual client" you noted was missing)
+    # Factory helpers
     # ------------------------------------------------------------------
     def _is_streaming(self) -> bool:
-        """Resolve effective streaming flag.
+        """Return whether this wrapper should behave as streaming.
 
-        Priority: explicit `self._streaming` (via __init__ or create) > client._config.streaming
-        && client._card.capabilities.streaming > default True. Lets caller create
-        one client and toggle per-call via `A2AClient(client, streaming=False)`.
+        Reference: checks explicit flag first, else SDK `client._config.streaming`
+        and server card `client._card.capabilities.streaming` (agent/a2a_connector.py:357 advertises True).
+        High-level: does the server + client actually support streaming right now?
         """
-        if self._streaming is not None:
-            return bool(self._streaming)
+        # High-level: if caller forced streaming via A2AClient(client, streaming=True/False), trust that
+        if self._explicit_streaming is not None:
+            return bool(self._explicit_streaming)
+        # High-level: otherwise ask the SDK client what it was configured with
         try:
-            cfg_stream = bool(getattr(self.client, "_config", None) and getattr(self.client._config, "streaming", True))
-            # card may be _card or card; capabilities.streaming is server advert (True on report agent agent/a2a_connector.py:357)
-            card = getattr(self.client, "_card", None) or getattr(self.client, "card", None)
-            if card is not None and hasattr(card, "capabilities"):
-                return bool(cfg_stream and getattr(card.capabilities, "streaming", True))
-            return cfg_stream
+            underlying_client_config = getattr(self.client, "_config", None)
+            is_client_streaming_enabled = bool(underlying_client_config and getattr(underlying_client_config, "streaming", True))
+            # High-level: also check what the server says it can do (agent card)
+            agent_card = getattr(self.client, "_card", None) or getattr(self.client, "card", None)
+            if agent_card is not None and hasattr(agent_card, "capabilities"):
+                is_server_streaming_enabled = bool(getattr(agent_card.capabilities, "streaming", True))
+                # High-level: both must be True to actually stream
+                return bool(is_client_streaming_enabled and is_server_streaming_enabled)
+            return is_client_streaming_enabled
         except Exception:
+            # High-level: if anything missing, assume streaming (report agent always streams)
             return True
 
     @classmethod
@@ -102,32 +109,31 @@ class A2AClient:
         httpx_client: Optional[httpx.AsyncClient] = None,
         polling: bool = False,
     ) -> "A2AClient":
-        """Create resolver+client and wrap. Mirrors 3_a2a_testing.py:254-260.
+        """Create resolver+client and wrap.
 
-        Args:
-            server_url: e.g. http://192.168.0.107:9999
-            streaming: maps to ClientConfig(streaming). True -> streaming path
-                       (a2a/client/base_client.py:streaming branch), False -> non-streaming.
-            httpx_client: reuse or None -> new AsyncClient(timeout=300)
-            polling: ClientConfig.polling (return_immediately)
+        Reference: mirrors 3_a2a_testing.py:254-260 (A2ACardResolver -> create_client with ClientConfig).
+        High-level: one-liner to get a ready A2AClient; streaming flag decides SendMessage vs SendStreamingMessage.
         """
-        close_ours = False
+        # Reference: SDK ClientConfig fields: streaming, polling (return_immediately), httpx_client
+        # High-level: build the SDK client the way the acceptance tests did, then wrap it
+        owns_httpx_client = False
         if httpx_client is None:
             httpx_client = httpx.AsyncClient(timeout=300.0)
-            close_ours = True  # caller still owns via svc, but we keep ref
-        resolver = A2ACardResolver(httpx_client=httpx_client, base_url=server_url)
-        card = await resolver.get_agent_card()
-        config = ClientConfig(streaming=streaming, polling=polling, httpx_client=httpx_client)
-        raw = await create_client(card, client_config=config)
-        # stash httpx_client for close() and wrap with explicit streaming
-        inst = cls(raw, streaming=streaming)
-        inst._httpx_client = httpx_client  # type: ignore[attr-defined]
-        inst._owns_httpx = close_ours  # type: ignore[attr-defined]
-        inst._server_url = server_url  # type: ignore[attr-defined]
-        return inst
+            owns_httpx_client = True
+        card_resolver = A2ACardResolver(httpx_client=httpx_client, base_url=server_url)
+        agent_card = await card_resolver.get_agent_card()
+        sdk_client_config = ClientConfig(streaming=streaming, polling=polling, httpx_client=httpx_client)
+        sdk_client = await create_client(agent_card, client_config=sdk_client_config)
+        wrapped_client = cls(sdk_client, streaming=streaming)
+        wrapped_client._httpx_client = httpx_client  # type: ignore[attr-defined]
+        wrapped_client._owns_httpx = owns_httpx_client  # type: ignore[attr-defined]
+        wrapped_client._server_url = server_url  # type: ignore[attr-defined]
+        return wrapped_client
 
     async def close(self):
-        """Close underlying client + httpx if we own it."""
+        """Close underlying SDK client + owned httpx."""
+        # Reference: SDK Client.close() + httpx.AsyncClient.aclose()
+        # High-level: clean up network resources; safe to call twice
         try:
             if hasattr(self.client, "close"):
                 await self.client.close()
@@ -142,7 +148,11 @@ class A2AClient:
     # INTERNAL HELPERS (The "Plumbing")
     # ==========================================
     def _create_send_request(self, text, context_id=None):
-        """Encapsulates the Protobuf message creation."""
+        """Build a SendMessageRequest from text.
+
+        Reference: a2a.types.a2a_pb2.Message/Part/Role + uuid for message_id/context_id
+        High-level: turns your string prompt into the protobuf the SDK wants, creating a new context if needed
+        """
         if not context_id:
             context_id = str(uuid.uuid4())
             print(f">>> CLIENT GENERATED CONTEXT ID: {context_id}")
@@ -158,7 +168,12 @@ class A2AClient:
         return SendMessageRequest(message=message), context_id
 
     def _extract_chunk_info(self, chunk):
-        """Takes raw Protobuf chunk. Returns: (text_content, task_id, context_id, chunk_type)"""
+        """Parse a StreamResponse chunk.
+
+        Reference: google.protobuf.json_format.MessageToDict(preserving_proto_field_name=True) on StreamResponse,
+        then inspects task / status_update / artifact_update branches (a2a spec Task|TaskStatusUpdateEvent|TaskArtifactUpdateEvent)
+        High-level: whatever the server streamed, give back (human text, task_id, context_id, kind) so callers don't parse proto
+        """
         chunk_dict = MessageToDict(chunk, preserving_proto_field_name=True)
         text_content = None
         chunk_type = None
@@ -207,7 +222,11 @@ class A2AClient:
         return text_content, task_id, context_id, chunk_type
 
     async def _process_stream(self, stream, label=""):
-        """Centralized pipeline to consume a stream, extract data, and print it."""
+        """Consume a streaming iterator and aggregate final artifact.
+
+        Reference: iterates async `stream` of StreamResponse, calls _extract_chunk_info per chunk
+        High-level: used by streaming calls to collect all server updates and return the report artifact
+        """
         final_artifact = ""
         task_id = None
         context_id = None
@@ -215,17 +234,17 @@ class A2AClient:
 
         async for chunk in stream:
             chunk_count += 1
-            text, tid, cid, ctype = self._extract_chunk_info(chunk)
+            text, extracted_task_id, extracted_context_id, chunk_kind = self._extract_chunk_info(chunk)
 
-            if tid:
-                task_id = tid
-            if cid:
-                context_id = cid
+            if extracted_task_id:
+                task_id = extracted_task_id
+            if extracted_context_id:
+                context_id = extracted_context_id
 
             if text:
                 print(f"{label}{text}")
 
-            if ctype == "ARTIFACT":
+            if chunk_kind == "ARTIFACT":
                 final_artifact = text
 
         print(f"{label}--- Stream finished. Total chunks: {chunk_count} ---")
@@ -237,56 +256,55 @@ class A2AClient:
     async def send_message(self, text, context_id=None, label=""):
         """3.1.1 SendMessage — send-and-forget (non-streaming).
 
-        Single `Task|Message` return. Uses `self.client.send_message(request)` which
-        when `ClientConfig(streaming=False)` or server `capabilities.streaming=False`
-        calls `transport.send_message` (one `StreamResponse` via
-        `a2a/client/base_client.py:send_message`). This method consumes ONLY the
-        first chunk and returns `(task_id, context_id, text)` — not `_process_stream`.
-        Respects `self._streaming` / `client._config.streaming`; if streaming True,
-        caller should use `send_streaming_message` for full stream. Keeps
-        3.1.1 vs 3.1.2 spec separation (previously alias, now actual non-streaming).
+        Reference: SDK transport `message/send` via `client.send_message` when streaming False (a2a/client/base_client.py:send_message)
+        High-level: fire the prompt and get back the first task immediately (task_id needed for resubscribe/poll); not the full streamed report
         """
-        request, ctx_id = self._create_send_request(text, context_id)
-        mode = "STREAMING" if self._is_streaming() else "NON-STREAMING"
-        print(f"\n{label}[CLIENT SENDING - {mode}]: {text}")
-        # Non-streaming: take first chunk only (send-and-forget)
+        request, generated_context_id = self._create_send_request(text, context_id)
+        mode_label = "STREAMING" if self._is_streaming() else "NON-STREAMING"
+        print(f"\n{label}[CLIENT SENDING - {mode_label}]: {text}")
+        # Reference: SDK still yields StreamResponse even for non-streaming (one item); we take only first
+        # High-level: single response is enough to learn task_id/context_id for later get/subscribe
         async for chunk in self.client.send_message(request):
-            text_content, tid, cid, ctype = self._extract_chunk_info(chunk)
-            if text_content:
-                print(f"{label}{text_content}")
-            # effective IDs fall back to request context if chunk missing
-            return tid or None, cid or ctx_id, text_content
-        return None, ctx_id, None
+            extracted_text, extracted_task_id, extracted_context_id, chunk_kind = self._extract_chunk_info(chunk)
+            if extracted_text:
+                print(f"{label}{extracted_text}")
+            return extracted_task_id or None, extracted_context_id or generated_context_id, extracted_text
+        return None, generated_context_id, None
 
     async def send_streaming_message(self, text, context_id=None, label=""):
         """3.1.2 SendStreamingMessage — streams to completion.
 
-        Uses `self.client.send_message(request)` which, when `ClientConfig(streaming=True)`
-        and server streaming True, calls `transport.send_message_streaming`
-        (`SendStreamingMessage` JSON-RPC) and yields many chunks. Consumed via
-        `_process_stream` to surface status/artifact and return final artifact.
-        This is the behaviour previously exposed as `send_message` (3_a2a_testing.py:107).
+        Reference: SDK transport `message/stream` via `client.send_message` when streaming True (a2a/client/base_client.py:send_message -> send_message_streaming)
+        High-level: fire prompt and stream all status + artifact chunks until the report is done; this is what 3_a2a_testing.py:107 did
         """
-        request, ctx_id = self._create_send_request(text, context_id)
+        request, generated_context_id = self._create_send_request(text, context_id)
         print(f"\n{label}[CLIENT SENDING - STREAMING]: {text}")
 
         stream = self.client.send_message(request)
-        tid, cid, artifact = await self._process_stream(stream, label=f"{label}  ")
-        return tid, cid, artifact
+        task_id, context_id, artifact = await self._process_stream(stream, label=f"{label}  ")
+        return task_id, context_id, artifact
 
     async def subscribe_to_task(self, task_id, label=""):
-        """3.1.6 SubscribeToTask — resubscribe to task event stream."""
+        """3.1.6 SubscribeToTask — resubscribe to task event stream.
+
+        Reference: SDK `client.subscribe(SubscribeToTaskRequest)` (a2a/client/base_client.py:subscribe)
+        High-level: after a drop, re-attach to the same task and stream its remaining updates
+        """
         print(f"\n{label}[SUBSCRIBING TO TASK]: {task_id}")
 
         # FIX: BaseClient requires a Protobuf request object and uses .subscribe()
         req = SubscribeToTaskRequest(id=task_id)
         stream = self.client.subscribe(req)
 
-        tid, cid, artifact = await self._process_stream(stream, label=f"{label}  ")
-        return tid, cid, artifact
+        task_id, context_id, artifact = await self._process_stream(stream, label=f"{label}  ")
+        return task_id, context_id, artifact
 
     async def get_task(self, task_id, label=""):
-        """3.1.3 GetTask"""
+        """3.1.3 GetTask.
+
+        Reference: SDK `client.get_task(GetTaskRequest)` (a2a/client/base_client.py:get_task)
+        High-level: fetch current task state/history on demand (polling)
+        """
         print(f"\n{label}[GETTING TASK]: {task_id}")
 
         # FIX: BaseClient requires a Protobuf request object
@@ -307,15 +325,10 @@ class A2AClient:
         history_length: Optional[int] = None,
         label: str = "",
     ) -> ListTasksResponse:
-        """3.1.4 ListTasks — wrapper over `Client.list_tasks`.
+        """3.1.4 ListTasks.
 
-        Mirrors `a2a/types/a2a_pb2.py:ListTasksRequest` fields:
-          context_id, status (TaskState enum), page_size, page_token,
-          history_length, include_artifacts (bool). Tenant/history filters omitted.
-
-        Example:
-            resp = await svc.list_tasks(context_id=ctx, page_size=10, include_artifacts=True)
-            for t in resp.tasks: print(t.id, t.status.state)
+        Reference: SDK `client.list_tasks(ListTasksRequest)` fields from a2a/types/a2a_pb2.py
+        High-level: list tasks for this agent, optionally filtered by context/status with paging
         """
         if label:
             print(f"\n{label}[LISTING TASKS] ctx={context_id} status={status} page_size={page_size}")
@@ -339,7 +352,11 @@ class A2AClient:
         return resp
 
     async def cancel_task(self, task_id, label=""):
-        """3.1.5 CancelTask"""
+        """3.1.5 CancelTask.
+
+        Reference: SDK `client.cancel_task(CancelTaskRequest)` (a2a/client/base_client.py:cancel_task)
+        High-level: ask server to cancel a running task; server enqueues TASK_STATE_CANCELED via agent/a2a_connector.py:281
+        """
         print(f"\n{label}[CANCELLING TASK]: {task_id}")
 
         # FIX: BaseClient requires a Protobuf request object
@@ -350,7 +367,11 @@ class A2AClient:
         return task_data
 
     async def poll_until_complete(self, task_id, interval=5, max_attempts=10, label=""):
-        """Polls get_task repeatedly until COMPLETED or max attempts reached."""
+        """Helper: poll get_task until COMPLETED.
+
+        Reference: loops get_task + asyncio.sleep
+        High-level: when you used non-streaming SendMessage, wait until the task finishes without streaming
+        """
         for attempt in range(1, max_attempts + 1):
             task_data = await self.get_task(task_id, label=f"{label}Poll {attempt}/{max_attempts}: ")
             if task_data.status.state == TaskState.TASK_STATE_COMPLETED:
@@ -359,7 +380,3 @@ class A2AClient:
                 print(f"{label}  -> Waiting {interval}s for next check...")
                 await asyncio.sleep(interval)
         return task_data
-
-
-# Removed redundant alias A2ATaskService — now only A2AClient (per cleanup).
-# For external compat, import via: from client.a2a_client import A2AClient
