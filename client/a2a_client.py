@@ -3,23 +3,18 @@
 # UNIFIED A2A client (PR-B). Moved from tests/a2a_task_service.py -> client/a2a_client.py
 # per easy-fix: rename + add send_message / send_streaming_message split + list_tasks.
 #
-# Streaming vs non-streaming note (the mix you flagged):
+# Streaming vs non-streaming (fixed from alias):
 # - SDK `a2a.client.Client.send_message` in `a2a/client/base_client.py:send_message`
-#   already multiplexes the JSON-RPC `message/send` vs `message/stream` via
-#   `ClientConfig(streaming)` and `AgentCard.capabilities.streaming`. If either is
-#   False, `transport.send_message` (single `SendMessageResponse`) is used and
-#   yielded as one `StreamResponse`. If both True, `transport.send_message_streaming`
-#   (`SendStreamingMessage`) yields many `StreamResponse`s. So the wire difference
-#   `SendMessage` (3.1.1) vs `SendStreamingMessage` (3.1.2) lives in `ClientConfig`,
-#   not in two different `Client` methods.
-# - This wrapper exposes BOTH spec names explicitly (`send_message:3.1.1`,
-#   `send_streaming_message:3.1.2`) so you can call spec-by-spec. Internally both
-#   currently delegate to `self.client.send_message(request)` and consume via
-#   `_process_stream`. True non-streaming behaviour (single response) happens when
-#   the wrapped `client` was created with `ClientConfig(streaming=False)` — see
-#   `create_client_from_url` below and `tests/acceptance/3_a2a_testing.py:259`.
-#   Keeping both names now satisfies spec coverage while preserving the old
-#   `send_message` streaming behaviour (now alias to streaming).
+#   multiplexes JSON-RPC `message/send` vs `message/stream` via
+#   `ClientConfig(streaming)` + `AgentCard.capabilities.streaming`. If either False,
+#   `transport.send_message` (single `SendMessageResponse`) -> one `StreamResponse`.
+#   If both True, `transport.send_message_streaming` -> many `StreamResponse`s.
+# - This wrapper now respects `self._streaming` / `client._config.streaming`
+#   (set via `A2AClient.create(streaming=...)` or `__init__(client, streaming=...)`).
+#   `send_message` (3.1.1) is true send-and-forget: consumes only first chunk (single
+#   Task|Message) - not `_process_stream`. `send_streaming_message` (3.1.2) streams
+#   to completion via `_process_stream` (former `send_message` behaviour).
+#   See `tests/acceptance/3_a2a_testing.py:259` for `ClientConfig(streaming=True)` origin.
 #
 # Source: tests/a2a_task_service.py (stash@{0} A2ATaskService) + 3_a2a_testing.py:254-260
 # client init pattern. Faithfully preserved; added list_tasks + push-free.
@@ -46,7 +41,7 @@ from a2a.types.a2a_pb2 import (
 )
 
 
-class A2ATaskService:
+class A2AClient:
     """Full task-lifecycle A2A client.
 
     Wraps a lower-level A2A client (from create_client) and provides the full
@@ -58,18 +53,46 @@ class A2ATaskService:
         resolver = A2ACardResolver(httpx_client=httpx_client, base_url=server_url)
         card = await resolver.get_agent_card()
         client = await create_client(card, ClientConfig(streaming=True, httpx_client=httpx_client))
-        svc = A2ATaskService(client)
+        svc = A2AClient(client, streaming=True)
     or via helper:
-        svc = await A2ATaskService.create(server_url, streaming=True)
-    Streaming True -> `SendStreamingMessage` (3.1.2), False -> `SendMessage` (3.1.1).
+        svc = await A2AClient.create(server_url, streaming=True)
+    Streaming flag controls `send_message` (3.1.1 single) vs `send_streaming_message` (3.1.2 streamed).
     """
 
-    def __init__(self, client):
+    def __init__(self, client, streaming: Optional[bool] = None):
         self.client = client
+        # Explicit streaming param overrides auto-detect; None -> infer from client._config / _card
+        if streaming is not None:
+            self._streaming: Optional[bool] = bool(streaming)
+        else:
+            self._streaming = None
+        # compat for old create() stashed attrs
+        self._httpx_client: Optional[httpx.AsyncClient] = None  # type: ignore[assignment]
+        self._owns_httpx = False
+        self._server_url: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Factory helpers (the "actual client" you noted was missing)
     # ------------------------------------------------------------------
+    def _is_streaming(self) -> bool:
+        """Resolve effective streaming flag.
+
+        Priority: explicit `self._streaming` (via __init__ or create) > client._config.streaming
+        && client._card.capabilities.streaming > default True. Lets caller create
+        one client and toggle per-call via `A2AClient(client, streaming=False)`.
+        """
+        if self._streaming is not None:
+            return bool(self._streaming)
+        try:
+            cfg_stream = bool(getattr(self.client, "_config", None) and getattr(self.client._config, "streaming", True))
+            # card may be _card or card; capabilities.streaming is server advert (True on report agent agent/a2a_connector.py:357)
+            card = getattr(self.client, "_card", None) or getattr(self.client, "card", None)
+            if card is not None and hasattr(card, "capabilities"):
+                return bool(cfg_stream and getattr(card.capabilities, "streaming", True))
+            return cfg_stream
+        except Exception:
+            return True
+
     @classmethod
     async def create(
         cls,
@@ -78,7 +101,7 @@ class A2ATaskService:
         streaming: bool = True,
         httpx_client: Optional[httpx.AsyncClient] = None,
         polling: bool = False,
-    ) -> "A2ATaskService":
+    ) -> "A2AClient":
         """Create resolver+client and wrap. Mirrors 3_a2a_testing.py:254-260.
 
         Args:
@@ -96,12 +119,11 @@ class A2ATaskService:
         card = await resolver.get_agent_card()
         config = ClientConfig(streaming=streaming, polling=polling, httpx_client=httpx_client)
         raw = await create_client(card, client_config=config)
-        # stash httpx_client for close()
-        inst = cls(raw)
+        # stash httpx_client for close() and wrap with explicit streaming
+        inst = cls(raw, streaming=streaming)
         inst._httpx_client = httpx_client  # type: ignore[attr-defined]
         inst._owns_httpx = close_ours  # type: ignore[attr-defined]
         inst._server_url = server_url  # type: ignore[attr-defined]
-        inst._streaming = streaming  # type: ignore[attr-defined]
         return inst
 
     async def close(self):
@@ -213,18 +235,28 @@ class A2ATaskService:
     # PUBLIC API (The "Service" Methods)
     # ==========================================
     async def send_message(self, text, context_id=None, label=""):
-        """3.1.1 SendMessage (non-streaming alias).
+        """3.1.1 SendMessage — send-and-forget (non-streaming).
 
-        Spec `message/send` returns single `Task|Message`. SDK achieves it when
-        `ClientConfig(streaming=False)` or server `capabilities.streaming=False`
-        (`a2a/client/base_client.py:send_message` branches to `transport.send_message`).
-        This wrapper still calls `self.client.send_message` and consumes via
-        `_process_stream` so it works with either config; when non-streaming it will
-        just get 1 chunk and return that task. Kept as streaming-alias for
-        backwards compat — previous `send_message` was streaming. Prefer
-        `send_streaming_message` for explicit streaming.
+        Single `Task|Message` return. Uses `self.client.send_message(request)` which
+        when `ClientConfig(streaming=False)` or server `capabilities.streaming=False`
+        calls `transport.send_message` (one `StreamResponse` via
+        `a2a/client/base_client.py:send_message`). This method consumes ONLY the
+        first chunk and returns `(task_id, context_id, text)` — not `_process_stream`.
+        Respects `self._streaming` / `client._config.streaming`; if streaming True,
+        caller should use `send_streaming_message` for full stream. Keeps
+        3.1.1 vs 3.1.2 spec separation (previously alias, now actual non-streaming).
         """
-        return await self.send_streaming_message(text, context_id=context_id, label=label)
+        request, ctx_id = self._create_send_request(text, context_id)
+        mode = "STREAMING" if self._is_streaming() else "NON-STREAMING"
+        print(f"\n{label}[CLIENT SENDING - {mode}]: {text}")
+        # Non-streaming: take first chunk only (send-and-forget)
+        async for chunk in self.client.send_message(request):
+            text_content, tid, cid, ctype = self._extract_chunk_info(chunk)
+            if text_content:
+                print(f"{label}{text_content}")
+            # effective IDs fall back to request context if chunk missing
+            return tid or None, cid or ctx_id, text_content
+        return None, ctx_id, None
 
     async def send_streaming_message(self, text, context_id=None, label=""):
         """3.1.2 SendStreamingMessage — streams to completion.
@@ -329,5 +361,5 @@ class A2ATaskService:
         return task_data
 
 
-# Backwards-compat alias — spec uses A2AClient, old code uses A2ATaskService
-A2AClient = A2ATaskService
+# Removed redundant alias A2ATaskService — now only A2AClient (per cleanup).
+# For external compat, import via: from client.a2a_client import A2AClient
