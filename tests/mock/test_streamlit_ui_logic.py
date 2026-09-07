@@ -22,11 +22,32 @@ Note: These tests use mock objects and do not require PostgreSQL or LLM APIs.
 import os
 import pytest
 from pathlib import Path
+import streamlit as st
 from streamlit.testing.v1 import AppTest
 
 os.environ["STREAMLIT_USE_MOCKS"] = "1"
 
 APP_PATH = str(Path(__file__).resolve().parent.parent.parent / "streamlit_ui" / "app.py")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_mock_cache():
+    """Clear streamlit's cache_resource between tests.
+
+    Mock dependencies are cached via st.cache_resource and would otherwise
+    leak (sessions, uploaded files, seeded report) across AppTest instances
+    within the same pytest process.
+    """
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
+    os.environ["STREAMLIT_USE_MOCKS"] = "1"
+    yield
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
 
 
 class TestAppInitialization:
@@ -125,8 +146,36 @@ class TestSessionStatePersistence:
         assert at.session_state.current_thread_id == first_session_id
 
 
-# Note: Full integration tests with user input simulation would require
-# mocking the service layer. The above tests verify UI structure and
-# basic state management. For complete flow testing, see the service
-# layer tests in test_agent_service_with_mocks.py.
+class TestSessionSwitching:
+    """End-to-end session creation and switching in mock mode."""
+
+    def test_new_session_creates_and_registers_thread(self):
+        """New Session starts a fresh thread id and clears the chat."""
+        at = AppTest.from_file(APP_PATH).run()
+        at.chat_input[0].set_value("scan 10.0.0.1").run()
+        first = at.session_state["current_thread_id"]
+
+        at.sidebar.button[0].click().run()
+        second = at.session_state["current_thread_id"]
+
+        assert second != first
+        assert at.session_state["chat_messages"] == []
+        assert not at.exception
+
+    def test_switching_back_restores_history(self):
+        """Selecting an older session reloads its saved chat history."""
+        at = AppTest.from_file(APP_PATH).run()
+        at.chat_input[0].set_value("scan 10.0.0.1").run()
+        first = at.session_state["current_thread_id"]
+
+        at.sidebar.button[0].click().run()
+        # One more pass so the session selector lists both threads
+        at.run()
+        at.sidebar.selectbox[0].select(first).run()
+
+        assert at.session_state["current_thread_id"] == first
+        assert len(at.session_state["chat_messages"]) == 2
+        roles = [m["role"] for m in at.session_state["chat_messages"]]
+        assert roles == ["user", "assistant"]
+        assert not at.exception
 

@@ -132,15 +132,31 @@ def _shared_mock_file_store() -> MockFileStore:
     """Shared in-memory file store for mock mode.
 
     Findings/reports are global by design (see upload_finding), so every
-    service in mock mode writes to the same store.
+    service in mock mode writes to the same store. A demo report is seeded so
+    the download path can be exercised without a real agent run.
     """
-    return MockFileStore()
+    store = MockFileStore()
+    store.prepopulate_with_report(
+        "demo_pentest_report.md",
+        b"# Demo Pentest Report\n\nSeeded by mock mode so the store + download "
+        b"path can be tested without a real agent run.\n",
+    )
+    return store
 
 
 @st.cache_resource
 def _shared_mock_agent_runner() -> MockAgentRunner:
-    """Shared in-memory agent runner for mock mode."""
-    return MockAgentRunner()
+    """Shared in-memory agent runner for mock mode.
+
+    Pre-loaded with plausible tool calls and a small per-event delay so the
+    chat visibly streams (tool call blocks, then the reply) like a real run.
+    """
+    runner = MockAgentRunner(delay_seconds=0.35)
+    runner.set_tool_calls([
+        {"name": "nmap_scan", "args": {"target": "10.0.0.1"}},
+        {"name": "nikto_scan", "args": {"url": "http://10.0.0.1"}},
+    ])
+    return runner
 
 
 def _build_mock_service(thread_id: str) -> PenTestAgentService:
@@ -226,24 +242,41 @@ def render_sidebar(service: PenTestAgentService) -> None:
             
             if selected_session != st.session_state.current_thread_id:
                 st.session_state.current_thread_id = selected_session
-                st.session_state.chat_messages = service.get_chat_history()
-                st.rerun()
+                st.session_state.chat_messages = []
+                # main() rebinds the service and reloads this thread's history
+                st.session_state._service_thread = None
         
         if st.button("➕ New Session", use_container_width=True):
             import uuid
             new_thread_id = f"session_{uuid.uuid4().hex[:8]}"
             st.session_state.current_thread_id = new_thread_id
             st.session_state.chat_messages = []
-            st.session_state.service = get_or_create_service(new_thread_id)
-            st.rerun()
+            st.session_state._service_thread = None
+            service = get_or_create_service(new_thread_id)
+            # Register the thread so it immediately appears in the session selector
+            service.save_chat_history([])
         
         st.divider()
         
         # File upload section
-        def handle_upload(filename: str, content: bytes) -> None:
-            """Callback for file upload component."""
+        def handle_upload(filename: str, content: bytes) -> Optional[str]:
+            """Callback for file upload component. Returns status text (or None when already handled).
+
+            st.file_uploader keeps the file in the widget across reruns, so the
+            callback fires on every interaction. Track processed names and write
+            only once - otherwise the same file would be re-written each rerun.
+            """
+            if filename in st.session_state.processed_findings:
+                return None
+            if filename in service.list_findings():
+                service.upload_finding(filename, content)
+                st.session_state.processed_findings.add(filename)
+                st.session_state.findings = service.list_findings()
+                return f"`{filename}` already existed - it was replaced."
             service.upload_finding(filename, content)
+            st.session_state.processed_findings.add(filename)
             st.session_state.findings = service.list_findings()
+            return f"Uploaded `{filename}` ({len(content)} bytes)."
         
         render_file_uploader(handle_upload)
         
@@ -344,11 +377,26 @@ def main() -> None:
     if "findings" not in st.session_state:
         st.session_state.findings = []
     
+    if "processed_findings" not in st.session_state:
+        st.session_state.processed_findings = set()
+    
+    if "_service_thread" not in st.session_state:
+        st.session_state._service_thread = None
+    
     # Get or create service for current thread
     service = get_or_create_service(st.session_state.current_thread_id)
     
-    # Render UI
+    # Render sidebar (its handlers may change the active thread)
     render_sidebar(service)
+    
+    # If a New Session / session switch happened above, rebind the service for
+    # the new thread and load that thread's saved history into the UI.
+    if st.session_state._service_thread != st.session_state.current_thread_id:
+        service = get_or_create_service(st.session_state.current_thread_id)
+        st.session_state.chat_messages = service.get_chat_history()
+        st.session_state._service_thread = st.session_state.current_thread_id
+    
+    # Render UI
     render_main_chat(service)
 
 

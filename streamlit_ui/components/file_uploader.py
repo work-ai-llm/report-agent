@@ -20,22 +20,25 @@ render_file_uploader(handle_upload)
 ```
 """
 
-from typing import Callable
+from typing import Callable, Optional
 import streamlit as st
 
 
 def render_file_uploader(
-    on_upload: Callable[[str, bytes], None],
+    on_upload: Callable[[str, bytes], Optional[str]],
     allowed_extensions: list[str] | None = None
 ) -> None:
     """Render file upload widget for findings.
     
     Displays a file uploader that accepts findings files and calls the
-    provided callback with filename and content bytes.
-    
+    provided callback with filename and content bytes. The callback returns
+    an optional status message that is rendered under the widget (return
+    None when the file has already been handled, e.g. re-uploaded on a rerun,
+    to avoid spamming status messages on every interaction).
+
     Args:
-        on_upload: Callback function(filename: str, content: bytes) 
-                   to handle the uploaded file
+        on_upload: Callback function(filename: str, content: bytes) -> Optional[str]
+                   to handle the uploaded file and return a status message
         allowed_extensions: Optional list of allowed file extensions
                            (e.g., ['.txt', '.md', '.json'])
                            
@@ -50,9 +53,11 @@ def render_file_uploader(
     Usage:
         ```python
         # In sidebar
-        def handle_upload(filename: str, content: bytes):
+        def handle_upload(filename: str, content: bytes) -> Optional[str]:
+            if filename in service.list_findings():
+                return f"{filename} already exists - replaced it."
             service.upload_finding(filename, content)
-            st.session_state.findings = service.list_findings()
+            return f"Uploaded {filename}"
         
         render_file_uploader(handle_upload)
         ```
@@ -73,7 +78,7 @@ def render_file_uploader(
         content = uploaded_file.getvalue()
         filename = uploaded_file.name
         
-        # Call the handler to store in virtual FS
-        on_upload(filename, content)
-        
-        st.success(f"✅ Uploaded **{filename}** ({len(content)} bytes)")
+        # Call the handler to store in virtual FS; it may return a status message
+        status = on_upload(filename, content)
+        if status:
+            st.success(status)
