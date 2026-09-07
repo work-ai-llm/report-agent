@@ -10,7 +10,7 @@ decoupled from the service implementation.
 ## Data Flow
 
 ```
-User clicks download → render_report_downloader() → download_report() → Browser
+User clicks download → st.download_button → download_report() → Browser
 ```
 
 ## Usage Pattern
@@ -31,46 +31,31 @@ def render_report_downloader(
     filename: str,
     label: Optional[str] = None,
 ) -> None:
-    """Render download button for a specific report.
+    """Render a single-click download button for a specific report.
 
-    The report content is fetched only when the button is clicked (not on every
-    page rerun), so a missing report shows a warning only on demand.
+    The report content is fetched at render time so ``st.download_button``
+    can be shown directly – one click triggers the download. A missing
+    report shows a warning instead.
 
     Args:
         download_report: Callable(filename: str) -> Optional[bytes] that loads
                          the report content from the virtual filesystem
         filename: Name of the report file (e.g., "pentest_report.md")
         label: Optional custom button label (defaults to "📄 Download {filename}")
-
-    Visual Layout:
-        ┌─────────────────────────────┐
-        │ [📄 Download pentest_report.md] │
-        │                             │
-        └─────────────────────────────┘
-
-    Usage:
-        ```python
-        # Show download button if report exists
-        reports = service.list_reports()
-        if "pentest_report.md" in reports:
-            render_report_downloader(service.download_report, "pentest_report.md")
-        ```
     """
+    content = download_report(filename)
+    if content is None:
+        st.warning(f"Report **{filename}** not found")
+        return
+
     button_label = label if label else f"📄 Download **{filename}**"
-
-    if st.button(button_label, key=f"download_report_{filename}"):
-        content = download_report(filename)
-        if content is None:
-            st.warning(f"Report **{filename}** not found")
-            return
-
-        st.download_button(
-            label=f"**{filename}**",
-            data=content,
-            file_name=filename,
-            mime="text/markdown" if filename.endswith(".md") else "text/plain",
-            key=f"save_report_{filename}",
-        )
+    st.download_button(
+        label=button_label,
+        data=content,
+        file_name=filename,
+        mime="text/markdown" if filename.endswith(".md") else "text/plain",
+        key=f"save_report_{filename}",
+    )
 
 
 def render_report_selector(list_reports: Callable[[], List[str]]) -> Optional[str]:

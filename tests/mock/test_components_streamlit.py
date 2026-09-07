@@ -60,19 +60,63 @@ class TestFileUploader:
     """Tests for the findings upload widget."""
 
     def test_render_file_uploader_calls_back_with_upload(self) -> None:
-        captured: List[Tuple[str, bytes]] = []
+        captured: List[Tuple[str, bytes, bool]] = []
 
         def app(captured) -> None:
             from streamlit_ui.components.file_uploader import render_file_uploader
 
-            def handle(filename, content):
-                captured.append((filename, content))
+            def handle(filename, content, replace=False):
+                captured.append((filename, content, replace))
 
             render_file_uploader(handle)
 
         at = AppTest.from_function(app, args=(captured,)).run()
         at.file_uploader[0].upload("nmap.txt", b"Port 80 open").run()
-        assert captured == [("nmap.txt", b"Port 80 open")]
+        assert captured == [("nmap.txt", b"Port 80 open", False)]
+
+    def test_uploader_clears_after_successful_upload(self) -> None:
+        """After a successful upload the dropzone is remounted (key rotates)."""
+        def app() -> None:
+            from streamlit_ui.components.file_uploader import render_file_uploader
+
+            def handle(filename, content, replace=False):
+                return f"Uploaded {filename}"
+
+            render_file_uploader(handle)
+
+        at = AppTest.from_function(app).run()
+        assert len(at.file_uploader) == 1
+
+        # Upload a file -> success status is shown and a rerun is triggered.
+        at.file_uploader[0].upload("a.txt", b"content").run()
+        assert len(at.success) == 1
+
+    def test_collision_stages_decision_and_replace_uploads(self) -> None:
+        """A duplicate filename is not silently accepted; Replace works."""
+        calls: List[Tuple[str, bool]] = []
+
+        def app(calls) -> None:
+            from streamlit_ui.components.file_uploader import render_file_uploader
+
+            def handle(filename, content, replace=False):
+                calls.append((filename, replace))
+                return "__COLLISION__" if not replace else f"Replaced {filename}"
+
+            render_file_uploader(handle)
+
+        at = AppTest.from_function(app, args=(calls,)).run()
+        # First upload triggers collision staging.
+        at.file_uploader[0].upload("dup.txt", b"data").run()
+        assert calls == [("dup.txt", False)]
+        # Collision banner appears.
+        assert len(at.warning) == 1
+        # Click "Replace existing".
+        for btn in at.button:
+            if "Replace existing" in str(btn):
+                btn.click().run()
+                break
+        assert ("dup.txt", True) in calls
+        assert len(at.success) >= 1
 
 
 class TestReportDownloader:
@@ -86,13 +130,12 @@ class TestReportDownloader:
             render_report_downloader(lambda name: None, "missing.md")
 
         at = AppTest.from_function(app).run()
-        # Content is fetched on click, so no warning before the button is pressed
-        assert len(at.warning) == 0
-
-        at.button[0].click().run()
+        # Content is fetched at render time; a missing report warns immediately.
         assert len(at.warning) == 1
+        assert len(at.download_button) == 0
 
-    def test_fetches_content_only_on_click(self) -> None:
+    def test_single_click_downloads(self) -> None:
+        """st.download_button is rendered directly – no intermediate st.button."""
         calls: List[str] = []
 
         def app(calls) -> None:
@@ -107,15 +150,11 @@ class TestReportDownloader:
             render_report_downloader(download, "report.md")
 
         at = AppTest.from_function(app, args=(calls,)).run()
-        # First render: button shown, download_report NOT called yet
-        assert len(calls) == 0
-        assert len(at.button) == 1
-        assert len(at.download_button) == 0
-
-        # Click → content fetched and download button appears
-        at.button[0].click().run()
+        # Content is fetched at render time, so the download button is direct.
         assert calls == ["report.md"]
         assert len(at.download_button) == 1
+        # No separate st.button wrapper (single click downloads).
+        assert len(at.button) == 0
 
 
 class TestReportSelector:

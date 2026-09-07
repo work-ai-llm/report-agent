@@ -101,9 +101,13 @@ streamlit run streamlit_ui/app.py
 
 import os
 import streamlit as st
-from typing import Optional, Callable
+from typing import Optional, Callable, List, Dict, Any
 from streamlit_ui.services.agent_service import PenTestAgentService
-from streamlit_ui.components.chat_display import render_message, render_tool_call
+from streamlit_ui.components.chat_display import (
+    render_chat_history,
+    render_message,
+    render_tool_call,
+)
 from streamlit_ui.components.file_uploader import render_file_uploader
 from streamlit_ui.components.report_downloader import (
     render_report_downloader,
@@ -236,8 +240,7 @@ def render_sidebar(service: PenTestAgentService) -> None:
             selected_session = st.selectbox(
                 label="Select Session",
                 options=existing_sessions,
-                index=len(existing_sessions) - 1,  # Default to latest
-                key="session_selector"
+                key="session_selector",
             )
             
             if selected_session != st.session_state.current_thread_id:
@@ -246,36 +249,56 @@ def render_sidebar(service: PenTestAgentService) -> None:
                 # main() rebinds the service and reloads this thread's history
                 st.session_state._service_thread = None
         
-        if st.button("➕ New Session", use_container_width=True):
+        # Handler for the New Session button. Runs BEFORE the script replays,
+        # so it can safely set the session_selector widget value (the widget
+        # has not been instantiated yet on this run).
+        def _new_session():
             import uuid
             new_thread_id = f"session_{uuid.uuid4().hex[:8]}"
             st.session_state.current_thread_id = new_thread_id
             st.session_state.chat_messages = []
             st.session_state._service_thread = None
-            service = get_or_create_service(new_thread_id)
+            svc = get_or_create_service(new_thread_id)
             # Register the thread so it immediately appears in the session selector
-            service.save_chat_history([])
+            svc.save_chat_history([])
+            # Make the session selector show the new thread on the next run.
+            st.session_state["session_selector"] = new_thread_id
+
+        st.button(
+            "➕ New Session",
+            on_click=_new_session,
+            use_container_width=True,
+        )
         
         st.divider()
         
         # File upload section
-        def handle_upload(filename: str, content: bytes) -> Optional[str]:
-            """Callback for file upload component. Returns status text (or None when already handled).
+        def handle_upload(
+            filename: str, content: bytes, replace: bool = False
+        ) -> Optional[str]:
+            """Callback for file upload component.
 
-            st.file_uploader keeps the file in the widget across reruns, so the
-            callback fires on every interaction. Track processed names and write
-            only once - otherwise the same file would be re-written each rerun.
+            Returns ``"__COLLISION__"`` when the file name already exists and
+            the user has not yet chosen to replace it. On success returns a
+            status message. Returns None when the file has already been
+            processed this session (dedupe).
+
+            Args:
+                filename: Uploaded file name.
+                content: Uploaded file bytes.
+                replace: True when the user chose to overwrite an existing file.
             """
+            if filename in service.list_findings() and not replace:
+                return "__COLLISION__"
+
             if filename in st.session_state.processed_findings:
                 return None
-            if filename in service.list_findings():
-                service.upload_finding(filename, content)
-                st.session_state.processed_findings.add(filename)
-                st.session_state.findings = service.list_findings()
-                return f"`{filename}` already existed - it was replaced."
+
             service.upload_finding(filename, content)
             st.session_state.processed_findings.add(filename)
             st.session_state.findings = service.list_findings()
+            if replace:
+                return f"Replaced `{filename}` with the new upload."
             return f"Uploaded `{filename}` ({len(content)} bytes)."
         
         render_file_uploader(handle_upload)
@@ -301,6 +324,33 @@ def render_sidebar(service: PenTestAgentService) -> None:
             render_report_downloader(service.download_report, selected_report)
 
 
+def _history_from_stored(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert stored history entries into a flat event list.
+
+    The stored history (from checkpointer) may contain plain role/content
+    entries (written before structured events were introduced) or structured
+    events (``{"type": ...}``). This helper normalises the former into the
+    structured form so ``render_chat_history`` can render either.
+
+    Args:
+        messages: Entries as stored in the checkpointer.
+
+    Returns:
+        Normalised flat event list.
+    """
+    normalised: List[Dict[str, Any]] = []
+    for m in messages:
+        if "type" in m:
+            normalised.append(m)
+        elif m.get("role") == "user":
+            normalised.append({"type": "user", "content": m["content"]})
+        elif m.get("role") == "assistant":
+            normalised.append({"type": "assistant", "content": m["content"]})
+        else:
+            normalised.append({"type": "assistant", "content": str(m)})
+    return normalised
+
+
 def render_main_chat(service: PenTestAgentService) -> None:
     """Render main chat area with message history and input.
     
@@ -313,42 +363,43 @@ def render_main_chat(service: PenTestAgentService) -> None:
     """
     st.title("💬 Chat with Pen-Test Agent")
     
-    # Display chat history
-    for message in st.session_state.chat_messages:
-        render_message(message["role"], message["content"])
+    # Display chat history from the structured event list
+    render_chat_history(
+        _history_from_stored(st.session_state.chat_messages)
+    )
     
     # Chat input
     if prompt := st.chat_input("Ask the agent to analyze findings..."):
         # Add user message
-        st.session_state.chat_messages.append({"role": "user", "content": prompt})
+        st.session_state.chat_messages.append({"type": "user", "content": prompt})
         render_message("user", prompt)
         
         # Stream agent response
         with st.chat_message("assistant"):
-            message_placeholder = st.empty()
+            # Render tool-call blocks first, then accumulate the final text
+            # below them so the answer text appears underneath the expanders.
+            tool_events: List[Dict[str, Any]] = []
             full_response = ""
             
             # Process streaming events
             for event in service.send_message(prompt):
                 if event["type"] == "tool_call":
-                    # Render tool call visualization
-                    render_tool_call(
-                        event["data"]["name"],
-                        event["data"]["args"]
-                    )
+                    name = event["data"]["name"]
+                    args = event["data"]["args"]
+                    tool_events.append({"type": "tool_call", "name": name, "args": args})
+                    render_tool_call(name, args)
                 elif event["type"] == "message":
-                    # Accumulate final response
                     full_response = event["data"]
-                    message_placeholder.write(full_response)
+                    st.write(full_response)
             
-            # Add assistant message to history
-            if full_response:
-                st.session_state.chat_messages.append({
-                    "role": "assistant",
-                    "content": full_response
-                })
-                
-                # Persist to database
+            # Persist tool calls + assistant reply as structured entries
+            if tool_events or full_response:
+                st.session_state.chat_messages.extend(tool_events)
+                if full_response:
+                    st.session_state.chat_messages.append({
+                        "type": "assistant",
+                        "content": full_response,
+                    })
                 service.save_chat_history(st.session_state.chat_messages)
 
 
@@ -385,7 +436,18 @@ def main() -> None:
     
     # Get or create service for current thread
     service = get_or_create_service(st.session_state.current_thread_id)
-    
+
+    # Register initial thread so it appears in session selector immediately
+    if st.session_state.current_thread_id not in service.list_threads():
+        service.save_chat_history([])
+
+    # Default the session selector to the latest thread on first load, but keep
+    # any value set by the New Session / switching handlers on later runs.
+    if "session_selector" not in st.session_state:
+        threads = service.list_threads()
+        if threads:
+            st.session_state["session_selector"] = threads[-1]
+
     # Render sidebar (its handlers may change the active thread)
     render_sidebar(service)
     

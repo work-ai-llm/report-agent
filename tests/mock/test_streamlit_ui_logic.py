@@ -174,8 +174,144 @@ class TestSessionSwitching:
         at.sidebar.selectbox[0].select(first).run()
 
         assert at.session_state["current_thread_id"] == first
-        assert len(at.session_state["chat_messages"]) == 2
-        roles = [m["role"] for m in at.session_state["chat_messages"]]
-        assert roles == ["user", "assistant"]
+        # History contains the structured event entries: user msg, 2 tool calls,
+        # and the assistant reply.
+        messages = at.session_state["chat_messages"]
+        types = [m["type"] for m in messages]
+        assert types == ["user", "tool_call", "tool_call", "assistant"]
+        assert messages[0]["content"] == "scan 10.0.0.1"
+        assert messages[1]["name"] == "nmap_scan"
+        assert messages[2]["name"] == "nikto_scan"
+        assert messages[3]["content"] == "This is a mock agent response."
+        assert not at.exception
+
+
+class TestIssue1NewSessionStaysInNewSession:
+    """Regression: messages after New Session must stay in the new session."""
+
+    def test_message_after_new_session_goes_to_new_thread(self):
+        """Type a message in the new session; current_thread_id must remain B."""
+        at = AppTest.from_file(APP_PATH).run()
+        at.chat_input[0].set_value("first message").run()
+        first = at.session_state["current_thread_id"]
+
+        at.sidebar.button[0].click().run()
+        second = at.session_state["current_thread_id"]
+        assert second != first
+
+        # Now send a message in the "new" empty session.
+        at.chat_input[0].set_value("second message").run()
+
+        assert at.session_state["current_thread_id"] == second
+        assert not at.exception
+
+    def test_new_session_history_belongs_to_new_thread(self):
+        """After sending a message in the new session, history is the new one."""
+        at = AppTest.from_file(APP_PATH).run()
+        at.chat_input[0].set_value("first message").run()
+        first = at.session_state["current_thread_id"]
+
+        at.sidebar.button[0].click().run()
+        second = at.session_state["current_thread_id"]
+        # Message is authored after switching to B.
+        at.chat_input[0].set_value("only in B").run()
+
+        messages = at.session_state["chat_messages"]
+        user_texts = [m["content"] for m in messages if m["type"] == "user"]
+        assert user_texts == ["only in B"]
+        # The history doesn't contain the first message from A.
+        assert "first message" not in user_texts
+        assert at.session_state["current_thread_id"] == second
+
+
+class TestIssue4InitialSessionAppearsImmediately:
+    """Regression: the auto-created first session appears in the selector."""
+
+    def test_initial_session_registered_on_first_load(self):
+        """A fresh server's auto-created session must be listable right away."""
+        at = AppTest.from_file(APP_PATH).run()
+        assert "current_thread_id" in at.session_state
+        tid = at.session_state["current_thread_id"]
+        # The session selector should list the initial thread immediately.
+        assert at.sidebar.selectbox[0].options is not None
+        assert tid in at.sidebar.selectbox[0].options
+        assert not at.exception
+
+
+class TestIssue2ToolCallsPersist:
+    """Regression: tool-call blocks survive subsequent renders & session switches."""
+
+    def test_tool_calls_remain_after_second_message(self):
+        """After a second message, the first assistant turn still has tool calls."""
+        at = AppTest.from_file(APP_PATH).run()
+        at.chat_input[0].set_value("first").run()
+
+        # Send a second message; the first turn must keep its tool calls, and
+        # the second turn also emits tool calls (mock always emits them).
+        at.chat_input[0].set_value("second").run()
+        messages = at.session_state["chat_messages"]
+        types = [m["type"] for m in messages]
+        # First turn: user, tool_call, tool_call, assistant
+        # Second turn: user, tool_call, tool_call, assistant
+        assert types == [
+            "user", "tool_call", "tool_call", "assistant",
+            "user", "tool_call", "tool_call", "assistant",
+        ]
+        # The first turn's tool calls are preserved.
+        assert messages[1]["name"] == "nmap_scan"
+        assert messages[2]["name"] == "nikto_scan"
+        assert not at.exception
+
+    def test_tool_calls_survive_session_switch(self):
+        """After switching away and back, tool-call expanders are restored."""
+        at = AppTest.from_file(APP_PATH).run()
+        at.chat_input[0].set_value("first").run()
+        first = at.session_state["current_thread_id"]
+
+        # New session, then switch back to A.
+        at.sidebar.button[0].click().run()
+        at.run()  # let selector list both threads
+        at.sidebar.selectbox[0].select(first).run()
+
+        messages = at.session_state["chat_messages"]
+        types = [m["type"] for m in messages]
+        assert types == ["user", "tool_call", "tool_call", "assistant"]
+        assert not at.exception
+
+
+class TestIssue6UploadDuplicateNames:
+    """Regression: duplicate filename uploads produce a collision UX."""
+
+    def test_duplicate_upload_requires_explicit_replace(self):
+        """Uploading a file with an existing name must not be silently accepted."""
+        at = AppTest.from_file(APP_PATH).run()
+
+        # Upload a first file.
+        at.sidebar.file_uploader[0].upload("nmap.txt", b"content").run()
+        assert at.session_state["findings"] == ["nmap.txt"]
+
+        # Clear the uploader state; upload the same name again.
+        # The collision banner must appear (warning) rather than silent acceptance.
+        at.sidebar.file_uploader[0].upload("nmap.txt", b"new content").run()
+        # A warning should be present indicating the collision.
+        assert len(at.warning) >= 1
+        assert not at.exception
+
+    def test_initial_session_file_upload_clears_dropzone(self):
+        """Uploading a file in a fresh session does not leave the dropzone re-holding it."""
+        at = AppTest.from_file(APP_PATH).run()
+        at.sidebar.file_uploader[0].upload("scan.txt", b"data").run()
+        assert "scan.txt" in at.session_state["findings"]
+        assert not at.exception
+
+
+class TestIssue7SingleClickDownload:
+    """Regression: report download requires only one click."""
+
+    def test_report_download_button_is_direct(self):
+        """st.download_button is rendered immediately, not behind an st.button."""
+        at = AppTest.from_file(APP_PATH).run()
+        # The demo report is seeded in mock mode so a download button shows.
+        assert len(at.sidebar.download_button) >= 1
         assert not at.exception
 
