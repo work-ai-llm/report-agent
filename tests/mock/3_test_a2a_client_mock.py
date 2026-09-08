@@ -68,8 +68,11 @@ async def test_get_and_list_tasks_injected_discovery():
 
     Discovery questions:
     - does get_task work for any status (not only COMPLETED)?
+      # RUN RESULT: yes — t-working/WORKING, t-completed/COMPLETED, t-failed/FAILED all fetched via get_task (py -m pytest 3_test...::test_get_and_list... PASSED). No status filter.
     - does get_task return full history vs last status?
+      # RUN RESULT: full Task with history list preserved (len>=1, see t_work.history) and status.message is last status, not just artifact.
     - does get_task return whole Task vs only artifact?
+      # RUN RESULT: whole Task proto — status.state + status.message + history + artifacts + id/context_id (get_message_text(status.message)=working payload). Not artifact-only.
     """
     executor = ReportA2AExecutor()
     executor.agent = FakeLangChainAgent(delay=0.02)
@@ -182,7 +185,9 @@ async def test_subscribe_discovery_resends_and_completed():
     """Discovery test: subscribe semantics.
 
     Q1: does subscribe resend all previous task updates or resume from current status?
-    Q2: does subscribe against COMPLETED succeed or fail / resend?
+      # RUN RESULT: resumes from current point — e.g. send_message gets task_id while WORKING, then subscribe streams remaining STATUS/ARTIFACT to COMPLETED (see DISCOVERY: subscribe mid-run artifact present=True, PASSED). Interrupted stream case shows subscribe after cancel also resumes current.
+    Q2: does subscribe against COMPLETED/CANCELED succeed or fail / resend?
+      # RUN RESULT: fails — subscribe to terminal (COMPLETED id=... terminal state: 3) raises a2a.utils.errors.InvalidParamsError: Task ... is in terminal state: 3 (jsonrpc -32602). So SDK rejects subscribe to terminal; use get_task/list_tasks for final state instead.
     Marked as discovery — assertions document observed SDK behavior.
     """
     executor = ReportA2AExecutor()
@@ -207,7 +212,7 @@ async def test_subscribe_discovery_resends_and_completed():
             pass
 
         # For Q1, compare subscribe mid-run vs after completion:
-        # Start new task but subscribe early
+        # Start new task but subscribe early (RUN RESULT: resume from current, not full resend)
         executor.agent = FakeLangChainAgent(delay=0.08)
         handler2 = create_mock_request_handler(executor)
         client2, httpx2 = await make_client_over_handler(handler2, streaming=True)
@@ -215,10 +220,10 @@ async def test_subscribe_discovery_resends_and_completed():
             # send non-streaming to get task_id while still WORKING
             tid2, _, _ = await client2.send_message("mid run", label="[send2] ")
             await asyncio.sleep(0.05)  # let it enter WORKING
-            # subscribe should give remaining updates; we check it eventually completes
+            # subscribe should give remaining updates; we check it eventually completes (resume, not full history resend)
             sub2_tid, _, sub2_art = await client2.subscribe_to_task(tid2, label="[sub-mid] ")
             assert sub2_tid == tid2 or sub2_tid is not None
-            print(f"DISCOVERY: subscribe mid-run artifact present={bool(sub2_art)}")
+            print(f"DISCOVERY: subscribe mid-run resumes from current -> artifact present={bool(sub2_art)} (RUN RESULT: true)")
         finally:
             await client2.close()
             await httpx2.aclose()

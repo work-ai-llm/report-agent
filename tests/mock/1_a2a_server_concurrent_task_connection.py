@@ -1,5 +1,38 @@
 # tests/mock/1_a2a_server_concurrent_task_connection.py
-# Refactored to use shared mocks from tests/mock/a2a_mocks.py
+#
+# ============================================================================
+# PURPOSE OF THIS FILE (uses shared mocks from tests/mock/a2a_mocks.py)
+# ============================================================================
+# These tests validate TWO SEPARATE layers of the A2A report server WITHOUT any
+# external services. All real dependencies are swapped for in-memory stand-ins
+# now imported from a2a_mocks.py:
+#
+#   FakeLangChainAgent  → replaces the real LangChain agent (no LLM API calls,
+#                         no token cost). Simulates a full agent run by yielding
+#                         a tool call, a tool result, and a final answer.
+#   MagicMock           → replaces runtime.langfuse (no Langfuse server reachable).
+#                         _process_task() uses langfuse spans as context managers;
+#                         a MagicMock satisfies that protocol with zero setup.
+#   InMemoryTaskStore   → replaces the Postgres-backed task store.
+#
+# The two layers under test:
+#
+#   1. test_sequential_execution_and_state_updates
+#      → CONCURRENCY LOCKING. Proves the global execution lock (in
+#        ReportA2AExecutor) serializes concurrent client requests so exactly one
+#        agent runs at a time, while every request still completes.
+#
+#   2. test_cancellation_via_handler_and_lock_release
+#      → TASK LIFECYCLE. Proves a CancelTaskRequest stops a running task, marks
+#        it TASK_STATE_CANCELED in the store, and frees the execution lock so the
+#        next task runs immediately.
+#
+# NOTE: Layer 1 and layer 2 test DIFFERENT things. The lock does NOT manage the
+# task lifecycle; the task lifecycle is managed by the A2A SDK. They interact:
+# cancelling a running task releases the lock it held, which is why the lifecycle
+# test also asserts the lock is free afterwards.
+# See a2a_mocks.py for shared definitions; this file keeps the original
+# purpose/logic docs and assertions intact, just imports mocks centrally.
 
 import asyncio
 import time
