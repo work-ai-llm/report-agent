@@ -97,12 +97,44 @@ the receiver a user client runs in-process.
 
 Rules that make it readable:
 
-- Open each paragraph with a **topic sentence**; say the idea before the details.
-- Use **backticks** around any identifier (`wait_for_completion`, not bare text).
-- Drop line-number citations from prose; if a location matters, put it in a compact
-  "Key files" bullet list instead.
-- One idea per paragraph; separate lists into bullets so each fact gets breathing room.
-- You do not need to name every method to be accurate — name the ones that matter.
+**Structure (the skeleton):**
+
+1. Every section and paragraph opens with a plain-English **topic sentence** — no
+   identifiers, no `file:line`, no backticks. State the point first, add details after.
+2. **One bullet = one idea.** The idea comes first; the file reference goes at the end
+   in parentheses. Never open a bullet with `client/a2a_client.py:44`.
+3. If a sentence can't be read aloud without pausing at every colon, it's several
+   sentences — **split it**.
+
+**Detail (the symbols):**
+
+4. Use **backticks** around any identifier (`wait_for_completion`, not bare text).
+5. Drop line-number citations and spec version numbers from prose (`:369`, `3.1.1`);
+   they add no reading value. Keep enough reference for the reader to find the file.
+6. **No chained symbol stacks.** Turn
+   `create/send_message(3.1.1)/send_streaming_message(3.1.2)/subscribe/get/list/...`
+   into a normal list, and name the *capability*, not every method.
+7. You do not need to name every method to be accurate — name the ones that matter.
+
+**Bullet discipline (one new rule to cap the list):**
+
+8. Bullets are for **parallel, distinct claims only — max 3-5 per section**. If the
+   same subject owns several bullets, merge them into one paragraph under a single lead
+   bullet. Every list opens with a prose sentence stating the takeaway.
+
+**Mechanism preservation (one new rule to keep the how):**
+
+9. Before cutting a detail, classify it. **Decorative** — versions, line numbers,
+   commit hashes — drops. **Load-bearing** — the transport (`httpx.ASGITransport`),
+   the classes (`ReportA2AExecutor`, `DefaultRequestHandler`), env vars
+   (`POSTGRES_URI`), entry points (`A2AClient.create`) — a developer needs to build or
+   avoid it, so **preserve it, but relocate**: dense identifiers belong in a compact
+   `Wiring / Key references` block at the end. In prose, a mechanism becomes one normal
+   sentence, e.g. "the in-memory run goes over `httpx.ASGITransport`, same pattern as
+   the mock suite."
+
+Rule 8 stops the bullet-wall; rule 9 stops the silent loss of mechanism detail. Both
+fix the two ways a rewrite heals the prose but damages the content.
 
 ## Draft PR docs
 
@@ -116,5 +148,6 @@ into the PR description. See `docs/PR-a2a-client.md` for the pattern.
 - [ ] Title is descriptive, plain language.
 - [ ] Body reflects the idea, current state, and direction (3-paragraph rhythm).
 - [ ] Body is readable prose — topic sentences, backticks on identifiers, no code-splurge.
+- [ ] Bullets capped (3-5/section); mechanisms preserved in a `Wiring / Key references` block.
 - [ ] Draft status + `docs/PR-*.md` used for parked/large work.
 - [ ] No secrets committed; `.env` stays out of the repo.
