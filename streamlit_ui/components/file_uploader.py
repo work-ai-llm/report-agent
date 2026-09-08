@@ -41,7 +41,8 @@ def render_file_uploader(
     # Show a one-shot status message left by the previous run (after rerun).
     if msg := st.session_state.pop("_last_upload_message", None):
         st.success(msg)
-
+    # NOTE, replacement is "as-is", no "number increament" to the end of the file or smth similar,
+    # it's in case i want to upload multiple variants of the same file name
     # --- Pending collision decision banner --------------------------------
     if pending is not None:
         st.warning(
