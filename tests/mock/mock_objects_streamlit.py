@@ -46,6 +46,7 @@ these mocks.
 """
 
 from typing import Optional, List, Dict, Any, Iterator
+import time
 from streamlit_ui.services.interfaces import (
     CheckpointerProtocol,
     FileStoreProtocol,
@@ -215,12 +216,18 @@ class MockAgentRunner:
     ```
     """
     
-    def __init__(self):
-        """Initialize with empty tool call list."""
+    def __init__(self, delay_seconds: float = 0.0):
+        """Initialize with empty tool call list.
+
+        Args:
+            delay_seconds: Optional per-event delay to simulate real LLM
+                streaming latency (used by the demo app, not by tests).
+        """
         self._tool_calls: List[Dict[str, Any]] = []
         self._final_message: str = "This is a mock agent response."
         self.last_message: Optional[str] = None
         self.last_thread_id: Optional[str] = None
+        self._delay_seconds: float = delay_seconds
     
     def set_tool_calls(self, tool_calls: List[Dict[str, Any]]) -> None:
         """Configure which tool calls the mock should emit.
@@ -260,6 +267,8 @@ class MockAgentRunner:
         
         # Yield tool call events
         for tool_call in self._tool_calls:
+            if self._delay_seconds:
+                time.sleep(self._delay_seconds)
             yield {
                 "type": "tool_call",
                 "data": {
@@ -269,6 +278,8 @@ class MockAgentRunner:
             }
         
         # Yield final message
+        if self._delay_seconds:
+            time.sleep(self._delay_seconds)
         yield {
             "type": "message",
             "data": self._final_message

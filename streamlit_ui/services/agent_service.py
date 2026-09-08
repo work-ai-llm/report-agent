@@ -234,6 +234,15 @@ class PenTestAgentService:
         state = {"messages": messages}
         self._checkpointer.put(self._thread_id, state)
     
+    def list_threads(self) -> List[str]:
+        """List all available session/thread IDs.
+
+        Returns:
+            List of thread_id strings for the session selector dropdown.
+            Delegates to the injected checkpointer.
+        """
+        return self._checkpointer.list_threads()
+
     def delete_finding(self, filename: str) -> bool:
         """Delete a findings file from the virtual filesystem.
         
