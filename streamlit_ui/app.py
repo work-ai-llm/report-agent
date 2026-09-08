@@ -93,6 +93,13 @@ The app uses `st.session_state` to maintain UI state across reruns:
 streamlit run streamlit_ui/app.py
 ```
 
+Or via the launcher (prints the runtime status banner - which checkpointer /
+file store / agent are connected - before the server starts):
+
+```bash
+python -m streamlit_ui run streamlit_ui/app.py
+```
+
 ## Environment Variables (Production)
 
 - `DATABASE_URL`: PostgreSQL connection string for session store
