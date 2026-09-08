@@ -68,7 +68,8 @@ CONTEXT_DIR = Path(__file__).parent / "context"
 sys_prompt_path = Path(__file__).parent / "reports.md"
 
 # Local SQLite fallback (single file, two tables inside - same pattern as Postgres)
-LOCAL_DB_PATH = Path(__file__).parent / "agent_session.db"
+# Overridable via REPORT_AGENT_DB_PATH so tests/experiments can use a temp file.
+LOCAL_DB_PATH = Path(os.environ.get("REPORT_AGENT_DB_PATH", str(Path(__file__).parent / "agent_session.db")))
 
 
 # ==========================================
@@ -136,6 +137,7 @@ class AgentRuntime:
         self.agent = None
         self.langfuse = None
         self.langfuse_handler = None
+        self.langfuse_ok = False
         self.system_prompt_text = None
         self.fs_middleware = None
         self.llm = None
@@ -159,29 +161,52 @@ class AgentRuntime:
         await self._init_pool()
         await self._create_agent()
     
+    async def initialize_persistence(self):
+        """
+        Initialize ONLY observability + database persistence (checkpointer + store).
+        
+        Skips the LLM, middleware, and agent creation entirely - so no model API
+        keys are required. Used by the Streamlit UI's partial swap, where the
+        UI wants the real persistence backend (session checkpoints + virtual
+        filesystem) but still runs the mock agent runner.
+        
+        Delegates to the same private methods the full ``initialize()`` uses.
+        """
+        self._init_langfuse()
+        await self._init_pool()
+    
     # ==========================================
     # Private initialization methods
     # ==========================================
     
     def _init_langfuse(self):
-        """Initialize Langfuse observability client (optional, fails gracefully offline)."""
+        """Initialize Langfuse observability client (optional, fails gracefully offline).
+
+        ``self.langfuse_ok`` records whether the client actually authenticated -
+        a disabled client (missing env keys) makes ``auth_check()`` return False
+        instead of raising, which would otherwise look "connected".
+        """
         try:
             self.langfuse = get_client()
             # auth_check does network I/O - guard with try so offline doesn't crash initialize()
             try:
                 if self.langfuse.auth_check():
                     print("Langfuse client is authenticated and ready!")
+                    self.langfuse_ok = True
                 else:
                     print("Authentication failed. Please check your credentials and host.")
+                    self.langfuse_ok = False
             except Exception as e:
                 print(f"Langfuse auth_check failed ({e}), running without observability")
                 self.langfuse_handler = None
+                self.langfuse_ok = False
                 return
             self.langfuse_handler = CallbackHandler()
         except Exception as e:
             print(f"Langfuse init failed ({e}), running without observability")
             self.langfuse = None
             self.langfuse_handler = None
+            self.langfuse_ok = False
     
     def _init_system_prompt(self):
         """Load the system prompt from disk."""
