@@ -93,11 +93,13 @@ The app uses `st.session_state` to maintain UI state across reruns:
 streamlit run streamlit_ui/app.py
 ```
 
-Or via the launcher (prints the runtime status banner - which checkpointer /
-file store / agent are connected - before the server starts):
+Or via the launcher (same command; add `--debug` to print the runtime
+connectivity report - checkpointer / file store / llm api / agent /
+observability and whether each is connected - before the server starts):
 
 ```bash
-python -m streamlit_ui run streamlit_ui/app.py
+python -m streamlit_ui run streamlit_ui/app.py          # normal launch
+python -m streamlit_ui --debug run streamlit_ui/app.py  # prints debug report
 ```
 
 ## Environment Variables (Production)
