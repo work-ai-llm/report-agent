@@ -113,6 +113,9 @@ from streamlit_ui.components.report_downloader import (
     render_report_downloader,
     render_report_selector,
 )
+
+# Sentinel option shown in the session selector when no session is active.
+_NO_SESSION = "(no active session)"
 from tests.mock.mock_objects_streamlit import (
     MockCheckpointer,
     MockFileStore,
@@ -241,35 +244,50 @@ def render_sidebar(service: PenTestAgentService) -> None:
         # Session selection
         st.markdown("### 📋 Sessions")
         existing_sessions = service.list_threads()
+        current = st.session_state.current_thread_id
 
-        selected_session = None
         if existing_sessions:
-            selected_session = st.selectbox(
-                label="Select Session",
-                options=existing_sessions,
+            # The selector lists a "(no active session)" placeholder whenever no
+            # thread is currently active (fresh load or after "New Session").
+            if current in existing_sessions:
+                options = existing_sessions
+                cur_value = current
+            else:
+                options = [_NO_SESSION] + existing_sessions
+                cur_value = _NO_SESSION
+
+            def _select_session():
+                # on_change: bind the active thread to the selection, or clear
+                # it when the placeholder is chosen.
+                val = st.session_state["session_selector"]
+                st.session_state.current_thread_id = (
+                    None if val == _NO_SESSION else val
+                )
+                st.session_state.chat_messages = []
+                st.session_state._service_thread = None
+
+            st.selectbox(
+                "Select Session",
+                options,
+                index=options.index(cur_value),
                 key="session_selector",
+                on_change=_select_session,
             )
 
         def _new_session():
-            import uuid
-            new_thread_id = f"session_{uuid.uuid4().hex[:8]}"
-            st.session_state.current_thread_id = new_thread_id
+            # "New Session" just clears the current chat. A brand-new session
+            # is only created (and persisted) when the first message is sent,
+            # so an empty/interrupted session never shows up in the selector.
+            st.session_state.current_thread_id = None
             st.session_state.chat_messages = []
             st.session_state._service_thread = None
-            svc = get_or_create_service(new_thread_id)
-            svc.save_chat_history([])
-            st.session_state["session_selector"] = new_thread_id
+            st.session_state["session_selector"] = _NO_SESSION
 
         st.button(
             "➕ New Session",
             on_click=_new_session,
             use_container_width=True,
         )
-
-        if selected_session and selected_session != st.session_state.current_thread_id:
-            st.session_state.current_thread_id = selected_session
-            st.session_state.chat_messages = []
-            st.session_state._service_thread = None
         
         st.divider()
         
@@ -372,11 +390,15 @@ def render_main_chat(service: PenTestAgentService) -> None:
     # Chat input
     if prompt := st.chat_input("Ask the agent to analyze findings..."):
         # Create session on first message (not on page load)
+        created_session = False
         if st.session_state.current_thread_id is None:
             import uuid
             st.session_state.current_thread_id = f"session_{uuid.uuid4().hex[:8]}"
             service = get_or_create_service(st.session_state.current_thread_id)
             service.save_chat_history([])
+            # The sidebar selector (driven by current_thread_id) will show the
+            # new session on the rerun below.
+            created_session = True
 
         # Add user message
         st.session_state.chat_messages.append({"type": "user", "content": prompt})
@@ -409,6 +431,12 @@ def render_main_chat(service: PenTestAgentService) -> None:
                         "content": full_response,
                     })
                 service.save_chat_history(st.session_state.chat_messages)
+
+        # If this was the first message of a brand-new session, rerun once so the
+        # sidebar (which renders before the chat input handler runs) picks up the
+        # newly created session immediately, without requiring a browser reload.
+        if created_session:
+            st.rerun()
 
 
 def main() -> None:

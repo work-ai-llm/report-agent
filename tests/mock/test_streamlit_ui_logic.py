@@ -136,12 +136,12 @@ class TestSessionStatePersistence:
         """Verify session ID remains the same after app rerun."""
         at = AppTest.from_file(APP_PATH)
         at.run()
-        
+        at.chat_input[0].set_value("first").run()
         first_session_id = at.session_state.current_thread_id
-        
+
         # Simulate rerun
         at.run()
-        
+
         # Session ID should persist
         assert at.session_state.current_thread_id == first_session_id
 
@@ -149,17 +149,34 @@ class TestSessionStatePersistence:
 class TestSessionSwitching:
     """End-to-end session creation and switching in mock mode."""
 
-    def test_new_session_creates_and_registers_thread(self):
-        """New Session starts a fresh thread id and clears the chat."""
+    def test_new_session_clears_chat_without_creating_thread(self):
+        """New Session clears the chat and drops the active thread, but does
+        NOT create/persist a new session (that only happens on first message)."""
+        at = AppTest.from_file(APP_PATH).run()
+        at.chat_input[0].set_value("scan 10.0.0.1").run()
+        first = at.session_state["current_thread_id"]
+        assert first is not None
+
+        at.sidebar.button[0].click().run()
+
+        assert at.session_state["current_thread_id"] is None
+        assert at.session_state["chat_messages"] == []
+        assert not at.exception
+
+    def test_new_session_then_message_creates_fresh_thread(self):
+        """After New Session, the next message creates a brand-new thread."""
         at = AppTest.from_file(APP_PATH).run()
         at.chat_input[0].set_value("scan 10.0.0.1").run()
         first = at.session_state["current_thread_id"]
 
         at.sidebar.button[0].click().run()
-        second = at.session_state["current_thread_id"]
+        assert at.session_state["current_thread_id"] is None
 
+        # Next message creates a fresh session.
+        at.chat_input[0].set_value("next message").run()
+        second = at.session_state["current_thread_id"]
+        assert second is not None
         assert second != first
-        assert at.session_state["chat_messages"] == []
         assert not at.exception
 
     def test_switching_back_restores_history(self):
@@ -167,11 +184,13 @@ class TestSessionSwitching:
         at = AppTest.from_file(APP_PATH).run()
         at.chat_input[0].set_value("scan 10.0.0.1").run()
         first = at.session_state["current_thread_id"]
-
-        at.sidebar.button[0].click().run()
-        # One more pass so the session selector lists both threads
         at.run()
-        at.sidebar.selectbox[0].select(first).run()
+        # Start a second session and send the second message there.
+        at.sidebar.button[0].click().run()
+        at.chat_input[0].set_value("second session").run()
+        at.run()
+        first_selector_index = [sb.label for sb in at.sidebar.selectbox].index("Select Session")
+        at.sidebar.selectbox[first_selector_index].select(first).run()
 
         assert at.session_state["current_thread_id"] == first
         # History contains the structured event entries: user msg, 2 tool calls,
@@ -187,34 +206,40 @@ class TestSessionSwitching:
 
 
 class TestIssue1NewSessionStaysInNewSession:
-    """Regression: messages after New Session must stay in the new session."""
+    """Regression: if New Session creates no thread until a message, a typed
+    message must stay in the thread that got created for it."""
 
     def test_message_after_new_session_goes_to_new_thread(self):
-        """Type a message in the new session; current_thread_id must remain B."""
+        """New Session then a message creates/th stays in a fresh thread."""
         at = AppTest.from_file(APP_PATH).run()
         at.chat_input[0].set_value("first message").run()
         first = at.session_state["current_thread_id"]
 
         at.sidebar.button[0].click().run()
+        assert at.session_state["current_thread_id"] is None
+
+        # Now send a message; a brand-new session is created on this message.
+        at.chat_input[0].set_value("second message").run()
         second = at.session_state["current_thread_id"]
+        assert second is not None
         assert second != first
 
-        # Now send a message in the "new" empty session.
-        at.chat_input[0].set_value("second message").run()
-
+        # The created thread persists across another run.
+        at.run()
         assert at.session_state["current_thread_id"] == second
         assert not at.exception
 
     def test_new_session_history_belongs_to_new_thread(self):
-        """After sending a message in the new session, history is the new one."""
+        """After a message in the new session, history belongs to the new thread."""
         at = AppTest.from_file(APP_PATH).run()
         at.chat_input[0].set_value("first message").run()
         first = at.session_state["current_thread_id"]
 
         at.sidebar.button[0].click().run()
-        second = at.session_state["current_thread_id"]
-        # Message is authored after switching to B.
+        # Message is authored after New Session cleared the chat.
         at.chat_input[0].set_value("only in B").run()
+        second = at.session_state["current_thread_id"]
+        assert second != first
 
         messages = at.session_state["chat_messages"]
         user_texts = [m["content"] for m in messages if m["type"] == "user"]
