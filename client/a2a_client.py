@@ -185,7 +185,7 @@ class A2AClient:
             chunk_type = "INITIAL_TASK"
             task_dict = chunk_dict['task']
             task_id = task_dict.get('id')       # <--- FIX: Correctly extract nested ID
-            context_id = task_dict.get('contextId')
+            context_id = task_dict.get('context_id') or task_dict.get('contextId')
             status = task_dict.get("status", {}).get("state")
             text_content = f"[TASK STATE]: {status}\nTask Id: {task_id}"
 
@@ -200,8 +200,8 @@ class A2AClient:
             return text_content, task_id, context_id, chunk_type
 
         # 2. Handle Updates (IDs are at the root)
-        task_id = getattr(chunk, 'task_id', None) or chunk_dict.get('task_id')
-        context_id = getattr(chunk, 'context_id', None) or chunk_dict.get('context_id')
+        task_id = getattr(chunk, 'task_id', None) or chunk_dict.get('task_id') or chunk_dict.get('taskId')
+        context_id = getattr(chunk, 'context_id', None) or chunk_dict.get('context_id') or chunk_dict.get('contextId')
 
         if "status_update" in chunk_dict:
             chunk_type = "STATUS"
