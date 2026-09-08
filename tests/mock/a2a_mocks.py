@@ -45,6 +45,26 @@ def patch_runtime_langfuse():
     runtime.langfuse = original
 
 
+@pytest.fixture(autouse=True)
+def isolate_global_lock():
+    """Ensure global_execution_lock not held across tests (fragile if prior test cancelled before finally release)."""
+    from agent.a2a_connector import global_execution_lock
+
+    # start clean
+    if global_execution_lock.locked():
+        try:
+            global_execution_lock.release()
+        except RuntimeError:
+            pass
+    yield
+    # end clean — if test left lock held (exception before finally: release), free it
+    if global_execution_lock.locked():
+        try:
+            global_execution_lock.release()
+        except RuntimeError:
+            pass
+
+
 # --- FakeLangChainAgent (replaces real LLM) ---
 class FakeLangChainAgent:
     """Simulates one full agent run: AIMessage tool_call -> ToolMessage -> final AIMessage.

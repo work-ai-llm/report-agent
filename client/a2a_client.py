@@ -71,6 +71,7 @@ class A2AClient:
         self._httpx_client: Optional[httpx.AsyncClient] = None  # type: ignore[assignment]
         self._owns_httpx = False
         self._server_url: Optional[str] = None
+        self._non_streaming_client = None  # lazy for true 3.1.1
 
     # ------------------------------------------------------------------
     # Factory helpers
@@ -130,6 +131,31 @@ class A2AClient:
         wrapped_client._server_url = server_url  # type: ignore[attr-defined]
         return wrapped_client
 
+    async def _get_non_streaming_client(self):
+        """Lazy non-streaming SDK client for true 3.1.1 (avoids truncated stream).
+
+        Reference: SDK branches on ClientConfig(streaming) in base_client.py:send_message →
+        transport.send_message (message/send single Task) vs send_message_streaming (SSE).
+        High-level: send_message should be single Task, not first-chunk truncated stream that
+        leaves server background consume (default_request_handler.py:449).
+        """
+        if self._non_streaming_client is not None:
+            return self._non_streaming_client
+        try:
+            # reuse same httpx + card as main client
+            agent_card = getattr(self.client, "_card", None) or getattr(self.client, "card", None)
+            httpx_client = getattr(self, "_httpx_client", None)
+            if httpx_client is None:
+                cfg = getattr(self.client, "_config", None)
+                httpx_client = getattr(cfg, "httpx_client", None) if cfg else None
+            if agent_card is None or httpx_client is None:
+                return self.client  # fallback to truncated path if can't build
+            non_cfg = ClientConfig(streaming=False, httpx_client=httpx_client)
+            self._non_streaming_client = await create_client(agent_card, client_config=non_cfg)
+            return self._non_streaming_client
+        except Exception:
+            return self.client
+
     async def close(self):
         """Close underlying SDK client + owned httpx."""
         # Reference: SDK Client.close() + httpx.AsyncClient.aclose()
@@ -138,6 +164,11 @@ class A2AClient:
             if hasattr(self.client, "close"):
                 await self.client.close()
         finally:
+            if self._non_streaming_client is not None:
+                try:
+                    await self._non_streaming_client.close()
+                except Exception:
+                    pass
             if getattr(self, "_httpx_client", None) is not None and getattr(self, "_owns_httpx", False):
                 try:
                     await self._httpx_client.aclose()  # type: ignore[attr-defined]
@@ -256,15 +287,28 @@ class A2AClient:
     async def send_message(self, text, context_id=None, label=""):
         """3.1.1 SendMessage — send-and-forget (non-streaming).
 
-        Reference: SDK transport `message/send` via `client.send_message` when streaming False (a2a/client/base_client.py:send_message)
-        High-level: fire the prompt and get back the first task immediately (task_id needed for resubscribe/poll); not the full streamed report
+        Reference: SDK transport `message/send` via `client.send_message` when streaming False (a2a/client/base_client.py:send_message
+        → transport.send_message single Task, vs streaming path _send_stream_request SSE). Also respects
+        SendMessageConfiguration(return_immediately) / ClientConfig(polling).
+        High-level: fire prompt and get back single Task (task_id for resubscribe/poll), not truncated stream.
+        Previous impl truncated streaming stream (GeneratorExit → background consume default_request_handler.py:449);
+        now uses dedicated non-streaming SDK client to avoid that race (COMPLETED before subscribe).
         """
         request, generated_context_id = self._create_send_request(text, context_id)
-        mode_label = "STREAMING" if self._is_streaming() else "NON-STREAMING"
+        # True non-streaming: ensure return_immediately so handler returns SUBMITTED/WORKING immediately for subscribe (not blocking to COMPLETED)
+        # SDK _apply_client_config does `return_immediately |= polling`, so we set it directly
+        try:
+            request.configuration.return_immediately = True
+        except Exception:
+            pass
+        # Use dedicated non-streaming SDK client (streaming=False) to hit message/send single Task path, not truncated stream
+        non_stream_client = await self._get_non_streaming_client()
+        target_client = non_stream_client if non_stream_client is not self.client else self.client
+        mode_label = "NON-STREAMING"
+        if target_client is self.client and self._is_streaming():
+            mode_label = "NON-STREAMING (truncated-stream fallback)"
         print(f"\n{label}[CLIENT SENDING - {mode_label}]: {text}")
-        # Reference: SDK still yields StreamResponse even for non-streaming (one item); we take only first
-        # High-level: single response is enough to learn task_id/context_id for later get/subscribe
-        async for chunk in self.client.send_message(request):
+        async for chunk in target_client.send_message(request):
             extracted_text, extracted_task_id, extracted_context_id, chunk_kind = self._extract_chunk_info(chunk)
             if extracted_text:
                 print(f"{label}{extracted_text}")

@@ -25,18 +25,19 @@ from tests.mock.a2a_mocks import (
 )
 
 # helper to create A2AClient over in-memory ASGI app (no network)
-async def make_client_over_handler(handler, streaming: bool = True) -> tuple[A2AClient, httpx.AsyncClient]:
+async def make_client_over_handler(handler, streaming: bool = True, polling: bool = False) -> tuple[A2AClient, httpx.AsyncClient]:
     """Starlette app from handler -> httpx ASGI transport -> A2AClient.create.
 
     Returns (A2AClient, httpx_client) — caller must await client.close() and httpx_client.aclose().
     Tests mock HTTP responses via ASGI, not real network.
+    polling=True -> SendMessageConfiguration(return_immediately=True) for early Task SUBMITTED (needed for subscribe while WORKING).
     """
     app = create_mock_starlette_app(handler)
     # ASGI transport lets A2ACardResolver GET /.well-known/agent-card.json via httpx without network
     transport = httpx.ASGITransport(app=app)  # type: ignore[attr-defined]
     httpx_client = httpx.AsyncClient(transport=transport, base_url="http://testserver")
     # A2AClient.create will use this httpx_client to resolve card and create SDK client
-    client = await A2AClient.create(server_url="http://testserver", streaming=streaming, httpx_client=httpx_client)
+    client = await A2AClient.create(server_url="http://testserver", streaming=streaming, polling=polling, httpx_client=httpx_client)
     return client, httpx_client
 
 
@@ -156,25 +157,33 @@ async def test_send_and_subscribe_combined():
     """send_message (first chunk) gives task_id, then subscribe_to_task streams remaining.
 
     Confirms both work end-to-end over ASGI without push.
+    Fix: use polling=True so send_message returns SUBMITTED/WORKING immediately (return_immediately), not blocking to COMPLETED; plus sync on WORKING.
     """
     executor = ReportA2AExecutor()
-    executor.agent = FakeLangChainAgent(delay=0.05)
+    executor.agent = FakeLangChainAgent(delay=2.0)
     handler = create_mock_request_handler(executor)
-    client, httpx_client = await make_client_over_handler(handler, streaming=True)
+    # send needs early Task (polling) so subscribe can attach while WORKING
+    client_send, httpx_send = await make_client_over_handler(handler, streaming=False, polling=True)
+    client_sub, httpx_sub = await make_client_over_handler(handler, streaming=True, polling=False)
     try:
-        # non-streaming send to get task_id quickly
-        task_id, context_id, first_text = await client.send_message("start task", label="[send] ")
+        task_id, context_id, first_text = await client_send.send_message("start task", label="[send] ")
         assert task_id is not None
-        # small delay mimics real gap before resubscribe
-        await asyncio.sleep(0.1)
-        # subscribe should stream to COMPLETED and yield artifact
-        sub_tid, sub_cid, sub_art = await client.subscribe_to_task(task_id, label="[sub] ")
-        # sub should return same task_id
+        # sync on WORKING — wait for server to enter WORKING before subscribe (avoid terminal race)
+        for _ in range(30):
+            t = await client_send.get_task(task_id)
+            if t.status.state == TaskState.TASK_STATE_WORKING:
+                break
+            await asyncio.sleep(0.05)
+        assert t.status.state == TaskState.TASK_STATE_WORKING, f"task not WORKING before subscribe, was {t.status.state}"
+        # subscribe via streaming client while still WORKING (total run 6s, window ~5s)
+        sub_tid, sub_cid, sub_art = await client_sub.subscribe_to_task(task_id, label="[sub] ")
         assert sub_tid == task_id or sub_tid is not None
-        assert sub_art is not None  # artifact from report
+        assert sub_art is not None
     finally:
-        await client.close()
-        await httpx_client.aclose()
+        await client_send.close()
+        await httpx_send.aclose()
+        await client_sub.close()
+        await httpx_sub.aclose()
 
 
 # ------------------------------------------------------------------
@@ -213,20 +222,26 @@ async def test_subscribe_discovery_resends_and_completed():
 
         # For Q1, compare subscribe mid-run vs after completion:
         # Start new task but subscribe early (RUN RESULT: resume from current, not full resend)
-        executor.agent = FakeLangChainAgent(delay=0.08)
+        executor.agent = FakeLangChainAgent(delay=2.0)
         handler2 = create_mock_request_handler(executor)
-        client2, httpx2 = await make_client_over_handler(handler2, streaming=True)
+        client2_send, httpx2_send = await make_client_over_handler(handler2, streaming=False, polling=True)
+        client2_sub, httpx2_sub = await make_client_over_handler(handler2, streaming=True)
         try:
-            # send non-streaming to get task_id while still WORKING
-            tid2, _, _ = await client2.send_message("mid run", label="[send2] ")
-            await asyncio.sleep(0.05)  # let it enter WORKING
-            # subscribe should give remaining updates; we check it eventually completes (resume, not full history resend)
-            sub2_tid, _, sub2_art = await client2.subscribe_to_task(tid2, label="[sub-mid] ")
+            tid2, _, _ = await client2_send.send_message("mid run", label="[send2] ")
+            for _ in range(30):
+                t = await client2_send.get_task(tid2)
+                if t.status.state == TaskState.TASK_STATE_WORKING:
+                    break
+                await asyncio.sleep(0.05)
+            assert t.status.state == TaskState.TASK_STATE_WORKING
+            sub2_tid, _, sub2_art = await client2_sub.subscribe_to_task(tid2, label="[sub-mid] ")
             assert sub2_tid == tid2 or sub2_tid is not None
             print(f"DISCOVERY: subscribe mid-run resumes from current -> artifact present={bool(sub2_art)} (RUN RESULT: true)")
         finally:
-            await client2.close()
-            await httpx2.aclose()
+            await client2_send.close()
+            await httpx2_send.aclose()
+            await client2_sub.close()
+            await httpx2_sub.aclose()
     finally:
         await client.close()
         await httpx_client.aclose()
@@ -299,12 +314,15 @@ async def test_streaming_interruption_and_resubscribe():
                 print("DISCOVERY: streaming interrupted via cancel")
 
             # Try to reconnect via streaming again (same task) — SDK may not allow re-streaming via send
-            # Instead try subscribe — should succeed and give all updates
-            # Need task_id from the interrupted task; since we cancelled the wrapper, we don't have it.
-            # So inject a fresh task that is WORKING and then subscribe
-            # Simpler: start new task via send_message, then subscribe
+            # Instead try subscribe — should succeed and give remaining
+            # Need task_id from the interrupted task; since we cancelled wrapper, we don't have it.
+            # So start new task that is WORKING and then subscribe (with WORKING sync)
             tid3, _, _ = await client2.send_message("new for subscribe", label="[send3] ")
-            await asyncio.sleep(0.05)
+            for _ in range(10):
+                t = await client2.get_task(tid3)
+                if t.status.state == TaskState.TASK_STATE_WORKING:
+                    break
+                await asyncio.sleep(0.05)
             sub_tid, _, sub_art = await client2.subscribe_to_task(tid3, label="[sub-after-int] ")
             assert sub_tid == tid3 or sub_tid is not None
             # sub should eventually get final artifact despite earlier interruption
@@ -320,36 +338,61 @@ async def test_streaming_interruption_and_resubscribe():
 
 # ------------------------------------------------------------------
 # 7. cancel (mock) — delays + get_task (simple, complex flow deferred to acceptance 6)
+#    Fix: start via handler.on_message_send_stream (keeps ActiveTask producer alive for cancel) + client cancel/get
 # ------------------------------------------------------------------
 @pytest.mark.asyncio
 async def test_cancel_with_get_mock():
-    """Simple cancel via A2AClient: start slow task, cancel, verify CANCELED via get.
+    """Simple cancel via A2AClient: start slow task via handler stream, cancel via client, verify CANCELED.
 
     Complex 2-task user flow with queue+subscribe deferred to acceptance test 6 per request.
     """
+    from a2a.server.context import ServerCallContext
+
     executor = ReportA2AExecutor()
-    executor.agent = FakeLangChainAgent(delay=0.5)
+    executor.agent = FakeLangChainAgent(delay=5.0)
     handler = create_mock_request_handler(executor)
+    # client shares same handler (same TaskStore/lock) via ASGI
     client, httpx_client = await make_client_over_handler(handler, streaming=True)
     try:
-        # start task
-        task_id, _, _ = await client.send_message("to cancel", label="[send-cancel] ")
-        assert task_id is not None
-        await asyncio.sleep(0.1)  # let it acquire lock
-        # cancel via client
+        # start task directly via handler stream (ensures ActiveTask producer exists for cancel)
+        req = create_mock_send_request("ctx-cancel")
+        mock_context = ServerCallContext()
+        events = []
+        first = asyncio.Event()
+
+        async def track():
+            async for item in handler.on_message_send_stream(req, mock_context):
+                events.append(item)
+                if not first.is_set():
+                    first.set()
+                # keep consuming until cancel
+            return events
+
+        stream_task = asyncio.create_task(track())
+        await first.wait()
+        task_id = events[0].id
+        # ensure WORKING
+        for _ in range(20):
+            t = await client.get_task(task_id)
+            if t.status.state == TaskState.TASK_STATE_WORKING:
+                break
+            await asyncio.sleep(0.05)
+        # cancel via A2AClient (true client path)
         canceled = await client.cancel_task(task_id, label="[cancel] ")
         assert canceled.status.state == TaskState.TASK_STATE_CANCELED
-
-        # get should show canceled
         fetched = await client.get_task(task_id)
         assert fetched.status.state == TaskState.TASK_STATE_CANCELED
-
-        # next task should run immediately (lock freed)
+        # next task via client should run immediately (lock freed)
         executor.agent = FakeLangChainAgent(delay=0.05)
-        # Need new handler? Reuse same handler's lock is global; but after cancel lock released, new task via same client should succeed
         task_id2, _, art2 = await client.send_streaming_message("after cancel", label="[after] ")
         assert task_id2 is not None
         assert art2 is not None
+        # cleanup background stream
+        stream_task.cancel()
+        try:
+            await stream_task
+        except asyncio.CancelledError:
+            pass
     finally:
         await client.close()
         await httpx_client.aclose()
