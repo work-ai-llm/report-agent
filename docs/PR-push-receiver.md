@@ -4,6 +4,9 @@ Status: **DRAFT / isolated — cherry-picked from `pr-a2a-client` (`b658669` + `
 
 > This branch isolates the push-receiver piece that previously lived inside `pr-a2a-client`. It contains only `client/push_receiver.py`, `tests/client_push.py` (reference), `tests/mock/2_test_push_reciver_server.py` and `docs/push_receiver.md`. No `A2AClient` lifecycle changes. Draft so it can be reviewed/merged independently of `pr-a2a-client`.
 
+Main goal of this pr, is to separate the process of a2a client connection with push reciver, to form a complete a2a client/server lifecycle with client having push reciver server endpoint, which it can provide during task sendings.
+and a2a server push notification sender would be able to send either terminal state task reaching notifications or critical task status updates, which would require client clarifications or additional information for task execution to continue.
+
 ---
 
 ## What this PR represents
