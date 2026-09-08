@@ -101,6 +101,20 @@ class MockCheckpointer:
         """
         return list(self._storage.keys())
     
+    def delete(self, thread_id: str) -> bool:
+        """Delete a thread and its stored conversation state.
+        
+        Args:
+            thread_id: Unique identifier for the session/thread to delete
+            
+        Returns:
+            True if the thread existed and was deleted, False otherwise
+        """
+        if thread_id in self._storage:
+            del self._storage[thread_id]
+            return True
+        return False
+    
     def clear(self) -> None:
         """Clear all stored threads (useful for test cleanup)."""
         self._storage.clear()

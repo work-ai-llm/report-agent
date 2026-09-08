@@ -357,3 +357,63 @@ class TestIssue7SingleClickDownload:
         assert len(at.sidebar.download_button) >= 1
         assert not at.exception
 
+
+class TestDeleteSession:
+    """Session deletion workflow in mock mode."""
+
+    def _active_sessions(self, at) -> set:
+        return set(at.session_state["service"].list_threads())
+
+    def test_deleting_current_session_removes_it(self):
+        """Deleting the selected session removes it and resets the chat."""
+        at = AppTest.from_file(APP_PATH).run()
+        at.chat_input[0].set_value("first message").run()
+        first = at.session_state["current_thread_id"]
+
+        # Second session becomes the active one.
+        at.sidebar.button[0].click().run()          # New Session
+        at.chat_input[0].set_value("second message").run()
+        second = at.session_state["current_thread_id"]
+        assert second != first
+        assert self._active_sessions(at) == {first, second}
+
+        # Confirm + delete the active (second) session.
+        at.sidebar.checkbox[0].check().run()
+        at.sidebar.button[1].click().run()
+
+        assert at.session_state["current_thread_id"] is None
+        assert not self._active_sessions(at) & {second}
+        assert first in self._active_sessions(at)
+        assert at.session_state["chat_messages"] == []
+        assert not at.exception
+
+    def test_delete_requires_confirmation(self):
+        """Without confirming, no Delete Session button is shown and nothing dies."""
+        at = AppTest.from_file(APP_PATH).run()
+        at.chat_input[0].set_value("first message").run()
+        tid = at.session_state["current_thread_id"]
+
+        # Not confirmed -> no delete button rendered.
+        assert not any("Delete Session" in str(b) for b in at.sidebar.button)
+
+        # Confirming alone must not delete.
+        at.sidebar.checkbox[0].check().run()
+        buttons = [str(b) for b in at.sidebar.button]
+        assert any("Delete Session" in b for b in buttons)
+        assert tid in self._active_sessions(at)
+        assert at.session_state["current_thread_id"] == tid
+        assert not at.exception
+
+    def test_delete_last_session_leaves_no_sessions(self):
+        """Deleting the only existing session empties the session list."""
+        at = AppTest.from_file(APP_PATH).run()
+        at.chat_input[0].set_value("only message").run()
+        tid = at.session_state["current_thread_id"]
+
+        at.sidebar.checkbox[0].check().run()
+        at.sidebar.button[1].click().run()
+
+        assert at.session_state["current_thread_id"] is None
+        assert self._active_sessions(at) == set()
+        assert not at.exception
+

@@ -243,6 +243,17 @@ class PenTestAgentService:
         """
         return self._checkpointer.list_threads()
 
+    def delete_thread(self, thread_id: str) -> bool:
+        """Delete a session/thread and its persisted conversation state.
+
+        Args:
+            thread_id: Unique identifier for the session/thread to delete
+
+        Returns:
+            True if the thread existed and was deleted, False otherwise
+        """
+        return self._checkpointer.delete(thread_id)
+
     def delete_finding(self, filename: str) -> bool:
         """Delete a findings file from the virtual filesystem.
         

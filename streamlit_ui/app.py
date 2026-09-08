@@ -282,12 +282,56 @@ def render_sidebar(service: PenTestAgentService) -> None:
             st.session_state.chat_messages = []
             st.session_state._service_thread = None
             st.session_state["session_selector"] = _NO_SESSION
+            st.session_state["confirm_delete_session"] = False
 
         st.button(
             "➕ New Session",
             on_click=_new_session,
             use_container_width=True,
         )
+
+        # Delete the currently selected session (two-step: confirm checkbox).
+        current_tid = st.session_state.current_thread_id
+        if current_tid and current_tid in existing_sessions:
+            st.caption("Deletes the session selected above.")
+            if st.checkbox(
+                "⚠️ I understand - this permanently deletes the selected session",
+                key="confirm_delete_session",
+            ):
+                def _delete_session():
+                    # on_click: runs before the session widgets are instantiated,
+                    # so widget keys can be reset safely (same as New Session).
+                    tid = st.session_state.current_thread_id
+                    if service.delete_thread(tid):
+                        st.session_state.current_thread_id = None
+                        st.session_state.chat_messages = []
+                        st.session_state._service_thread = None
+                        st.session_state["session_selector"] = _NO_SESSION
+                        st.session_state["confirm_delete_session"] = False
+                        st.session_state["_delete_notice"] = (
+                            "success",
+                            f"Deleted session `{tid}`.",
+                        )
+                        st.rerun()
+                    else:
+                        st.session_state["_delete_notice"] = (
+                            "error",
+                            f"Session `{tid}` could not be found.",
+                        )
+
+                st.button(
+                    "🗑 Delete Session",
+                    on_click=_delete_session,
+                    use_container_width=True,
+                )
+
+        notice = st.session_state.pop("_delete_notice", None)
+        if notice:
+            kind, text = notice
+            if kind == "success":
+                st.success(text)
+            else:
+                st.error(text)
         
         st.divider()
         
@@ -468,6 +512,9 @@ def main() -> None:
 
     if "_service_thread" not in st.session_state:
         st.session_state._service_thread = None
+
+    if "confirm_delete_session" not in st.session_state:
+        st.session_state.confirm_delete_session = False
 
     # Sidebar needs a service to list existing sessions even before a thread
     # is active.  Use the latest existing thread or a placeholder.

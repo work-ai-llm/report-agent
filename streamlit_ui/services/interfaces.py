@@ -62,6 +62,17 @@ class CheckpointerProtocol(Protocol):
             List of thread_id strings for session selector dropdown
         """
         ...
+    
+    def delete(self, thread_id: str) -> bool:
+        """Delete a thread and its persisted conversation state.
+        
+        Args:
+            thread_id: Unique identifier for the session/thread to delete
+            
+        Returns:
+            True if the thread existed and was deleted, False otherwise
+        """
+        ...
 
 
 class FileStoreProtocol(Protocol):

@@ -243,6 +243,44 @@ class TestReportDownload:
         assert "reports/report1.md" not in reports
 
 
+class TestSessionDeletion:
+    """Test session/thread deletion through the service layer."""
+
+    def test_delete_thread_removes_from_checkpointer(self):
+        """Verify delete_thread removes the thread and its history."""
+        mock_checkpointer = MockCheckpointer()
+        mock_checkpointer.put("session_1", {"messages": [{"role": "user", "content": "hi"}]})
+        mock_checkpointer.put("session_2", {"messages": [{"role": "user", "content": "bye"}]})
+
+        service = PenTestAgentService(
+            thread_id="session_1",
+            checkpointer=mock_checkpointer,
+            file_store=MockFileStore(),
+            agent_runner=MockAgentRunner(),
+        )
+
+        result = service.delete_thread("session_1")
+
+        assert result is True
+        assert "session_1" not in mock_checkpointer.list_threads()
+        assert service.get_chat_history() == []
+        # Unrelated threads are untouched.
+        assert "session_2" in mock_checkpointer.list_threads()
+
+    def test_delete_nonexistent_thread_returns_false(self):
+        """Verify deleting a thread that does not exist returns False."""
+        service = PenTestAgentService(
+            thread_id="session_1",
+            checkpointer=MockCheckpointer(),
+            file_store=MockFileStore(),
+            agent_runner=MockAgentRunner(),
+        )
+
+        result = service.delete_thread("does_not_exist")
+
+        assert result is False
+
+
 class TestChatHistoryPersistence:
     """Test chat history save and retrieve operations."""
 
