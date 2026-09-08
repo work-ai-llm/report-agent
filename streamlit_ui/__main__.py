@@ -5,13 +5,16 @@ delegates to Streamlit's own CLI. This is the drop-in replacement for::
 
     python -m streamlit run streamlit_ui/app.py
 
-Example::
+Examples::
 
-    python -m streamlit_ui run streamlit_ui/app.py
+    python -m streamlit_ui run streamlit_ui/app.py   # explicit (same as streamlit run)
+    python -m streamlit_ui                            # defaults to run streamlit_ui/app.py
 
 The banner ("mock checkpointer is connected", ...) is visible in the terminal
 right above Streamlit's "Uvicorn server started" line - see
-``streamlit_ui/runtime_status.py``.
+``streamlit_ui/runtime_status.py``. Note that plain ``python -m streamlit run
+app.py`` cannot print anything before the server starts (the app script only
+executes on first page load) - use this launcher.
 """
 
 import sys
@@ -20,6 +23,8 @@ from streamlit.web import cli as stcli
 
 from streamlit_ui.runtime_status import print_status_banner
 
+_DEFAULT_ARGS = ["run", "streamlit_ui/app.py"]
+
 
 def main(argv=None) -> None:
     """Print the status banner, then run the normal Streamlit CLI.
@@ -27,10 +32,13 @@ def main(argv=None) -> None:
     Args:
         argv: Optional argument list (defaults to ``sys.argv[1:]``). Arrowed
               through unchanged, so ``python -m streamlit_ui run app.py`` works
-              exactly like ``python -m streamlit run app.py``.
+              exactly like ``python -m streamlit run app.py``. With no
+              arguments it defaults to ``run streamlit_ui/app.py``.
     """
     print_status_banner()
     args = list(argv) if argv is not None else sys.argv[1:]
+    if not args:
+        args = _DEFAULT_ARGS
     # streamlit reads sys.argv[0] only to decide its program name.
     sys.argv = ["streamlit", *args]
     stcli.main()

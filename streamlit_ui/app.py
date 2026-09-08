@@ -315,11 +315,12 @@ def render_sidebar(service: PenTestAgentService) -> None:
                         st.session_state._service_thread = None
                         st.session_state["session_selector"] = _NO_SESSION
                         st.session_state["confirm_delete_session"] = False
+                        # No st.rerun() here: it is a no-op inside a callback.
+                        # The sidebar refresh happens on the next interaction.
                         st.session_state["_delete_notice"] = (
                             "success",
                             f"Deleted session `{tid}`.",
                         )
-                        st.rerun()
                     else:
                         st.session_state["_delete_notice"] = (
                             "error",
