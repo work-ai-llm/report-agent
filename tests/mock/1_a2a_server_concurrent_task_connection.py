@@ -48,7 +48,6 @@ from tests.mock.a2a_mocks import (
     create_mock_request_handler,
     create_mock_send_request,
     consume_stream,
-    patch_runtime_langfuse,  # noqa: F401 - autouse fixture
 )
 
 

@@ -32,37 +32,11 @@ from starlette.applications import Starlette
 from a2a.server.routes import create_agent_card_routes, create_jsonrpc_routes
 
 
-# --- mock langfuse (no real server) ---
+# --- mock langfuse (also in conftest autouse) ---
 mock_langfuse = MagicMock()
 
-
-@pytest.fixture(autouse=True)
-def patch_runtime_langfuse():
-    """Replace runtime.langfuse with no-op mock for every test (covers _process_task spans)."""
-    original = runtime.langfuse
-    runtime.langfuse = mock_langfuse
-    yield
-    runtime.langfuse = original
-
-
-@pytest.fixture(autouse=True)
-def isolate_global_lock():
-    """Ensure global_execution_lock not held across tests (fragile if prior test cancelled before finally release)."""
-    from agent.a2a_connector import global_execution_lock
-
-    # start clean
-    if global_execution_lock.locked():
-        try:
-            global_execution_lock.release()
-        except RuntimeError:
-            pass
-    yield
-    # end clean — if test left lock held (exception before finally: release), free it
-    if global_execution_lock.locked():
-        try:
-            global_execution_lock.release()
-        except RuntimeError:
-            pass
+def patch_runtime_langfuse():  # keep importable for legacy `from a2a_mocks import patch_runtime_langfuse`
+    pass
 
 
 # --- FakeLangChainAgent (replaces real LLM) ---

@@ -21,7 +21,6 @@ from tests.mock.a2a_mocks import (
     create_mock_send_request,
     create_mock_starlette_app,
     inject_task,
-    patch_runtime_langfuse,  # noqa: F401
 )
 
 # helper to create A2AClient over in-memory ASGI app (no network)
