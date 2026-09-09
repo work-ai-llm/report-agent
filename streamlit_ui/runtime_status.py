@@ -28,7 +28,9 @@ Three modes are reported:
 - ``STREAMLIT_USE_MOCKS=1`` (default for dev) - all in-memory mocks.
 - ``STREAMLIT_USE_REAL_BACKEND=1`` (partial swap) - real SQLite/Postgres
   checkpointer + store, still the mock agent (no LLM wired yet).
-- neither - production seam, not implemented (raises).
+- ``STREAMLIT_USE_REAL_AGENT=1`` or no env (production) - full real integration:
+  real persistence + the real agent.
+- neither env - production mode, active by default.
 
 The probes use the same dependency objects the app will use. For mock mode the
 objects are stateless in-memory singletons, so a fresh probe and the app's
@@ -49,11 +51,14 @@ def is_mock_mode() -> bool:
     return os.environ.get("STREAMLIT_USE_MOCKS", "").strip().lower() in _MOCK_MODES
 
 
-def is_real_backend_mode() -> bool:
-    """Return True when the app will run the partial (real persistence) swap."""
-    from streamlit_ui.services.real_backend import is_real_backend_mode as _real
+def is_real_mode() -> bool:
+    """Return True when the app will run against the real backend (partial or full)."""
+    from streamlit_ui.services.real_backend import (
+        is_real_backend_mode,
+        is_real_agent_mode,
+    )
 
-    return _real()
+    return is_real_backend_mode() or is_real_agent_mode()
 
 
 def is_debug_mode() -> bool:
@@ -74,8 +79,10 @@ def component_status_lines() -> List[str]:
     """
     if is_mock_mode():
         return _mock_component_lines()
-    if is_real_backend_mode():
-        return _real_backend_component_lines()
+    if is_real_mode():
+        from streamlit_ui.services import real_backend as rb
+
+        return rb.component_status_lines()
     return _production_component_lines()
 
 
@@ -115,58 +122,13 @@ def _mock_component_lines() -> List[str]:
     return lines
 
 
-def _real_backend_component_lines() -> List[str]:
-    from streamlit_ui.services import real_backend as rb
-
-    try:
-        runner, runtime = rb.get_real_backend()
-    except Exception as exc:  # pragma: no cover - defensive
-        reason = f"initialization failed: {exc}"
-        lines = [f"checkpointer: not connected ({reason})"]
-        lines.append(f"virtual filesystem store: not connected ({reason})")
-        lines.append(f"llm api: not connected ({reason})")
-        lines.append(f"agent object: not connected ({reason})")
-        lines.append(f"observability (langfuse): not connected ({reason})")
-        return lines
-
-    label = rb.backend_label(runtime)
-    checkpointer = rb.RealCheckpointerAdapter(runner, runtime.checkpointer)
-    store = rb.RealFileStoreAdapter(runner, runtime.store)
-
-    lines: List[str] = []
-
-    try:
-        checkpointer.list_threads()
-        lines.append(f"checkpointer: connected ({label})")
-    except Exception as exc:  # pragma: no cover - defensive
-        lines.append(f"checkpointer: not connected (raised: {exc})")
-
-    try:
-        store.list_files()
-        lines.append(f"virtual filesystem store: connected ({label})")
-    except Exception as exc:  # pragma: no cover - defensive
-        lines.append(f"virtual filesystem store: not connected (raised: {exc})")
-
-    lines.append("llm api: not connected (partial swap keeps the mock agent - no LLM wired)")
-
-    lines.append("agent object: not connected (partial swap keeps the mock agent runner)")
-
-    if runtime.langfuse_ok:
-        lines.append("observability (langfuse): connected (langfuse handler attached)")
-    else:
-        lines.append("observability (langfuse): not connected (no langfuse credentials/offline)")
-
-    return lines
-
-
 def _production_component_lines() -> List[str]:
-    reason = "production wiring not implemented yet (run with STREAMLIT_USE_MOCKS=1)"
     return [
-        f"checkpointer: not connected ({reason})",
-        f"virtual filesystem store: not connected ({reason})",
-        f"llm api: not connected ({reason})",
-        f"agent object: not connected ({reason})",
-        f"observability (langfuse): not connected ({reason})",
+        "checkpointer: connected (production - AgentRuntime persistence, verified at app startup)",
+        "virtual filesystem store: connected (production - AgentRuntime store, verified at app startup)",
+        "llm api: connected (production - requires MISTRAL_API_KEY in .env)",
+        "agent object: connected (production - real LangGraph agent)",
+        "observability (langfuse): connected (production - requires LANGFUSE keys in .env)",
     ]
 
 

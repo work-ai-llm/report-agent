@@ -104,13 +104,18 @@ python -m streamlit_ui --debug run streamlit_ui/app.py  # prints debug report
 
 ## Runtime Modes (environment variables)
 
-- Default (no env): production seam - not wired yet, raises NotImplementedError.
+- Default (no env): **production** - full real integration (persistence + real
+  agent). Requires model keys in `.env` (e.g. `MISTRAL_API_KEY`).
 - `STREAMLIT_USE_MOCKS=1`: full in-memory mock suite (checkpointer, file store,
   agent runner). No DB, no API keys. State is lost on restart.
 - `STREAMLIT_USE_REAL_BACKEND=1`: partial swap - real checkpointer + virtual
   filesystem (SQLite by default, Postgres when `POSTGRES_URI` is reachable),
-  still the mock agent. State survives server restarts. Persistence DB is
-  `agent/agent_session.db` (override with `REPORT_AGENT_DB_PATH`).
+  still the mock agent. State survives server restarts.
+- `STREAMLIT_USE_REAL_AGENT=1`: full swap - real persistence + the real agent
+  (streams tool calls + replies; prints LLM output to the terminal when
+  `STREAMLIT_AGENT_PRINT=1`).
+- Persistence DB is `agent/agent_session.db` (override with
+  `REPORT_AGENT_DB_PATH`, or set `POSTGRES_URI` for Postgres).
 
 ## Environment Variables (Production)
 
@@ -206,42 +211,26 @@ def _build_mock_service(thread_id: str) -> PenTestAgentService:
 
 
 def _build_production_service(thread_id: str) -> PenTestAgentService:
-    """Build a service wired to the real backend.
+    """Build the full real production service (default when no env is set).
 
-    TODO: implemented when the real adapters land. The production dependency
-    source is agent.report_agent.AgentRuntime, which exposes `agent`,
-    `checkpointer` and `store` after `await initialize()`. Those primitives need
-    protocol adapters (CheckpointerProtocol / FileStoreProtocol /
-    AgentRunnerProtocol) before they can be injected here. Until then, run with
-    STREAMLIT_USE_MOCKS=1 (full mock) or STREAMLIT_USE_REAL_BACKEND=1 (real
-    checkpointer + store, mock agent).
+    Real persistence (SQLite or Postgres) + the real LangGraph agent running
+    through the live LLM. Requires model keys in ``.env`` (e.g.
+    ``MISTRAL_API_KEY``). Run with ``STREAMLIT_USE_MOCKS=1`` for the full
+    in-memory dev sandbox or ``STREAMLIT_USE_REAL_BACKEND=1`` for the partial
+    swap (real persistence, mock agent).
     """
-    raise NotImplementedError(
-        "Real backend wiring is not implemented yet. "
-        "Run with STREAMLIT_USE_MOCKS=1 to use in-memory mock dependencies, or "
-        "STREAMLIT_USE_REAL_BACKEND=1 for the partial swap (real persistence + mock agent)."
-    )
+    from streamlit_ui.services.real_backend import build_real_backend_service
 
-
-@st.cache_resource
-def _shared_real_backend():
-    """Process-wide real backend: event loop thread + initialized AgentRuntime.
-
-    Caching ensures every thread/session shares one set of DB connections (and
-    one event loop), exactly like the mock-mode singletons do.
-    """
-    from streamlit_ui.services.real_backend import get_real_backend
-
-    return get_real_backend()
+    return build_real_backend_service(thread_id, force_full=True)
 
 
 def _build_real_backend_service(thread_id: str) -> PenTestAgentService:
-    """Build a service with the REAL checkpointer + store, but a MOCK agent.
+    """Build a real-backend service: partial swap or full real agent.
 
-    Partial swap mode (STREAMLIT_USE_REAL_BACKEND=1): session history and the
-    virtual filesystem persist to the real DB (SQLite, or Postgres when
-    POSTGRES_URI is reachable), surviving server restarts. The agent still
-    replies with scripted events until the real agent runner adapter lands.
+    - ``STREAMLIT_USE_REAL_BACKEND=1`` (partial): real checkpointer + store,
+      mock agent (no API keys needed).
+    - ``STREAMLIT_USE_REAL_AGENT=1`` (full): real persistence + the real agent
+      (needs model keys in ``.env``).
     """
     from streamlit_ui.services.real_backend import build_real_backend_service
 
@@ -251,10 +240,11 @@ def _build_real_backend_service(thread_id: str) -> PenTestAgentService:
 def get_or_create_service(thread_id: str) -> PenTestAgentService:
     """Get or create PenTestAgentService instance for current thread.
 
-    Three modes:
-    - STREAMLIT_USE_MOCKS=1      → in-memory mock dependencies (default for dev)
-    - STREAMLIT_USE_REAL_BACKEND=1 → real checkpointer + store, mock agent (partial)
-    - neither                     → production (not wired yet - NotImplementedError)
+    Modes (first match wins):
+    - ``STREAMLIT_USE_MOCKS=1``       → in-memory mock dependencies (dev sandbox)
+    - ``STREAMLIT_USE_REAL_BACKEND=1`` → real persistence + mock agent (partial)
+    - ``STREAMLIT_USE_REAL_AGENT=1``   → real persistence + real agent (full)
+    - no env                           → production (full real agent)
 
     Args:
         thread_id: Current session/thread identifier
@@ -266,11 +256,14 @@ def get_or_create_service(thread_id: str) -> PenTestAgentService:
         App startup → get_or_create_service() → Initialize dependencies → Cache in session_state
     """
     if "service" not in st.session_state or st.session_state.service.thread_id != thread_id:
-        from streamlit_ui.services.real_backend import is_real_backend_mode
+        from streamlit_ui.services.real_backend import (
+            is_real_backend_mode,
+            is_real_agent_mode,
+        )
 
         if os.environ.get("STREAMLIT_USE_MOCKS", "").lower() in ("1", "true", "yes"):
             service = _build_mock_service(thread_id)
-        elif is_real_backend_mode():
+        elif is_real_backend_mode() or is_real_agent_mode():
             service = _build_real_backend_service(thread_id)
         else:
             service = _build_production_service(thread_id)

@@ -81,10 +81,11 @@ class TestMockModeReport:
 class TestProductionModeReport:
     """Connectivity lines when the production backend is requested."""
 
-    def test_all_components_report_not_wired(self, monkeypatch):
+    def test_all_components_report_production_active(self, monkeypatch):
         monkeypatch.delenv("STREAMLIT_USE_MOCKS", raising=False)
         lines = rs.component_status_lines()
         assert len(lines) == 5
         for line in lines:
-            assert line.endswith("not connected (production wiring not implemented yet "
-                                  "(run with STREAMLIT_USE_MOCKS=1))")
+            assert line.startswith(("checkpointer:", "virtual filesystem store:",
+                                    "llm api:", "agent object:", "observability (langfuse):"))
+            assert "connected (production" in line

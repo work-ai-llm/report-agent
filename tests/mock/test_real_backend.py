@@ -62,6 +62,29 @@ class TestRealCheckpointerAdapter:
         assert cp.get("t1") is None
         assert cp.delete("t1") is False
 
+    def test_ui_namespace_isolated_from_agent_namespace(self, backend):
+        """UI display history lives in ns ``ui``; agent state in ns ``""``."""
+        runner, runtime = backend
+        ui_cp = rb.RealCheckpointerAdapter(runner, runtime.checkpointer, checkpoint_ns=rb._UI_CHECKPOINT_NS)
+        agent_cp = rb.RealCheckpointerAdapter(runner, runtime.checkpointer)
+        thread_id = "shared"
+        agent_cp.put(thread_id, {"messages": [{"role": "user", "content": "agent history"}]})
+        ui_cp.put(thread_id, {"messages": [{"role": "user", "content": "ui display"}]})
+        assert agent_cp.get(thread_id) == {"messages": [{"role": "user", "content": "agent history"}]}
+        assert ui_cp.get(thread_id) == {"messages": [{"role": "user", "content": "ui display"}]}
+        assert ui_cp.list_threads() == [thread_id]  # scans all namespaces, dedupes
+        assert ui_cp.delete(thread_id) is True  # removes the whole thread
+        assert agent_cp.get(thread_id) is None
+        assert ui_cp.get(thread_id) is None
+
+    def test_ui_put_with_fixed_id_replaces_in_place(self, backend):
+        runner, runtime = backend
+        cp = rb.RealCheckpointerAdapter(runner, runtime.checkpointer, checkpoint_ns=rb._UI_CHECKPOINT_NS)
+        cp.put("t", {"messages": [{"role": "user", "content": "v1"}]})
+        cp.put("t", {"messages": [{"role": "user", "content": "v2"}]})
+        assert cp.list_threads() == ["t"]  # upsert, not multiply versions
+        assert cp.get("t") == {"messages": [{"role": "user", "content": "v2"}]}
+
 
 class TestRealFileStoreAdapter:
     def test_write_read_roundtrip(self, backend):
@@ -153,6 +176,87 @@ class TestPartialSwapService:
         assert a.list_threads() == ["tb"]
 
 
+class TestRealAgentRunnerAdapter:
+    """Real agent runner streams LangGraph events into UI-visible events."""
+
+    class _FakeAsyncAgent:
+        def __init__(self, chunks, exc=None):
+            self._chunks = chunks
+            self._exc = exc
+            self.calls = []
+
+        async def astream(self, stream_input, config=None):
+            self.calls.append((stream_input, config))
+            if self._exc is not None:
+                raise self._exc
+            for batch in self._chunks:
+                yield batch
+
+    @staticmethod
+    def _events(backend, agent, message="scan target", thread_id="th"):
+        runner, _runtime = backend
+        adapter = rb.RealAgentRunnerAdapter(runner, agent)
+        return list(adapter.run(message, thread_id))
+
+    def test_streams_tool_call_then_message(self, backend, monkeypatch):
+        from langchain_core.messages import AIMessageChunk, ToolMessage
+
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            {"messages": [AIMessageChunk(
+                content="", tool_calls=[{"name": "nmap_scan", "args": {"target": "10.0.0.1"},
+                                         "id": "c1", "type": "tool_call"}])]},
+            {"messages": [ToolMessage(content="80/tcp open", tool_call_id="c1", name="nmap_scan")]},
+            {"messages": [AIMessageChunk(content="Scan complete.")]},
+        ])
+        events = self._events(backend, agent, "scan target", "th1")
+        assert [e["type"] for e in events] == ["tool_call", "tool_result", "message"]
+        assert events[0]["data"] == {"name": "nmap_scan", "args": {"target": "10.0.0.1"}}
+        assert events[1]["data"]["name"] == "nmap_scan"
+        assert events[2]["data"] == "Scan complete."
+        stream_input, config = agent.calls[0]
+        assert stream_input == {"messages": [{"role": "user", "content": "scan target"}]}
+        assert config["configurable"]["thread_id"] == "th1"
+        assert config["configurable"]["checkpoint_ns"] == ""
+
+    def test_multiple_text_chunks_join_into_one_message(self, backend, monkeypatch):
+        from langchain_core.messages import AIMessageChunk
+
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            {"messages": [AIMessageChunk(content="Recon ")],
+             "extra": [{"type": "whatever"}]},  # non-message keys ignored
+            {"messages": [AIMessageChunk(content="complete.")]},
+        ])
+        events = self._events(backend, agent)
+        assert [e["type"] for e in events] == ["message"]
+        assert events[0]["data"] == "Recon complete."
+
+    def test_stream_error_surfaces_error_event(self, backend, monkeypatch):
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([], exc=ValueError("llm exploded"))
+        events = self._events(backend, agent)
+        assert events == [{"type": "error", "data": "ValueError: llm exploded"}]
+
+    def test_print_enabled_emits_marker_lines(self, backend, monkeypatch, capsys):
+        from langchain_core.messages import AIMessageChunk, ToolMessage
+
+        monkeypatch.setenv("STREAMLIT_AGENT_PRINT", "1")
+        agent = self._FakeAsyncAgent([
+            {"messages": [AIMessageChunk(
+                content="", tool_calls=[{"name": "read_file", "args": {"path": "/a/b.md"},
+                                         "id": "c1", "type": "tool_call"}])]},
+            {"messages": [ToolMessage(content="# Markdown body", tool_call_id="c1", name="read_file")]},
+            {"messages": [AIMessageChunk(content="Done here.")]},
+        ])
+        self._events(backend, agent)
+        out = capsys.readouterr().out
+        assert "[TOOL CALL]: read_file" in out
+        assert "[TOOL RESULT]: read_file" in out
+        assert "[CNK]: Done here." in out
+        assert "[AGENT RESPONSE]: Done here." in out
+
+
 class TestRealBackendStatus:
     def test_real_backend_lines_connect_sqlite(self, monkeypatch, tmp_path):
         monkeypatch.delenv("STREAMLIT_USE_MOCKS", raising=False)
@@ -191,7 +295,7 @@ class TestRealBackendAppTest:
         _reset_backend_cache()
         try:
             at = AppTest.from_file(APP_PATH)
-            at.run()
+            at.run(timeout=60)  # backend init retries Postgres + Langfuse checks
             assert not at.exception, f"App failed to load: {at.exception}"
             assert "current_thread_id" in at.session_state
             assert at.session_state.current_thread_id is None
