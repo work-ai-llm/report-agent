@@ -11,9 +11,10 @@ from dotenv import load_dotenv
 # Official A2A Client Imports
 from a2a.client import A2ACardResolver, ClientConfig, create_client
 # (Protobuf-based)
-from a2a.types.a2a_pb2 import Message, Part, Role, SendMessageRequest
+from a2a.types.a2a_pb2 import Message, Part, Role, SendMessageRequest, SubscribeToTaskRequest
 # for protobuf object conversion
 from google.protobuf.json_format import MessageToDict
+
 
 load_dotenv()
 
@@ -24,54 +25,76 @@ SERVER_URL = 'http://192.168.0.107:9999'
 from dev_tools.store_cli import seed_store, inspect_store, delete_file
 
 # ==========================================
-# broken text extraction FUNCTION
+# proper extraction function
 # ==========================================
-def extract_text_heuristically(chunk_dict):
-    """Recursively search any dictionary/object for textual data."""
-    # 2. Extract Status Updates (e.g., "Agent is calling tools...")
-    if "status_update" in chunk_dict:
-        status = chunk_dict["status_update"].get("status", {})
-        message = status.get("message", {})
-        parts = message.get("parts", [])
-        for part in parts:
-            if "text" in part:
-                return f"[STATUS]: {part['text']}"
-
-    # 3. Extract Artifacts (The final report)
-    elif "artifact_update" in chunk_dict:
-        artifact = chunk_dict["artifact_update"].get("artifact", {})
-        parts = artifact.get("parts", [])
-        for part in parts:
-            if "text" in part:
-                return f"[ARTIFACT]: {part['text']}"   
-    # 4. Handle initial task acknowledgment
-    elif 'task' in chunk_dict:
-        task_dict = chunk_dict['task']
-        task_id = task_dict.get('id')
-        status = task_dict.get("status", {}).get("state")
-        history_list = task_dict.get("history", [])
+def extract_chunk_info(chunk):
+    """
+    Takes the raw Protobuf chunk from the SDK.
+    Returns: (text_content, task_id, context_id, chunk_type)
+    """
+    # 1. Get Metadata directly from Protobuf attributes (No dict conversion needed!)
+    # Task object has 'id', while Updates have 'task_id'
+    task_id = getattr(chunk, 'task_id', None) or getattr(chunk, 'id', None)
+    context_id = getattr(chunk, 'context_id', None)
     
-        task_text = None
-        
+    # 2. Convert to dict ONLY to extract the nested text payloads
+    chunk_dict = MessageToDict(chunk, preserving_proto_field_name=True)
+    text_content = None
+    chunk_type = None
+
+    if "task" in chunk_dict:
+        chunk_type = "INITIAL_TASK"
+        task_dict = chunk_dict['task']
+        status = chunk_dict["task"].get("status", {}).get("state")
+        text_content = f"[TASK STATE]: {status}"
+        history_list = task_dict.get("history", [])
+
         for history_item in history_list:
             parts = history_item.get("parts", [])
             for part in parts:
-                if "text" in part:
-                    task_text = part['text']
-                    
-        return f"[TASK STATE]: {status}\nTask Id: {task_id}\nText: {task_text}"
-    return None
+                if "text" in part:                    
+                    text_content = f"[TASK STATE]: {status}\nText: {part['text']}"
+                    break
+        
+    elif "status_update" in chunk_dict:
+        chunk_type = "STATUS"
+        message = chunk_dict["status_update"].get("status", {}).get("message", {})
+        for part in message.get("parts", []):
+            if "text" in part:
+                text_content = f"[STATUS]: {part['text']}"
+                break
+                
+    elif "artifact_update" in chunk_dict:
+        chunk_type = "ARTIFACT"
+        artifact = chunk_dict["artifact_update"].get("artifact", {})
+        for part in artifact.get("parts", []):
+            if "text" in part:
+                text_content = f"[ARTIFACT]: {part['text']}"
+                break
 
+    return text_content, task_id, context_id, chunk_type
 
 
 # ==========================================
 # CORE HELPER FUNCTION
 # ==========================================
-async def send_and_get_response(client, text, context_id=None):
+async def send_and_get_response(client, text, context_id=None, task_id=None):
     """
     Sends a message, generates Context ID on client side if not provided,
     and extracts the response.
     """
+
+    if task_id:
+        sub_request = SubscribeToTaskRequest(id=task_id)
+
+        async for chunk in client.subscribe_to_task(task_id=task_id):
+            converted = MessageToDict(chunk, preserving_proto_field_name=True)
+
+            extract_text_heuristically(converted)
+            print(extract_text_heuristically)
+
+
+
     if not context_id:
         context_id = str(uuid.uuid4())
         print(f">>> CLIENT GENERATED CONTEXT ID: {context_id}")
@@ -94,7 +117,6 @@ async def send_and_get_response(client, text, context_id=None):
     # 3. Create the Params
     request = SendMessageRequest(
         message=message)
-
 
     print(f"\n[CLIENT SENDING]: {text}")
     print("--- WAITING FOR SERVER RESPONSE ---")
@@ -143,6 +165,31 @@ async def send_and_get_response(client, text, context_id=None):
     print(f"[AGENT RESPONSE]: {agent_response.strip()}")
     return returned_context_id, full_response_text.strip()
 
+
+async def stream_to_completion(client, stream, label=""):
+    """Consumes a stream (from send_message or subscribe_to_task) until COMPLETED."""
+    final_artifact = ""
+    async for chunk in stream:
+        text, tid, cid, ctype = extract_chunk_info(chunk)
+        if text:
+            print(f"{label}{text[:100]}")
+        if ctype == "ARTIFACT":
+            final_artifact = text
+        if ctype == "STATUS" and "TASK_STATE_COMPLETED" in text:
+            break
+    return final_artifact
+
+
+
+import uuid
+import asyncio
+from google.protobuf.json_format import MessageToDict
+from a2a.types.a2a_pb2 import (
+    Part, Role, Message, SendMessageRequest, 
+    GetTaskRequest, CancelTaskRequest, SubscribeToTaskRequest, TaskState
+)
+
+
 # ==========================================
 # TEST DEFINITIONS
 # ==========================================
@@ -175,7 +222,6 @@ async def run_test_2(client):
     
     # 1. Explicitly delete only the finding files, preserving templates/interpretations
     print("\n--- Step 1: Deleting specific finding files from Store ---")
-    # Based on your seed_store logic, keys are prefixed with /
     delete_file("/findings/nmap_scans.txt")
     delete_file("/findings/bloodhound_dump.txt")
     
@@ -214,7 +260,6 @@ async def run_test_3(client):
     print("[TEST 3] Back-to-Back Complex Tasks (Concurrency Test)")
     print("="*60)
     print("Firing two complex tasks simultaneously to test server concurrency.")
-    print("Since streaming=False, the server will block each HTTP request until done.")
     print("We use asyncio.gather to fire both at the exact same time.\n")
 
     task1_text = (
@@ -242,6 +287,187 @@ async def run_test_3(client):
     print("Check Langfuse to see if these were processed concurrently or queued.")
     print("\n[TEST 3 COMPLETE]")
 
+async def run_test_4(client):
+    print("\n" + "="*60)
+    print("[TEST 4] Sequential Execution Stress Test (Multiple Concurrent Tasks)")
+    print("="*60)
+    print("Firing 3 complex tasks simultaneously from the client.")
+    print("The server should queue them and execute them strictly one by one.")
+    print("Check the server logs to see them being picked up sequentially.\n")
+
+    tasks = [
+        "Generate a quick summary of the recon phase.",
+        "Analyze the bloodhound dump for privilege escalation paths.",
+        "Create a draft for the executive summary based on nmap scans.",
+    ]
+
+    # Fire all 3 concurrently
+    results = await asyncio.gather(
+        *[send_and_get_response(client, text) for text in tasks]
+    )
+    
+    for i, (ctx, resp) in enumerate(results):
+        print(f"\nTask {i+1} Context ID: {ctx}")
+        # Just print a snippet to avoid flooding the console
+        snippet = resp[:150].replace('\n', ' ') if resp else "No response"
+        print(f"Task {i+1} Response snippet: {snippet}...")
+
+    print("\n[TEST 4 COMPLETE]")
+
+
+# ==========================================
+# TEST 5: Concurrency & Client Drop (Refactored)
+# ==========================================
+async def run_test_5(client):
+    print("\n" + "="*60)
+    print("[TEST 5] Concurrency Limit & Client Drop Simulation")
+    print("="*60)
+    print("Firing 5 tasks simultaneously.")
+    print("Tasks 1 & 2 will finish. Tasks 3, 4, 5 will be dropped after 3 seconds.\n")
+
+    # Helper to run a single stream using YOUR exact function
+
+    async def run_single_stream(task_num, text):
+        ctx_id = str(uuid.uuid4())
+        try:
+            # Call your exact function. It handles all the printing and parsing.
+            returned_ctx, response_text = await send_and_get_response(client, text, context_id=ctx_id)
+            print(f"[Task {task_num:02d}] Finished normally.")
+            return returned_ctx, response_text
+        except asyncio.CancelledError:
+            # This triggers when we call task.cancel() below
+            print(f"[Task {task_num:02d}] !!! CLIENT CONNECTION DROPPED (Cancelled) !!!")
+            raise
+        except Exception as e:
+            print(f"[Task {task_num:02d}] Stream ended with error: {type(e).__name__}")
+            return ctx_id, None
+
+    all_tasks = []
+
+    # PHASE 1: Fire tasks using create_task (non-blocking)
+    for i in range(5):
+        text = f"Task {i+1}: Quick summary of recon phase."
+        task_coro = run_single_stream(i + 1, text)
+        all_tasks.append(asyncio.create_task(task_coro))
+
+    # PHASE 2: Let the queue build up
+    print("\n--- WAITING 5 SECONDS TO LET QUEUE BUILD UP ---")
+    await asyncio.sleep(5)
+
+    # PHASE 3: Drop the clients for tasks 3, 4, 5
+    print("\n--- DROPPING CLIENT CONNECTIONS FOR TASKS 3, 4, 5 ---")
+    for i in range(2, 5):
+        all_tasks[i].cancel()
+
+    # PHASE 4: Wait for completion (return_exceptions prevents crash on CancelledError)
+    print("\n--- WAITING FOR TASKS 1 & 2 TO COMPLETE ---")
+    results = await asyncio.gather(*all_tasks, return_exceptions=True)
+
+    # PHASE 5: Summary
+    print("\n" + "-"*50)
+    print("--- TEST 5 RESULTS ---")
+    for i, res in enumerate(results):
+        if isinstance(res, asyncio.CancelledError):
+            print(f"Task {i+1}: DROPPED (Client disconnected)")
+        elif isinstance(res, Exception):
+            print(f"Task {i+1}: FAILED with {type(res).__name__}")
+        else:
+            ctx, _ = res
+            print(f"Task {i+1}: COMPLETED (Context: {ctx[:8]}...)")
+            
+    print("\n[TEST 5 COMPLETE] (Check server logs for 'Skipping task...')")
+
+
+from a2a.types.a2a_pb2 import SubscribeToTaskRequest # Import the specific request type
+
+# ==========================================
+# TEST 5: Advanced Lifecycle (Drop, Zombie, Subscribe & Get)
+# ==========================================
+async def run_test_5(client):
+    print("\n" + "="*60)
+    print("[TEST 5] Advanced Lifecycle: Drop, Zombie, Subscribe & Get")
+    print("="*60)
+
+    # 1. Initialize the Service
+    service = A2ATaskService(client)
+
+    # --- PHASE 1: FIRE 5 TASKS & GET IDS ---
+    print("\n[PHASE 1] Firing 5 tasks and extracting Server Task IDs...")
+    active_tasks = {}
+    task_ids = {}
+    
+    for i in range(1, 6):
+        text = f"Task {i}: Generate a quick recon summary."
+        stream, tid, cid = await service.start_stream(text)
+        task_ids[i] = tid
+        print(f"  -> Task {i} created. Server ID: {tid}")
+        
+        # Wrap the rest of the stream in a background task so we can drop it later
+        async def consume(s, num):
+            await service._process_stream(s, label=f"  [Task {num}] ")
+            
+        active_tasks[i] = asyncio.create_task(consume(stream, i))
+
+    # --- PHASE 2: DROP 3, 4, 5 ---
+    print("\n[PHASE 2] Letting server process for 5 seconds, then dropping 3, 4, 5...")
+    await asyncio.sleep(5)
+    
+    for i in [3, 4, 5]:
+        active_tasks[i].cancel() # Violently sever the TCP connection
+        
+    # --- PHASE 3: LET 1 & 2 FINISH ---
+    print("\n[PHASE 3] Letting Tasks 1 & 2 finish normally...")
+    for i in [1, 2]:
+        await active_tasks[i]
+        print(f"  -> Task {i} finished normally.")
+
+    # Wait for the server to process the dropped tasks in the background (Zombie mode)
+    print("\n[PHASE 4] Waiting 10 seconds for server to process 'zombie' tasks...")
+    await asyncio.sleep(10)
+
+    # --- PHASE 5: TASK 3 (Check -> Subscribe) ---
+    print("\n[PHASE 5] Handling Task 3 (Check status, then cancel)...")
+    task3_data = await service.get_task(task_ids[3], label="  ")
+    if task3_data.status.state == TaskState.TASK_STATE_WORKING:
+        print("  -> Task 3 is still working. cancel")
+        await service.cancel_task(task_ids[3], label="  ")
+    else:
+        print("  -> Task 3 canceled")
+
+    # --- PHASE 6: TASK 4 (check status -> Get & Replay) ---
+    print("\n[PHASE 6] Handling Task 4 ( Get & Subscribe)...")
+    await service.get_task(task_ids[4], label="  [Get 4] ")
+    print("  -> Task 4 stream via subscribe_to_task...")
+    if task3_data.status.state == TaskState.TASK_STATE_WORKING:
+        print("  -> Task 4 is still working. cancel")
+        await service.subscribe_to_task(task_ids[4], label="  [Subscribe 4] ")
+    else:
+        print("  -> Task 4 dropped")
+    
+
+    # --- PHASE 7: TASK 5 (Poll -> Wait -> Get & Replay) ---
+    print("\n[PHASE 7] Handling Task 5 (Polling get_task, then Retrieve)...")
+    # Polling every 60 seconds for 10 times (10 minutes total)
+    task5_data = await service.poll_until_complete(task_ids[5], interval=60, max_attempts=10, label="  ")
+    
+    if task5_data and task5_data.status.state == TaskState.TASK_STATE_COMPLETED:
+        print("  -> Task 5 completed. Starting 10-minute countdown to check if it disappears...")
+        for i in range(10):
+            print(f"  -> Countdown check {i+1}/10...")
+            await asyncio.sleep(60)
+            check = await service.get_task(task_ids[5], label="     ")
+            if check.status.state != TaskState.TASK_STATE_COMPLETED:
+                print("  -> WARNING: Task disappeared or changed state!")
+                break
+                
+        print("  -> Countdown passed. Retrieving Task 5 final payload...")
+        await service.get_task(task_ids[5], label="  [Get 5] ")
+        await service.subscribe_to_task(task_ids[5], label="  [Replay 5] ")
+    else:
+        print("  -> Task 5 did not complete in time!")
+
+    print("\n[TEST 5 COMPLETE]")
+
 
 # ==========================================
 # MAIN EXECUTION & CLI
@@ -262,25 +488,25 @@ async def main(test_num):
 
         if test_num == 0:
             await run_test_0_streaming(client)
-        if test_num == 1:
+        elif test_num == 1:
             await run_test_1(client)
         elif test_num == 2:
             await run_test_2(client)
         elif test_num == 3:
             await run_test_3(client)
+        elif test_num == 4:
+            await run_test_4(client)
+        elif test_num == 5:
+            await run_test_5(client)
         else:
-            print("Invalid test number. Choose 1, 2, or 3.")
+            print("Invalid test number. Choose 0, 1, 2, 3, 4 or 5.")
 
         await client.close()
 
-
-
-
-    
 if __name__ == "__main__":
     # Professional CLI setup: python 3_a2a_testing.py --test 1
     parser = argparse.ArgumentParser(description="Run specific A2A integration tests.")
-    parser.add_argument("--test", type=int, choices=[0, 1, 2, 3], required=True, help="The test number to run (0, 1, 2, or 3)")
+    parser.add_argument("--test", type=int, choices=[0, 1, 2, 3, 4, 5], required=True, help="The test number to run (0, 1, 2, 3, 4 or 5)")
     args = parser.parse_args()
     
     asyncio.run(main(args.test))
