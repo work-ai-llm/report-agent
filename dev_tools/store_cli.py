@@ -85,25 +85,74 @@ async def inspect_store(namespace_str: str, show_size: bool, show_dates: bool, p
                 print(f"  Preview: {preview}...")
         print("")
 
+async def _fetch_thread_ids(max_threads: int) -> list[str]:
+    """Run the lightweight DISTINCT thread_id scan on the ACTIVE backend."""
+    # Postgres: psycopg async pool, dict_row row factory.
+    if runtime.pool is not None:
+        async with runtime.pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT DISTINCT thread_id FROM checkpoints "
+                    "ORDER BY thread_id LIMIT %s",
+                    (max_threads,),
+                )
+                rows = await cur.fetchall()
+        return sorted(str(row["thread_id"]) for row in rows)
+
+    # SQLite fallback: the checkpointer's own aiosqlite connection points at
+    # the ACTIVE local file (LOCAL_DB_PATH), so no hardcoded path is needed.
+    if runtime.checkpointer is not None and hasattr(runtime.checkpointer, "conn"):
+        async with runtime.checkpointer.conn.execute(
+            "SELECT DISTINCT thread_id FROM checkpoints "
+            "ORDER BY thread_id LIMIT ?",
+            (max_threads,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return sorted(str(row[0]) for row in rows)
+
+    return []
+
+
+async def _active_thread_ids(max_threads: int = 5000) -> list[str]:
+    """Distinct thread_ids from the ACTIVE checkpointer, failing fast.
+
+    The old implementation read ``LOCAL_DB_PATH`` directly with aiosqlite and
+    plain ``SELECT DISTINCT thread_id FROM checkpoints``, which only ever
+    reflected the SQLite fallback (stale/empty when the runtime is on Postgres).
+    A later attempt used ``checkpointer.alist(None)`` but that is an *unbounded*
+    full-table scan of every namespace that deserializes + de-blobs every
+    checkpoint row - far too slow to enumerate sessions on a busy Postgres DB
+    (that is exactly why ``list-sessions`` hung with a Postgres backend).
+
+    Instead, run the distinct scan directly on the ACTIVE backend and bound the
+    wait so a down/slow pool surfaces an error instead of hanging the CLI.
+    """
+    try:
+        return await asyncio.wait_for(_fetch_thread_ids(max_threads), timeout=15.0)
+    except asyncio.TimeoutError:
+        raise RuntimeError(
+            "timed out waiting for a checkpointer connection - is Postgres "
+            "reachable? (check your Tailscale/VPN and psql)"
+        ) from None
+
 async def list_sessions():
     """List all thread_ids chronologically with created/last timestamps."""
-    print("Listing sessions in checkpointer (agent_session.db) chronologically...")
+    print("Listing sessions in checkpointer chronologically...", flush=True)
     try:
-        import aiosqlite
-        from agent.report_agent import LOCAL_DB_PATH
-        # Get thread_ids, then sort by earliest checkpoint ts
-        async with aiosqlite.connect(str(LOCAL_DB_PATH)) as conn:
-            async with conn.execute("SELECT DISTINCT thread_id FROM checkpoints") as cur:
-                rows = await cur.fetchall()
-                if not rows:
-                    print("No sessions found.")
-                    return
-                tids = [r[0] for r in rows]
-        # For each tid, get full history via alist to extract created/last ts
+        tids = await _active_thread_ids()
+        if not tids:
+            print("No sessions found.")
+            return
         sessions = []
-        for tid in tids:
+        total = len(tids)
+        for i, tid in enumerate(tids, 1):
+            print(f"  scanning session {i}/{total} ...", flush=True)
             try:
-                checkpoints = [t async for t in runtime.checkpointer.alist({"configurable": {"thread_id": tid}})]
+                async def _fetch_ckpts():
+                    return [t async for t in runtime.checkpointer.alist(
+                        {"configurable": {"thread_id": tid}}, limit=512
+                    )]
+                checkpoints = await asyncio.wait_for(_fetch_ckpts(), timeout=20.0)
                 if not checkpoints:
                     sessions.append((tid, None, None, 0, "?"))
                     continue
