@@ -199,15 +199,16 @@ class TestRealAgentRunnerAdapter:
         return list(adapter.run(message, thread_id))
 
     def test_streams_tool_call_then_message(self, backend, monkeypatch):
+        """langchain's Agent.astream yields {node: {"messages": [...]}} diffs."""
         from langchain_core.messages import AIMessageChunk, ToolMessage
 
         monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
         agent = self._FakeAsyncAgent([
-            {"messages": [AIMessageChunk(
+            {"agent": {"messages": [AIMessageChunk(
                 content="", tool_calls=[{"name": "nmap_scan", "args": {"target": "10.0.0.1"},
-                                         "id": "c1", "type": "tool_call"}])]},
-            {"messages": [ToolMessage(content="80/tcp open", tool_call_id="c1", name="nmap_scan")]},
-            {"messages": [AIMessageChunk(content="Scan complete.")]},
+                                         "id": "c1", "type": "tool_call"}])]}},
+            {"agent": {"messages": [ToolMessage(content="80/tcp open", tool_call_id="c1", name="nmap_scan")]}},
+            {"agent": {"messages": [AIMessageChunk(content="Scan complete.")]}},
         ])
         events = self._events(backend, agent, "scan target", "th1")
         assert [e["type"] for e in events] == ["tool_call", "tool_result", "message"]
@@ -218,6 +219,19 @@ class TestRealAgentRunnerAdapter:
         assert stream_input == {"messages": [{"role": "user", "content": "scan target"}]}
         assert config["configurable"]["thread_id"] == "th1"
         assert config["configurable"]["checkpoint_ns"] == ""
+
+    def test_handles_top_level_messages_and_serialized_dicts(self, backend, monkeypatch):
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            {"messages": [{"role": "assistant", "content": "", "tool_calls": [
+                {"name": "nmap_scan", "args": {"target": "10.0.0.1"}, "id": "c1"}]},
+                {"role": "tool", "name": "nmap_scan", "content": "80 open", "tool_call_id": "c1"}]},
+            {"agent": {"messages": [{"role": "assistant", "content": "Done quickly."}]}},
+        ])
+        events = self._events(backend, agent)
+        assert [e["type"] for e in events] == ["tool_call", "tool_result", "message"]
+        assert events[0]["data"] == {"name": "nmap_scan", "args": {"target": "10.0.0.1"}}
+        assert events[2]["data"] == "Done quickly."
 
     def test_multiple_text_chunks_join_into_one_message(self, backend, monkeypatch):
         from langchain_core.messages import AIMessageChunk
