@@ -377,6 +377,10 @@ def render_sidebar(service: PenTestAgentService) -> None:
                 st.success(text)
             else:
                 st.error(text)
+
+        load_error = st.session_state.pop("_session_load_error", None)
+        if load_error:
+            st.error(f"Session list unavailable ({load_error}).")
         
         st.divider()
         
@@ -566,8 +570,15 @@ def main() -> None:
     if st.session_state.current_thread_id is not None:
         service = get_or_create_service(st.session_state.current_thread_id)
     else:
-        tmp_threads = get_or_create_service("___placeholder___").list_threads()
-        tmp_id = tmp_threads[-1] if tmp_threads else "___placeholder___"
+        tmp_id = "___placeholder___"
+        try:
+            tmp_threads = get_or_create_service(tmp_id).list_threads()
+            tmp_id = tmp_threads[-1] if tmp_threads else tmp_id
+        except Exception as exc:  # noqa: BLE001 - never let a slow/down DB crash boot
+            # POSTGRES/robustness: list_threads scans the checkpointer; if the
+            # backend is slow or unreachable, boot with the placeholder session
+            # instead of blowing up the whole UI.
+            st.session_state["_session_load_error"] = str(exc)
         service = get_or_create_service(tmp_id)
 
     # Render sidebar — its handlers may change the active thread
