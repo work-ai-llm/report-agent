@@ -54,6 +54,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -223,7 +224,17 @@ class RealCheckpointerAdapter:
     def list_threads(self) -> List[str]:
         async def _scan() -> List[str]:
             thread_ids = set()
-            async for tup in self._saver.alist(None):
+            # POSTGRES FIX: `alist(None)` without a filter is an *unbounded*
+            # full-table scan over EVERY namespace and thread (the agent's own
+            # loop/input checkpoints too), with no LIMIT. AsyncPostgresSaver
+            # materializes + de-blobs every checkpoint row (per-row blob fetches
+            # and `asyncio.to_thread`), which on a busy Postgres DB exceeds the
+            # EventLoopThread.run() 60s default and crashes the app at boot
+            # (app.py list_threads on the placeholder service).
+            # Only the UI writes metadata {"source": "ui"} (see put()), so scope
+            # the scan to UI sessions; LIMIT keeps it bounded regardless of
+            # backend. Works on SQLite (json_extract) and Postgres (metadata @>).
+            async for tup in self._saver.alist(None, filter={"source": "ui"}, limit=1000):
                 tid = tup.config["configurable"]["thread_id"]
                 thread_ids.add(tid)
             return sorted(thread_ids)
@@ -324,9 +335,10 @@ class RealAgentRunnerAdapter:
         self._agent = agent
 
     def run(self, message: str, thread_id: str) -> Iterator[Dict[str, Any]]:
-        from langchain_core.messages import AIMessageChunk, ToolMessage
+        from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
         emit_print = is_agent_output_print_enabled()
+        trace_path = os.environ.get("STREAMLIT_AGENT_LOG")
         events: "queue.Queue[Any]" = queue.Queue()
         sentinel = object()
         final_parts: List[str] = []
@@ -334,10 +346,31 @@ class RealAgentRunnerAdapter:
         stream_input = {"messages": [{"role": "user", "content": message}]}
 
         def _print(*parts: Any) -> None:
+            # Mirrored to STREAMLIT_AGENT_LOG (if set) so a run that is frozen
+            # or killed under pytest capture still leaves a visible trace.
+            line = " ".join(str(p) for p in parts)
             if emit_print:
-                print(*parts, flush=True)
+                try:
+                    print(line, flush=True)
+                except UnicodeEncodeError:  # cp1252 consoles choke on unicode arrows etc.
+                    # Best-effort console print - the trace file (utf-8) still
+                    # preserves the exact bytes. Never crash the agent stream.
+                    try:
+                        safe = line.encode("utf-8", "replace").decode("ascii", "backslashreplace")
+                        print(safe, flush=True)
+                    except Exception:
+                        pass
+            if trace_path:
+                try:
+                    with open(trace_path, "a", encoding="utf-8") as fh:
+                        fh.write(line + "\n")
+                except OSError:  # pragma: no cover - logging must never break the run
+                    pass
 
         def _handle_chunk(chunk: Any) -> None:
+            if isinstance(chunk, dict):
+                _handle_dict_chunk(chunk)
+                return
             if isinstance(chunk, ToolMessage):
                 name = getattr(chunk, "name", "") or ""
                 output = getattr(chunk, "content", "")
@@ -346,7 +379,7 @@ class RealAgentRunnerAdapter:
                 _print(f"[TOOL RESULT]: {name} -> {preview}")
                 return
 
-            if isinstance(chunk, AIMessageChunk):
+            if isinstance(chunk, (AIMessage, AIMessageChunk)):
                 for tc in getattr(chunk, "tool_calls", []) or []:
                     data = {"name": tc.get("name"), "args": tc.get("args", {})}
                     events.put({"type": "tool_call", "data": data})
@@ -359,16 +392,76 @@ class RealAgentRunnerAdapter:
                         final_parts.append(text)
                         _print(f"[CNK]: {text}")
 
+        def _handle_dict_chunk(chunk: Dict[str, Any]) -> None:
+            # Serialized message form (some graph updates yield dicts).
+            if chunk.get("tool_calls"):
+                for tc in chunk["tool_calls"]:
+                    data = {"name": tc.get("name") or tc.get("function", {}).get("name"),
+                            "args": tc.get("args") or tc.get("function", {}).get("arguments", {})}
+                    events.put({"type": "tool_call", "data": data})
+                    _print(f"[TOOL CALL]: {data['name']} args={data['args']}")
+            if chunk.get("role") == "tool":
+                name = chunk.get("name") or ""
+                events.put({"type": "tool_result", "data": {"name": name, "output": chunk.get("content", "")}})
+                preview = str(chunk.get("content", ""))[:300]
+                _print(f"[TOOL RESULT]: {name} -> {preview}")
+            content = chunk.get("content") or ""
+            if chunk.get("role") not in ("tool",) and not chunk.get("tool_calls") and content:
+                text = content if isinstance(content, str) else str(content)
+                if text.strip():
+                    final_parts.append(text)
+                    _print(f"[CNK]: {text}")
+
+        def _iter_messages(update: Any) -> Iterator[Any]:
+            """Extract message-like items from a langchain Agent astream update.
+
+            ``langchain.create_agent`` returns a LangGraph agent whose
+            ``astream`` yields node-diff dicts like
+            ``{"agent": {"messages": [added_messages]}}`` (plus whole-state
+            envelopes in some graphs), not flat ``{"messages": [...]}``. Handle
+            both the nested node form and a top-level ``messages`` key.
+            """
+            if not isinstance(update, dict):
+                return
+            top = update.get("messages")
+            if isinstance(top, list):
+                yield from top
+            for value in update.values():
+                if isinstance(value, dict):
+                    inner = value.get("messages")
+                    if isinstance(inner, list):
+                        yield from inner
+
         async def _consume() -> None:
+            start = time.monotonic()
+            def _ts() -> str:
+                return f"{time.monotonic() - start:.1f}s"
+            _print(f"[AGENT STREAM]: launching astream on {self._runner._thread.name} thread={threading.current_thread().name}")
+            _print(f"[AGENT STREAM]: stream_input type={type(stream_input)} keys={list(stream_input) if isinstance(stream_input, dict) else 'N/A'}")
+            _print(f"[AGENT STREAM]: config={config}")
+            _print(f"[AGENT STREAM]: agent type={type(self._agent).__name__} graph_type={type(getattr(self._agent, 'builder', None)).__name__}")
+            _updates = 0
             try:
-                async for update in self._agent.astream(stream_input, config=config):
-                    chunks = update.get("messages", []) if isinstance(update, dict) else []
-                    for chunk in chunks:
+                _print(f"[AGENT STREAM]: calling astream() at t={_ts()}")
+                astream_iter = self._agent.astream(stream_input, config=config)
+                _print(f"[AGENT STREAM]: astream() returned iterator at t={_ts()}, type={type(astream_iter).__name__}")
+                _print(f"[AGENT STREAM]: entering async for loop at t={_ts()}")
+                async for update in astream_iter:
+                    _updates += 1
+                    _print(
+                        f"[AGENT STREAM]: update#{_updates} t={_ts()} "
+                        f"keys={list(update) if isinstance(update, dict) else type(update).__name__}"
+                    )
+                    for chunk in _iter_messages(update):
                         _handle_chunk(chunk)
+                _print(f"[AGENT STREAM]: astream loop finished at t={_ts()} total_updates={_updates}")
             except Exception as exc:  # noqa: BLE001 - surface to UI consumer
+                _print(f"[AGENT ERROR]: t={_ts()} {type(exc).__name__}: {exc}")
+                import traceback
+                _print(f"[AGENT ERROR] traceback:\n{traceback.format_exc()}")
                 events.put({"type": "error", "data": f"{type(exc).__name__}: {exc}"})
-                _print(f"[AGENT ERROR]: {type(exc).__name__}: {exc}")
             finally:
+                _print(f"[AGENT STREAM]: finally block at t={_ts()}")
                 if final_parts:
                     text = "".join(final_parts)
                     events.put({"type": "message", "data": text})
