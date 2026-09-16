@@ -88,25 +88,59 @@ async def inspect_store(namespace_str: str, show_size: bool, show_dates: bool, p
                 print(f"  Preview: {preview}...")
         print("")
 
+async def _latest_thread_ids() -> list[str]:
+    """Return ALL thread_ids, newest first, via one SQL request.
+
+    ``checkpoint_id`` embeds a sortable timestamp, so MAX() = most recent
+    activity. The caller slices/trims to what it displays and uses len() for
+    the real total - the CLI only ever ``alist``-scans the handful of sessions
+    it prints, never the whole table.
+    """
+    # Postgres: psycopg async pool, dict_row row factory.
+    if runtime.pool is not None:
+        async with runtime.pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT thread_id, MAX(checkpoint_id) AS last_id "
+                    "FROM checkpoints GROUP BY thread_id "
+                    "ORDER BY last_id DESC"
+                )
+                rows = await cur.fetchall()
+        return [str(row["thread_id"]) for row in rows]
+
+    # SQLite fallback: the checkpointer's own aiosqlite connection points at
+    # the ACTIVE local file (LOCAL_DB_PATH), so no hardcoded path is needed.
+    if runtime.checkpointer is not None and hasattr(runtime.checkpointer, "conn"):
+        async with runtime.checkpointer.conn.execute(
+            "SELECT thread_id, MAX(checkpoint_id) AS last_id "
+            "FROM checkpoints GROUP BY thread_id "
+            "ORDER BY last_id DESC"
+        ) as cur:
+            rows = await cur.fetchall()
+        return [str(row[0]) for row in rows]
+
+    return []
+
 async def list_sessions():
     """List all thread_ids chronologically with created/last timestamps."""
-    print("Listing sessions in checkpointer (agent_session.db) chronologically...")
+    print("Listing sessions in checkpointer chronologically...", flush=True)
     try:
-        import aiosqlite
-        from agent.report_agent import LOCAL_DB_PATH
-        # Get thread_ids, then sort by earliest checkpoint ts
-        async with aiosqlite.connect(str(LOCAL_DB_PATH)) as conn:
-            async with conn.execute("SELECT DISTINCT thread_id FROM checkpoints") as cur:
-                rows = await cur.fetchall()
-                if not rows:
-                    print("No sessions found.")
-                    return
-                tids = [r[0] for r in rows]
-        # For each tid, get full history via alist to extract created/last ts
+        # ONE SQL request returns ALL thread_ids newest-first; total = len().
+        # Only then do we slice the newest N and alist-scan just those, so the
+        # CLI knows the real total without ever scanning every thread.
+        tids = await _latest_thread_ids()
+        total = len(tids)
+        if not tids:
+            print("No sessions found.")
+            return
         sessions = []
-        for tid in tids:
+        for tid in tids[:10]:
             try:
-                checkpoints = [t async for t in runtime.checkpointer.alist({"configurable": {"thread_id": tid}})]
+                async def _fetch_ckpts():
+                    return [t async for t in runtime.checkpointer.alist(
+                        {"configurable": {"thread_id": tid}}, limit=512
+                    )]
+                checkpoints = await asyncio.wait_for(_fetch_ckpts(), timeout=20.0)
                 if not checkpoints:
                     sessions.append((tid, None, None, 0, "?"))
                     continue
@@ -125,8 +159,8 @@ async def list_sessions():
                 sessions.append((tid, first_ts, last_ts, len(msgs), step))
             except Exception as e:
                 sessions.append((tid, None, None, 0, f"error:{e}"))
-        # Sort chronologically by created ts (ISO strings sort correctly)
-        sessions.sort(key=lambda x: x[1] or "")
+        # Sort by created ts: newest FIRST (ISO strings sort correctly, reversed)
+        sessions.sort(key=lambda x: x[1] or "", reverse=True)
         def _explain_ts(ts: str) -> str:
             # 2026-08-25T16:05:27.221455+00:00 -> 2026 year - 08 month - 25 day T 16 hour:05 minute:27 second .221455 microseconds +00:00 UTC
             if not ts or ts == "unknown":
@@ -156,8 +190,13 @@ async def list_sessions():
                 return f" (Date {year}:{month}:{day}, Time {hour}:{minute}, {second} seconds, {micro})"
             except Exception:
                 return ""
-        print(f"Found {len(sessions)} session(s) (chronological):")
-        for tid, created, last, msg_count, step in sessions:
+        MAX_SHOWN = 10
+        if total > MAX_SHOWN:
+            print(f"Found {total} session(s) total - this tool currently lists only the "
+                  f"LATEST {MAX_SHOWN} (newest first):")
+        else:
+            print(f"Found {total} session(s) (newest first):")
+        for tid, created, last, msg_count, step in sessions[:MAX_SHOWN]:
             print(f" - {tid}")
             print(f"   created: {created or 'unknown'}{_explain_ts(created) if created else ''}")
             print(f"   last message: {last or 'unknown'}{_explain_ts(last) if last else ''}")
