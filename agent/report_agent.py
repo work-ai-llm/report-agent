@@ -191,19 +191,19 @@ class AgentRuntime:
             # auth_check does network I/O - guard with try so offline doesn't crash initialize()
             try:
                 if self.langfuse.auth_check():
-                    print("Langfuse client is authenticated and ready!")
+                    print("Langfuse client is authenticated and ready!", flush=True)
                     self.langfuse_ok = True
                 else:
-                    print("Authentication failed. Please check your credentials and host.")
+                    print("Authentication failed. Please check your credentials and host.", flush=True)
                     self.langfuse_ok = False
             except Exception as e:
-                print(f"Langfuse auth_check failed ({e}), running without observability")
+                print(f"Langfuse auth_check failed ({e}), running without observability", flush=True)
                 self.langfuse_handler = None
                 self.langfuse_ok = False
                 return
             self.langfuse_handler = CallbackHandler()
         except Exception as e:
-            print(f"Langfuse init failed ({e}), running without observability")
+            print(f"Langfuse init failed ({e}), running without observability", flush=True)
             self.langfuse = None
             self.langfuse_handler = None
             self.langfuse_ok = False
@@ -215,7 +215,7 @@ class AgentRuntime:
         
         # Read the entire contents of the file into a string
         self.system_prompt_text = sys_prompt_path.read_text(encoding="utf-8")
-        print(f"Loaded system prompt ({len(self.system_prompt_text)} characters)")
+        print(f"Loaded system prompt ({len(self.system_prompt_text)} characters)", flush=True)
     
     def _init_middleware_and_llm(self):
         """Configure middleware, rate limiter, and LLM models."""
@@ -337,17 +337,17 @@ class AgentRuntime:
                 
                 self.store = AsyncPostgresStore(self.pool)
                 await self.store.setup()
-                print(f"Using Postgres backend: {DB_URI[:30]}...")
+                print(f"Using Postgres backend: {DB_URI[:30]}...", flush=True)
                 return
             except Exception as e:
-                print(f"Postgres unreachable ({e}), falling back to local SQLite: {LOCAL_DB_PATH}")
+                print(f"Postgres unreachable ({e}), falling back to local SQLite: {LOCAL_DB_PATH}", flush=True)
                 if self.pool is not None:
                     try:
                         await self.pool.close()
                     except Exception:
                         pass
-                    self.pool = None
-        
+                self.pool = None
+
         # --- Fallback: local SQLite (same file, two tables - checkpoints + store) ---
         # This mirrors Postgres pattern: one server/file, separate tables for saver vs store.
         # Reuses same self.checkpointer / self.store variables, just different backend.
@@ -372,7 +372,7 @@ class AgentRuntime:
         
         self.store = AsyncSqliteStore(conn_store)
         await self.store.setup()
-        print(f"Using local SQLite backend: {LOCAL_DB_PATH}")
+        print(f"Using local SQLite backend: {LOCAL_DB_PATH}", flush=True)
     
     async def _create_agent(self):
         """Create the LangChain agent with all middleware."""
