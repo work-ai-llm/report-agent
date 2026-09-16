@@ -178,6 +178,29 @@ class RealCheckpointerAdapter:
         self._saver = saver
         self._checkpoint_ns = checkpoint_ns
 
+    def _next_blob_version(self, thread_id: str) -> int:
+        """Return the next ``messages`` blob version for a thread.
+
+        Blob version numbers must be strictly increasing per
+        ``(thread_id, checkpoint_ns, channel)``: the ``checkpoint_blobs``
+        table's upsert uses ``ON CONFLICT DO NOTHING`` on that key, so a reused
+        version would silently keep the OLD blob (the "messages disappear"
+        bug).  Derive the next number from the CURRENT checkpoint's
+        ``channel_versions`` so it stays correct across adapter instances (a
+        per-instance counter would reset and collide).
+        """
+        async def _get() -> Optional[Any]:
+            return await self._saver.aget_tuple(self._config(thread_id))
+
+        tup = self._runner.run(_get())
+        if tup is not None and tup.checkpoint is not None:
+            base = (tup.checkpoint.get("channel_versions") or {}).get("messages", 0)
+            try:
+                return int(base) + 1
+            except (TypeError, ValueError):
+                return 1
+        return 1
+
     def _config(self, thread_id: str) -> Dict[str, Any]:
         return {
             "configurable": {
@@ -199,12 +222,13 @@ class RealCheckpointerAdapter:
     def put(self, thread_id: str, state: Dict[str, Any]) -> None:
         messages = list(state.get("messages", []))
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        ver = self._next_blob_version(thread_id)
         checkpoint = {
             "v": 1,
             "ts": ts,
             "id": "ui",
             "channel_values": {"messages": messages},
-            "channel_versions": {"messages": 1},
+            "channel_versions": {"messages": ver},
             "versions_seen": {},
             "pending_sends": [],
         }
@@ -216,7 +240,7 @@ class RealCheckpointerAdapter:
                 self._config(thread_id),
                 checkpoint,
                 {"source": "ui"},
-                new_versions={"messages": 1},
+                new_versions={"messages": ver},
             )
 
         self._runner.run(_put())
@@ -280,8 +304,19 @@ class RealFileStoreAdapter:
             return "\n".join(content)
         return str(content)
 
+    @staticmethod
+    def _norm(path: str) -> str:
+        """Normalize a virtual path so UI and agent keys always agree.
+
+        The agent's ``StoreBackend`` writes keys WITH a leading slash
+        (``/context/interpretations/recon.md`` -> ``/interpretations/...``),
+        while the UI writes keys WITHOUT one (``findings/b.txt``).  Strip the
+        leading slash so both conventions address the same store entry.
+        """
+        return path.lstrip("/")
+
     def read_file(self, path: str) -> Optional[bytes]:
-        item = self._runner.run(self._store.aget(_NAMESPACE, path))
+        item = self._runner.run(self._store.aget(_NAMESPACE, self._norm(path)))
         if item is None:
             return None
         value = item.value or {}
@@ -292,20 +327,26 @@ class RealFileStoreAdapter:
         value = {"content": self._to_text(content), "encoding": "utf-8"}
 
         async def _write() -> None:
-            await self._store.aput(_NAMESPACE, path, value)
+            await self._store.aput(_NAMESPACE, self._norm(path), value)
 
         self._runner.run(_write())
 
     def list_files(self, prefix: str = "") -> List[str]:
         items = self._runner.run(self._store.asearch(_NAMESPACE, limit=10000))
-        return sorted(item.key for item in items if item.key.startswith(prefix))
+        prefix = self._norm(prefix)
+        return sorted(
+            self._norm(item.key)
+            for item in items
+            if self._norm(item.key).startswith(prefix)
+        )
 
     def delete_file(self, path: str) -> bool:
         async def _delete() -> bool:
-            existing = await self._store.aget(_NAMESPACE, path)
+            key = self._norm(path)
+            existing = await self._store.aget(_NAMESPACE, key)
             if existing is None:
                 return False
-            await self._store.adelete(_NAMESPACE, path)
+            await self._store.adelete(_NAMESPACE, key)
             return True
 
         return self._runner.run(_delete())
@@ -478,6 +519,156 @@ class RealAgentRunnerAdapter:
 
 
 # ---------------------------------------------------------------------------
+# Mock agent adapter with persistence
+# ---------------------------------------------------------------------------
+
+class PersistingMockAdapter:
+    """Wrap ``MockAgentRunner`` to persist messages and mock tool results.
+
+    ``MockAgentRunner.run()`` yields fake events but never writes to the
+    checkpointer or the virtual filesystem.  This adapter intercepts those
+    events and after each yield:
+
+    1. Persists the accumulated message list to the checkpointer (so the
+       conversation survives page reloads and shows in the session list).
+    2. For mock tool calls, writes stub results to the virtual filesystem
+       (so ``list_findings`` / ``list_reports`` reflect mock activity).
+
+    The checkpoint is stored with ``source="ui"`` and a fixed checkpoint_id
+    (``"ui"``) matching ``RealCheckpointerAdapter.put`` semantics.
+    """
+
+    def __init__(
+        self,
+        inner: Any,
+        checkpointer: "RealCheckpointerAdapter",
+        file_store: "RealFileStoreAdapter",
+    ) -> None:
+        self._inner = inner
+        self._checkpointer = checkpointer
+        self._file_store = file_store
+
+    def set_tool_calls(self, tool_calls: list) -> None:
+        self._inner.set_tool_calls(tool_calls)
+
+    def set_final_message(self, message: str) -> None:
+        self._inner.set_final_message(message)
+
+    def run(self, message: str, thread_id: str) -> Iterator[Dict[str, Any]]:
+        # Seed with the EXISTING persisted history (so mid-stream checkpoints
+        # keep the whole conversation, not just the current turn), then append
+        # the new user message.
+        existing = (self._checkpointer.get(thread_id) or {}).get("messages", [])
+        messages: List[Dict[str, Any]] = list(existing)
+        messages.append({"role": "user", "content": message})
+
+        for event in self._inner.run(message, thread_id):
+            yield event
+            self._persist(messages, event, thread_id)
+
+    # -- internal helpers ---------------------------------------------------
+
+    def _persist(
+        self,
+        messages: List[Dict[str, Any]],
+        event: Dict[str, Any],
+        thread_id: str,
+    ) -> None:
+        event_type = event.get("type")
+
+        if event_type == "tool_call":
+            name = event.get("data", {}).get("name", "")
+            args = event.get("data", {}).get("args", {})
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"name": name, "args": args}],
+            })
+            self._write_mock_tool_result(name, args)
+
+        elif event_type == "tool_result":
+            name = event.get("data", {}).get("name", "")
+            output = event.get("data", {}).get("output", "")
+            messages.append({"role": "tool", "content": str(output), "name": name})
+
+        elif event_type == "message":
+            messages.append({"role": "assistant", "content": event.get("data", "")})
+
+        self._save_checkpoint(messages, thread_id)
+
+    def _save_checkpoint(
+        self, messages: List[Dict[str, Any]], thread_id: str
+    ) -> None:
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        ver = self._checkpointer._next_blob_version(thread_id)
+        checkpoint = {
+            "v": 1,
+            "ts": ts,
+            "id": "ui",
+            "channel_values": {"messages": list(messages)},
+            "channel_versions": {"messages": ver},
+            "versions_seen": {},
+            "pending_sends": [],
+        }
+
+        async def _put() -> None:
+            await self._checkpointer._saver.aput(
+                self._checkpointer._config(thread_id),
+                checkpoint,
+                {"source": "ui"},
+                new_versions={"messages": ver},
+            )
+
+        self._checkpointer._runner.run(_put())
+
+    def _write_mock_tool_result(
+        self, name: str, args: Dict[str, Any]
+    ) -> None:
+        """Persist a stub file for mock tool results.
+
+        ``read_file`` / ``ls`` are read-only - they must NOT overwrite the real
+        agent's files already in the store, so nothing is written for them.
+        Only tools that CREATE content (``write_file``, ``*_scan``) leave a
+        stub in the virtual filesystem.
+        """
+        def _safe(content: str) -> bytes:
+            return content.encode("utf-8")
+
+        def _norm_key(path: str) -> str:
+            # Mirror the agent's StoreBackend keys: /context/foo -> foo
+            # (leading slash handled by RealFileStoreAdapter._norm).
+            p = path.strip()
+            p = p.lstrip("/")
+            if p.startswith("context/"):
+                p = p[len("context/") :]
+            return p
+
+        try:
+            if name == "write_file":
+                path = args.get("path", "")
+                content_str = args.get("content", "")
+                if path:
+                    self._file_store.write_file(_norm_key(path), _safe(content_str))
+
+            elif name in ("nmap_scan", "nikto_scan", "nmap", "nikto"):
+                target = args.get("target") or args.get("url", "unknown")
+                ext = "nmap" if "nmap" in name else "nikto"
+                stub = (
+                    f"# Mock {name} output for {target}\n\n"
+                    f"PORT     STATE  SERVICE\n"
+                    f"22/tcp   open   ssh\n"
+                    f"80/tcp   open   http\n"
+                    f"443/tcp  open   https\n"
+                )
+                self._file_store.write_file(
+                    f"findings/{target.replace('.', '_')}_{ext}.txt",
+                    _safe(stub),
+                )
+        except Exception:
+            pass  # mock tool stubs must never break the stream
+
+
+# ---------------------------------------------------------------------------
 # Lifecycle helpers
 # ---------------------------------------------------------------------------
 
@@ -574,14 +765,23 @@ def build_real_backend_service(
 
         agent_runner = MockAgentRunner(delay_seconds=0.35)
         agent_runner.set_tool_calls([
-            {"name": "ls", "args": {"path": "/context/"}},
+            {"name": "ls", "args": {"path": "/context/interpretations/"}},
             {"name": "read_file", "args": {"path": "/context/interpretations/recon.md"}},
+            {"name": "write_file", "args": {"path": "/reports/r.md", "content": "# Recon Report (mock)\n\nGenerated by the mock agent during partial mode.\n"}},
         ])
+        checkpointer = RealCheckpointerAdapter(
+            runner, runtime.checkpointer, checkpoint_ns=_UI_CHECKPOINT_NS
+        )
+        file_store = RealFileStoreAdapter(runner, runtime.store)
         return PenTestAgentService(
             thread_id=thread_id,
-            checkpointer=RealCheckpointerAdapter(runner, runtime.checkpointer),
-            file_store=RealFileStoreAdapter(runner, runtime.store),
-            agent_runner=agent_runner,
+            checkpointer=checkpointer,
+            file_store=file_store,
+            # PersistingMockAdapter makes the in-memory mock runner durable:
+            # each streamed event is written to the checkpointer AND mock tool
+            # results land in the virtual filesystem, so sessions survive page
+            # reloads and show up in the sidebar session list.
+            agent_runner=PersistingMockAdapter(agent_runner, checkpointer, file_store),
         )
 
     if runtime.agent is None:
