@@ -10,6 +10,9 @@ from pathlib import Path
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    # Windows console defaults to cp1252 which crashes on emoji/unicode → force UTF-8
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 # Adjust path to import the store and agent
 sys.path.append(str(Path(__file__).parent.parent))
@@ -18,9 +21,9 @@ from agent.report_agent import runtime
 # No pool/store created at import - reused from runtime (same file as AgentRuntime LOCAL_DB_PATH)
 # via await runtime._init_pool() in main(). No extra pool.
 
-async def _ensure_runtime_store():
+async def _ensure_runtime_store(force_sqlite: bool = False):
     if runtime.store is None or runtime.checkpointer is None:
-        await runtime._init_pool()
+        await runtime._init_pool(force_sqlite=force_sqlite)
 
 async def seed_store(local_dir: Path):
     print(f"Seeding virtual filesystem from {local_dir}...")
@@ -374,6 +377,8 @@ Examples:
         epilog=examples,
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
+    parser.add_argument("--sqlite", action="store_true",
+                        help="Force local SQLite backend (skip Postgres), even when POSTGRES_URI is set/reachable.")
     subparsers = parser.add_subparsers(dest="command", help="Available commands")
 
     p_seed = subparsers.add_parser("seed", help="Seed the virtual filesystem from a local directory")
@@ -403,7 +408,7 @@ Examples:
     args = parser.parse_args()
 
     # Ensure runtime store/checkpointer ready (no LLM needed for store/session inspect)
-    await _ensure_runtime_store()
+    await _ensure_runtime_store(force_sqlite=args.sqlite)
 
     if args.command == "seed":
         await seed_store(args.dir)
