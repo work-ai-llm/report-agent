@@ -88,68 +88,53 @@ async def inspect_store(namespace_str: str, show_size: bool, show_dates: bool, p
                 print(f"  Preview: {preview}...")
         print("")
 
-async def _fetch_thread_ids(max_threads: int) -> list[str]:
-    """Run the lightweight DISTINCT thread_id scan on the ACTIVE backend."""
+async def _latest_thread_ids() -> list[str]:
+    """Return ALL thread_ids, newest first, via one SQL request.
+
+    ``checkpoint_id`` embeds a sortable timestamp, so MAX() = most recent
+    activity. The caller slices/trims to what it displays and uses len() for
+    the real total - the CLI only ever ``alist``-scans the handful of sessions
+    it prints, never the whole table.
+    """
     # Postgres: psycopg async pool, dict_row row factory.
     if runtime.pool is not None:
         async with runtime.pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT DISTINCT thread_id FROM checkpoints "
-                    "ORDER BY thread_id LIMIT %s",
-                    (max_threads,),
+                    "SELECT thread_id, MAX(checkpoint_id) AS last_id "
+                    "FROM checkpoints GROUP BY thread_id "
+                    "ORDER BY last_id DESC"
                 )
                 rows = await cur.fetchall()
-        return sorted(str(row["thread_id"]) for row in rows)
+        return [str(row["thread_id"]) for row in rows]
 
     # SQLite fallback: the checkpointer's own aiosqlite connection points at
     # the ACTIVE local file (LOCAL_DB_PATH), so no hardcoded path is needed.
     if runtime.checkpointer is not None and hasattr(runtime.checkpointer, "conn"):
         async with runtime.checkpointer.conn.execute(
-            "SELECT DISTINCT thread_id FROM checkpoints "
-            "ORDER BY thread_id LIMIT ?",
-            (max_threads,),
+            "SELECT thread_id, MAX(checkpoint_id) AS last_id "
+            "FROM checkpoints GROUP BY thread_id "
+            "ORDER BY last_id DESC"
         ) as cur:
             rows = await cur.fetchall()
-        return sorted(str(row[0]) for row in rows)
+        return [str(row[0]) for row in rows]
 
     return []
-
-
-async def _active_thread_ids(max_threads: int = 5000) -> list[str]:
-    """Distinct thread_ids from the ACTIVE checkpointer, failing fast.
-
-    The old implementation read ``LOCAL_DB_PATH`` directly with aiosqlite and
-    plain ``SELECT DISTINCT thread_id FROM checkpoints``, which only ever
-    reflected the SQLite fallback (stale/empty when the runtime is on Postgres).
-    A later attempt used ``checkpointer.alist(None)`` but that is an *unbounded*
-    full-table scan of every namespace that deserializes + de-blobs every
-    checkpoint row - far too slow to enumerate sessions on a busy Postgres DB
-    (that is exactly why ``list-sessions`` hung with a Postgres backend).
-
-    Instead, run the distinct scan directly on the ACTIVE backend and bound the
-    wait so a down/slow pool surfaces an error instead of hanging the CLI.
-    """
-    try:
-        return await asyncio.wait_for(_fetch_thread_ids(max_threads), timeout=15.0)
-    except asyncio.TimeoutError:
-        raise RuntimeError(
-            "timed out waiting for a checkpointer connection - is Postgres "
-            "reachable? (check your Tailscale/VPN and psql)"
-        ) from None
 
 async def list_sessions():
     """List all thread_ids chronologically with created/last timestamps."""
     print("Listing sessions in checkpointer chronologically...", flush=True)
     try:
-        tids = await _active_thread_ids()
+        # ONE SQL request returns ALL thread_ids newest-first; total = len().
+        # Only then do we slice the newest N and alist-scan just those, so the
+        # CLI knows the real total without ever scanning every thread.
+        tids = await _latest_thread_ids()
+        total = len(tids)
         if not tids:
             print("No sessions found.")
             return
         sessions = []
-        total = len(tids)
-        for i, tid in enumerate(tids, 1):
-            print(f"  scanning session {i}/{total} ...", flush=True)
+        for tid in tids[:10]:
             try:
                 async def _fetch_ckpts():
                     return [t async for t in runtime.checkpointer.alist(
@@ -174,8 +159,8 @@ async def list_sessions():
                 sessions.append((tid, first_ts, last_ts, len(msgs), step))
             except Exception as e:
                 sessions.append((tid, None, None, 0, f"error:{e}"))
-        # Sort chronologically by created ts (ISO strings sort correctly)
-        sessions.sort(key=lambda x: x[1] or "")
+        # Sort by created ts: newest FIRST (ISO strings sort correctly, reversed)
+        sessions.sort(key=lambda x: x[1] or "", reverse=True)
         def _explain_ts(ts: str) -> str:
             # 2026-08-25T16:05:27.221455+00:00 -> 2026 year - 08 month - 25 day T 16 hour:05 minute:27 second .221455 microseconds +00:00 UTC
             if not ts or ts == "unknown":
@@ -205,8 +190,13 @@ async def list_sessions():
                 return f" (Date {year}:{month}:{day}, Time {hour}:{minute}, {second} seconds, {micro})"
             except Exception:
                 return ""
-        print(f"Found {len(sessions)} session(s) (chronological):")
-        for tid, created, last, msg_count, step in sessions:
+        MAX_SHOWN = 10
+        if total > MAX_SHOWN:
+            print(f"Found {total} session(s) total - this tool currently lists only the "
+                  f"LATEST {MAX_SHOWN} (newest first):")
+        else:
+            print(f"Found {total} session(s) (newest first):")
+        for tid, created, last, msg_count, step in sessions[:MAX_SHOWN]:
             print(f" - {tid}")
             print(f"   created: {created or 'unknown'}{_explain_ts(created) if created else ''}")
             print(f"   last message: {last or 'unknown'}{_explain_ts(last) if last else ''}")
