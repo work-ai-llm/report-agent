@@ -1,4 +1,5 @@
 .env
+dev_tools/.model_server_state.json
 
 # local SQLite fallback (single file, WAL aux files)
 agent_session.db
