@@ -147,6 +147,9 @@ def _show_running(running: dict):
         status = info.get("status", "?")
         print(f"  {name:14s} port={info.get('port')} gpu={gpu} ctx={ctx}  "
               f"cache_k={ctk} cache_v={ctv}  idle_left={idle}s status={status}")
+        note = info.get("ctx_note")
+        if note:
+            print(f"  ! ctx: {note}")
 
 
 def _show_available(available: dict):
@@ -211,10 +214,13 @@ def cmd_launch(args):
     if args.ctv:
         payload["ctv"] = args.ctv
     r = requests.post(f"{_server_url(args)}/launch", json=payload, timeout=args.timeout)
-    if r.status_code == 422:
-        print(f"ERROR: {r.json().get('detail', r.text)}")
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("detail", r.text)
+        except Exception:
+            detail = r.text
+        print(f"ERROR: {detail}")
         sys.exit(1)
-    r.raise_for_status()
     data = r.json()
     state = _load_state()
     secret = (args.secret or data.get("secret") or data.get("secret_key") or "").strip()
@@ -234,6 +240,9 @@ def cmd_launch(args):
     _save_state(state)
     print(f"Launched '{args.model}':")
     print(json.dumps(data, indent=2))
+    note = data.get("ctx_note")
+    if note:
+        print(f"\nWARNING: {note}")
     if port and not args.endpoint:
         print(f"\nDirect llama-server endpoint (if reachable): "
               f"http://{_server_url(args).split('//')[1].split(':')[0]}:{port}/v1")
@@ -317,10 +326,13 @@ def cmd_estimate(args):
     if args.model:
         params["model"] = args.model
     r = requests.get(f"{_server_url(args)}/estimate", params=params, timeout=args.timeout)
-    if r.status_code == 422:
-        print(f"ERROR: {r.json().get('detail', r.text[:500])}")
+    if r.status_code != 200:
+        try:
+            detail = r.json().get("detail", r.text[:500])
+        except Exception:
+            detail = r.text[:500]
+        print(f"ERROR: {detail}")
         sys.exit(1)
-    r.raise_for_status()
     data = r.json()
     single = bool(data.get("model"))
     notes = data.get("field_notes", {})
