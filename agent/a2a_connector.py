@@ -1,5 +1,7 @@
 import sys
 import asyncio
+import os
+import socket
 
 # NOTE, this fix loop creation for postgres async connection ONLY if you make "uvicorn<0.36.0"
 if sys.platform == "win32":
@@ -331,6 +333,26 @@ async def lifespan(app: Starlette):
 # ==========================================
 # 2. Setup and Run the A2A Server
 # ==========================================
+def _resolve_lan_ip() -> str:
+    """LAN IP to advertise in the agent card.
+
+    Priority: A2A_HOST env override, else auto-detected outbound-interface IP
+    (UDP trick, no traffic sent), else loopback. Auto-detect keeps working
+    across Wi-Fi changes where a hardcoded IP would fail to bind.
+    """
+    override = (os.getenv("A2A_HOST") or "").strip()
+    if override:
+        return override
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 def main():
 
     # Define the agent's skills (capabilities)
@@ -344,9 +366,11 @@ def main():
         examples=['Generate a report from the uploaded findings.', 'Analyze the attached port scan results.'],
     )
 
-    # DEFINE YOUR LOCAL NETWORK IP HERE
-    LOCAL_IP = "192.168.0.107"
-    PORT = 9999
+    # Bind address: configurable via A2A_HOST/A2A_PORT, auto-detected by default.
+    # The socket binds 0.0.0.0 (all interfaces) so Wi-Fi IP changes can't break
+    # startup; LOCAL_IP is only what we advertise in the agent card.
+    LOCAL_IP = _resolve_lan_ip()
+    PORT = int(os.getenv("A2A_PORT", "9999"))
     
     # Define the public-facing Agent Card
     public_agent_card = AgentCard(
@@ -384,11 +408,12 @@ def main():
 
     app = Starlette(routes=routes, lifespan=lifespan)
 
-    print(f"A2A Server running at http://{LOCAL_IP}:{PORT}")
+    print(f"A2A Server running at http://{LOCAL_IP}:{PORT} (listening on 0.0.0.0:{PORT})")
     print(f"Agent Card available at: http://{LOCAL_IP}:{PORT}/.well-known/agent-card.json")
-    
-    # CRITICAL: host='0.0.0.0' allows connections from the local network
-    uvicorn.run(app, host=LOCAL_IP, port=PORT)
+
+    # Bind all interfaces so the server survives Wi-Fi/IP changes;
+    # clients can use the advertised LAN IP or 127.0.0.1 locally.
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
     main()

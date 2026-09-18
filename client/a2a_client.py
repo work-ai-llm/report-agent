@@ -326,7 +326,10 @@ class A2AClient:
 
         stream = self.client.send_message(request)
         task_id, context_id, artifact = await self._process_stream(stream, label=f"{label}  ")
-        return task_id, context_id, artifact
+        # Fallback to the id we sent: the server echoes message.context_id, so
+        # when chunk parsing yields nothing we still return a usable context
+        # (mirrors send_message above; without this, follow-ups start new threads).
+        return task_id, context_id or generated_context_id, artifact
 
     async def subscribe_to_task(self, task_id, label=""):
         """3.1.6 SubscribeToTask — resubscribe to task event stream.

@@ -1,4 +1,5 @@
 import argparse
+import os
 import requests
 import uuid
 import json
@@ -18,8 +19,8 @@ from google.protobuf.json_format import MessageToDict
 
 load_dotenv()
 
-# Use your local network IP where the server is running
-SERVER_URL = 'http://192.168.0.107:9999'
+# Server address: override with A2A_SERVER_URL env (server prints its address on start)
+SERVER_URL = os.getenv("A2A_SERVER_URL", "http://127.0.0.1:9999")
 
 # Import store CLI functions directly from your existing tool
 from dev_tools.store_cli import seed_store, inspect_store, delete_file
@@ -287,6 +288,10 @@ async def run_test_3(client):
     print("Check Langfuse to see if these were processed concurrently or queued.")
     print("\n[TEST 3 COMPLETE]")
 
+# NOTE (historical): run_test_4 / run_test_5 below won't work with the
+# current test setup (raw SDK helpers + pre-client assumptions).
+# The working version is in tests/acceptance/7_a2a_client_acceptance.py.
+# These tests are preserved for historical reasons.
 async def run_test_4(client):
     print("\n" + "="*60)
     print("[TEST 4] Sequential Execution Stress Test (Multiple Concurrent Tasks)")
@@ -317,6 +322,9 @@ async def run_test_4(client):
 
 # ==========================================
 # TEST 5: Concurrency & Client Drop (Refactored)
+# NOTE (historical): won't work with the current test setup.
+# The working version is in tests/acceptance/7_a2a_client_acceptance.py.
+# Preserved for historical reasons.
 # ==========================================
 async def run_test_5(client):
     print("\n" + "="*60)
@@ -382,6 +390,9 @@ from a2a.types.a2a_pb2 import SubscribeToTaskRequest # Import the specific reque
 
 # ==========================================
 # TEST 5: Advanced Lifecycle (Drop, Zombie, Subscribe & Get)
+# NOTE (historical): won't work with the current test setup
+# (references removed A2ATaskService). The working version is in
+# tests/acceptance/7_a2a_client_acceptance.py. Preserved for historical reasons.
 # ==========================================
 async def run_test_5(client):
     print("\n" + "="*60)
