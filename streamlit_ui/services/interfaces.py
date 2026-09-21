@@ -150,6 +150,7 @@ class AgentRunnerProtocol(Protocol):
     ## Event Types
     - `tool_call`: Agent is invoking a tool (shows tool name + arguments)
     - `tool_result`: Tool execution completed (shows result preview)
+    - `token`: Live text delta while the model generates
     - `message`: Final agent response to display to user
     """
     
@@ -162,7 +163,7 @@ class AgentRunnerProtocol(Protocol):
             
         Yields:
             Event dictionaries with structure:
-            - type: "tool_call" | "tool_result" | "message"
+            - type: "tool_call" | "tool_result" | "token" | "message"
             - data: Event-specific payload
             
         Example:

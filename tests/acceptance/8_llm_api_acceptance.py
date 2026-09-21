@@ -2,11 +2,20 @@
 LLM API acceptance tests for the report agent (v2).
 
 Runs against a local llama.cpp model server (see dev_tools/model_server_cli.py).
-Every test forces the local SQLite backend, so afterwards the sessions can be
-inspected without any LLM call:
+The backend is selected with ``--backend sqlite|postgres`` (default sqlite):
 
-  python dev_tools/store_cli.py --sqlite list-sessions
-  python dev_tools/store_cli.py --sqlite inspect-session --thread-id <thread_id>
+  python tests/acceptance/8_llm_api_acceptance.py --backend sqlite
+  python tests/acceptance/8_llm_api_acceptance.py --backend postgres
+
+Afterwards the sessions can be inspected without any LLM call - the same
+thread ids work on both backends because each store is independent:
+
+  python dev_tools/store_cli.py --sqlite list-sessions                      # sqlite run
+  python dev_tools/store_cli.py --sqlite inspect-session --thread-id <id>   # sqlite run
+  python dev_tools/store_cli.py list-sessions                               # postgres run
+  python dev_tools/store_cli.py inspect-session --thread-id <id>            # postgres run
+
+A postgres run that silently falls back to SQLite is reported and FAILS.
 
 Tests:
   1. Smoke: a single "hi" turn.  Fastest possible "is the LLM endpoint even
@@ -128,13 +137,28 @@ async def run_vfs_tool_check(rt) -> bool:
     return ok
 
 
-async def run_all() -> bool:
+async def run_all(backend: str = "sqlite") -> bool:
     from agent.report_agent import AgentRuntime
 
     rt = AgentRuntime()
-    await rt.initialize(debug_mode=True, force_sqlite=True)
+    await rt.initialize(debug_mode=True, force_sqlite=(backend == "sqlite"))
+
+    # -- Backend verification ------------------------------------------------
+    # report_agent._init_pool() silently FALLS BACK to SQLite when Postgres is
+    # unreachable. A requested "postgres" run that landed on SQLite is NOT a
+    # passing test, so detect it here and fail explicitly.
+    selected = type(rt.checkpointer).__name__
+    if backend == "postgres":
+        backend_ok = rt.pool is not None
+        print(f"[backend] requested=postgres selected={selected} "
+              f"({'PASS' if backend_ok else 'FAIL - Postgres unreachable, runtime fell back to SQLite!'})")
+    else:
+        backend_ok = rt.pool is None
+        print(f"[backend] requested=sqlite   selected={selected} "
+              f"({'PASS' if backend_ok else 'FAIL - Postgres unexpectedly used'})")
 
     results = {
+        "0. backend": backend_ok,
         "1. smoke (hi)": await run_smoke(rt),
         "2a. system prompt loaded": await run_system_prompt_check(rt),
         "2b. vfs tool calling": await run_vfs_tool_check(rt),
@@ -161,11 +185,26 @@ async def run_all() -> bool:
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="LLM API acceptance test for the report agent (v2) - drives "
+                    "the real AgentRuntime against a local llama.cpp model server."
+    )
+    parser.add_argument(
+        "--backend", choices=["sqlite", "postgres"], default="sqlite",
+        help="Checkpointer backend to run against. sqlite = local "
+             "agent/agent_session.db (override with REPORT_AGENT_DB_PATH); "
+             "postgres = .env POSTGRES_URI. The run FAILS (exit 1) if postgres "
+             "was requested but the runtime silently fell back to SQLite.",
+    )
+    args = parser.parse_args()
+
     print("=" * 60)
     print("STARTING LLM API ACCEPTANCE TEST (v2)")
+    print(f"backend: {args.backend}")
     print("=" * 60)
     try:
-        ok = asyncio.run(run_all())
+        ok = asyncio.run(run_all(args.backend))
         print(f"ALL TESTS {'PASSED' if ok else 'FAILED'}")
         sys.exit(0 if ok else 1)
     except KeyboardInterrupt:

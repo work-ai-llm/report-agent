@@ -390,6 +390,12 @@ class AgentRuntime:
             force_sqlite: When True, bypasses Postgres entirely and uses local SQLite
                           even when POSTGRES_URI is configured and reachable.
         """
+        # Env override so any caller (Streamlit UI launch, scripts, tests) can
+        # force the local backend without making Postgres unreachable or editing
+        # .env - in cmd `set POSTGRES_URI=` would UNSET the var and let .env win:
+        #   set REPORT_AGENT_FORCE_SQLITE=1
+        if not force_sqlite:
+            force_sqlite = os.getenv("REPORT_AGENT_FORCE_SQLITE", "").strip().lower() in ("1", "true", "yes")
         # Legacy code: sync pool implementation (just a reminder for devs)
         # """self.pool = ConnectionPool(
         #     conninfo=DB_URI,

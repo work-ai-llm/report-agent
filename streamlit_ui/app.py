@@ -124,6 +124,8 @@ python -m streamlit_ui --debug run streamlit_ui/app.py  # prints debug report
 """
 
 import os
+import time
+
 import streamlit as st
 from typing import Optional, Callable, List, Dict, Any
 from streamlit_ui.services.agent_service import PenTestAgentService
@@ -503,7 +505,22 @@ def render_main_chat(service: PenTestAgentService) -> None:
             # below them so the answer text appears underneath the expanders.
             tool_events: List[Dict[str, Any]] = []
             full_response = ""
-            
+            # Live token streaming: "token" events arrive per model delta; we
+            # render them into a placeholder with light throttling so long
+            # replies don't re-render Streamlit on every single token.
+            stream_ph: Optional[Any] = None
+            stream_acc = ""
+            flushed_len = 0
+            last_flush = 0.0
+
+            def _flush_stream() -> None:
+                nonlocal flushed_len, last_flush
+                now = time.monotonic()
+                if now - last_flush >= 0.12 or (len(stream_acc) - flushed_len) >= 24:
+                    stream_ph.markdown(f"{stream_acc}▌")
+                    flushed_len = len(stream_acc)
+                    last_flush = now
+
             # Process streaming events
             for event in service.send_message(prompt):
                 if event["type"] == "tool_call":
@@ -511,9 +528,30 @@ def render_main_chat(service: PenTestAgentService) -> None:
                     args = event["data"]["args"]
                     tool_events.append({"type": "tool_call", "name": name, "args": args})
                     render_tool_call(name, args)
+                elif event["type"] == "tool_result":
+                    name = event["data"].get("name", "")
+                    output = event["data"].get("output", "")
+                    # Attach the result to the oldest tool_call still awaiting
+                    # one (FIFO, matches tool-call execution order), so the
+                    # persisted history keeps args + results (store_cli reads
+                    # them) without breaking chat rendering.
+                    for te in tool_events:
+                        if te.get("type") == "tool_call" and "result" not in te:
+                            te["result"] = str(output)
+                            break
+                    if output:
+                        st.caption(f"✅ {name} → {str(output)[:120]}")
+                elif event["type"] == "token":
+                    stream_acc += event["data"]
+                    if stream_ph is None:
+                        stream_ph = st.empty()
+                    _flush_stream()
                 elif event["type"] == "message":
                     full_response = event["data"]
-                    st.write(full_response)
+                    if stream_ph is not None:
+                        stream_ph.markdown(full_response or stream_acc)
+                    else:
+                        st.write(full_response)
             
             # Persist tool calls + assistant reply as structured entries
             if tool_events or full_response:

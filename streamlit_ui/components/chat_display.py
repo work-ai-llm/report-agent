@@ -16,7 +16,7 @@ Agent Event → render_tool_call() / render_message() → Streamlit UI Element
 - render_chat_history(): Renders a full conversation from persisted history
 """
 
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import streamlit as st
 
 
@@ -41,7 +41,7 @@ def render_message(role: str, content: str) -> None:
         st.chat_message("assistant").write(content)
 
 
-def render_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> None:
+def render_tool_call(tool_name: str, tool_args: Dict[str, Any], tool_result: Optional[str] = None) -> None:
     """Render a tool call visualization with expandable details.
     
     Displays tool invocation in a formatted box showing:
@@ -74,6 +74,9 @@ def render_tool_call(tool_name: str, tool_args: Dict[str, Any]) -> None:
     """
     with st.expander(f"🔧 Calling tool: **{tool_name}**", expanded=False):
         st.json(tool_args)
+        if tool_result:
+            st.markdown("**Result:**")
+            st.code(str(tool_result), language=None)
 
 
 def render_chat_history(messages: List[Dict[str, Any]]) -> None:
@@ -105,7 +108,11 @@ def render_chat_history(messages: List[Dict[str, Any]]) -> None:
             # Collect a group: leading tool_calls + one assistant message
             with st.chat_message("assistant"):
                 while i < len(messages) and messages[i].get("type") == "tool_call":
-                    render_tool_call(messages[i]["name"], messages[i]["args"])
+                    render_tool_call(
+                        messages[i]["name"],
+                        messages[i]["args"],
+                        messages[i].get("result"),
+                    )
                     i += 1
                 if i < len(messages) and messages[i].get("type") == "assistant":
                     st.write(messages[i]["content"])

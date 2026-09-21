@@ -258,6 +258,16 @@ class RealCheckpointerAdapter:
             # Only the UI writes metadata {"source": "ui"} (see put()), so scope
             # the scan to UI sessions; LIMIT keeps it bounded regardless of
             # backend. Works on SQLite (json_extract) and Postgres (metadata @>).
+            # NOTE(perf, parked): on Postgres this `metadata @>` filter is a
+            # full-table jsonb seq-scan (~0.5-0.6s per call over Tailscale, ~13s
+            # on a cold pool). A GIN index on the JSONB column turns it into an
+            # index scan:
+            #   CREATE INDEX IF NOT EXISTS idx_checkpoints_metadata_gin
+            #     ON checkpoints USING GIN (metadata);
+            # This adds a SEPARATE index only - the checkpointer's table/schema
+            # stays untouched, no column added, row format unchanged, fully
+            # reversible (DROP INDEX). Deliberately not applied yet (parked in
+            # the acceptance-test plan); revisit before scaling session counts.
             async for tup in self._saver.alist(None, filter={"source": "ui"}, limit=1000):
                 tid = tup.config["configurable"]["thread_id"]
                 thread_ids.add(tid)
@@ -306,17 +316,26 @@ class RealFileStoreAdapter:
 
     @staticmethod
     def _norm(path: str) -> str:
-        """Normalize a virtual path so UI and agent keys always agree.
-
-        The agent's ``StoreBackend`` writes keys WITH a leading slash
-        (``/context/interpretations/recon.md`` -> ``/interpretations/...``),
-        while the UI writes keys WITHOUT one (``findings/b.txt``).  Strip the
-        leading slash so both conventions address the same store entry.
-        """
+        """Strip a leading ``/`` for display/prefix purposes only."""
         return path.lstrip("/")
 
+    @staticmethod
+    def _key(path: str) -> str:
+        """Canonical store key (slash-prefixed, matching the agent's StoreBackend).
+
+        Files routed through ``/context/`` land in the store keyed WITH a
+        leading slash (``/findings/nmap.txt``).  The UI used to strip it, so
+        UI uploads were invisible to the agent and agent-written reports were
+        listed in the selector but unreadable.  Always write the slash form;
+        reads try slash first with a legacy no-slash fallback so old rows
+        still resolve.
+        """
+        return "/" + path.lstrip("/")
+
     def read_file(self, path: str) -> Optional[bytes]:
-        item = self._runner.run(self._store.aget(_NAMESPACE, self._norm(path)))
+        item = self._runner.run(self._store.aget(_NAMESPACE, self._key(path)))
+        if item is None:
+            item = self._runner.run(self._store.aget(_NAMESPACE, self._norm(path)))
         if item is None:
             return None
         value = item.value or {}
@@ -327,7 +346,7 @@ class RealFileStoreAdapter:
         value = {"content": self._to_text(content), "encoding": "utf-8"}
 
         async def _write() -> None:
-            await self._store.aput(_NAMESPACE, self._norm(path), value)
+            await self._store.aput(_NAMESPACE, self._key(path), value)
 
         self._runner.run(_write())
 
@@ -342,12 +361,18 @@ class RealFileStoreAdapter:
 
     def delete_file(self, path: str) -> bool:
         async def _delete() -> bool:
-            key = self._norm(path)
+            key = self._key(path)
             existing = await self._store.aget(_NAMESPACE, key)
-            if existing is None:
-                return False
-            await self._store.adelete(_NAMESPACE, key)
-            return True
+            if existing is not None:
+                await self._store.adelete(_NAMESPACE, key)
+                return True
+            legacy = self._norm(path)
+            if legacy != key:
+                existing = await self._store.aget(_NAMESPACE, legacy)
+                if existing is not None:
+                    await self._store.adelete(_NAMESPACE, legacy)
+                    return True
+            return False
 
         return self._runner.run(_delete())
 
@@ -484,11 +509,25 @@ class RealAgentRunnerAdapter:
             _updates = 0
             try:
                 _print(f"[AGENT STREAM]: calling astream() at t={_ts()}")
-                astream_iter = self._agent.astream(stream_input, config=config)
+                # stream_mode=["messages", "updates"]: the "messages" channel
+                # yields per-token AIMessageChunk deltas (live streaming) while
+                # "updates" still delivers whole-step node diffs for tool calls
+                # and results. Checkpointing is unaffected by the stream mode.
+                astream_iter = self._agent.astream(
+                    stream_input, config=config, stream_mode=["messages", "updates"]
+                )
                 _print(f"[AGENT STREAM]: astream() returned iterator at t={_ts()}, type={type(astream_iter).__name__}")
                 _print(f"[AGENT STREAM]: entering async for loop at t={_ts()}")
                 async for update in astream_iter:
                     _updates += 1
+                    if isinstance(update, tuple) and len(update) == 2:
+                        # (AIMessageChunk, metadata) from the "messages" channel.
+                        message_chunk, _meta = update
+                        if isinstance(message_chunk, AIMessageChunk):
+                            delta = getattr(message_chunk, "content", "")
+                            if isinstance(delta, str) and delta:
+                                events.put({"type": "token", "data": delta})
+                        continue
                     _print(
                         f"[AGENT STREAM]: update#{_updates} t={_ts()} "
                         f"keys={list(update) if isinstance(update, dict) else type(update).__name__}"
