@@ -290,6 +290,13 @@ async def inspect_session_store(thread_id: str):
                     print(f"  name: {name}")
                 if tool_call_id:
                     print(f"  tool_call_id: {tool_call_id}")
+                # Flat UI format carries args/result directly on the dict
+                if isinstance(m, dict):
+                    if m.get("args"):
+                        print(f"  args: {m.get('args')}")
+                    if m.get("result"):
+                        result_preview = str(m.get("result"))
+                        print(f"  result: {result_preview[:400]}{'...' if len(result_preview) > 400 else ''}")
                 # Print content in full (no truncation)
                 if content.strip():
                     print(content)
@@ -314,7 +321,10 @@ async def inspect_session_store(thread_id: str):
 
 async def export_file(store_path: str, local_path: Path):
     print(f"Exporting '{store_path}' to '{local_path}'...")
-    item = await runtime.store.aget(("filesystem",), store_path)
+    namespace = ("filesystem",)
+    item = await runtime.store.aget(namespace, store_path)
+    if not item and not store_path.startswith("/"):
+        item = await runtime.store.aget(namespace, "/" + store_path)
     if not item:
         print(f"Error: File not found at '{store_path}' in the store.")
         return
@@ -329,10 +339,39 @@ async def delete_file(store_path: str):
     print(f"Deleting '{store_path}' from virtual filesystem...")
     namespace = ("filesystem",)
     try:
-        await runtime.store.adelete(namespace, store_path)
-        print(f"Successfully deleted '{store_path}'.\n")
+        deleted = await runtime.store.adelete(namespace, store_path)
+        if not deleted and not store_path.startswith("/"):
+            deleted = await runtime.store.adelete(namespace, "/" + store_path)
+        print(f"Successfully deleted '{store_path}'.\n" if deleted else f"Not found: '{store_path}'.\n")
     except Exception as e:
         print(f"Error deleting file: {e}\n")
+
+async def reconcile_files():
+    """Normalize filesystem keys to the agent-canonical slash form.
+
+    The agent's ``StoreBackend`` keys ``/context/...`` files with a leading
+    slash (``/findings/x``), while older UI uploads stored them without one
+    (``findings/x``).  This renames any no-slash rows to the slash form so the
+    agent (and the UI, which reads slash-first) address the same entries.
+    """
+    print("Reconciling virtual filesystem keys (no-slash -> /slash)...")
+    namespace = ("filesystem",)
+    items = await runtime.store.asearch(namespace, limit=10000)
+    changed = 0
+    for item in items:
+        key = item.key
+        if key.startswith("/"):
+            continue
+        new_key = "/" + key
+        existing = await runtime.store.aget(namespace, new_key)
+        if existing is None:
+            await runtime.store.aput(namespace, new_key, item.value)
+            print(f"  {key!r} -> {new_key!r}")
+        else:
+            print(f"  {key!r}: target {new_key!r} already exists - dropping duplicate")
+        await runtime.store.adelete(namespace, key)
+        changed += 1
+    print(f"Done: {changed} file(s) normalized. The agent can now see them under /findings | /reports | ...\n")
 
 async def main():
     examples = """
@@ -360,6 +399,9 @@ Examples:
 
   # inspect session history
   python store_cli.py inspect-session --thread-id 737280d4-4a28-4427-b851-de581174c3eb
+
+  # Normalize legacy no-slash filesystem keys to the agent's /slash form
+  python store_cli.py reconcile-files
 """
 
     parser = argparse.ArgumentParser(
@@ -395,6 +437,8 @@ Examples:
     p_session = subparsers.add_parser("inspect-session", help="Inspect full session history from checkpointer")
     p_session.add_argument("--thread-id", type=str, required=True, help="The thread_id (context_id) of the session")
 
+    p_reconcile = subparsers.add_parser("reconcile-files", help="Normalize filesystem keys to the agent's /slash form")
+
     args = parser.parse_args()
 
     # Ensure runtime store/checkpointer ready (no LLM needed for store/session inspect)
@@ -415,6 +459,8 @@ Examples:
         await delete_file(args.store_path)
     elif args.command == "inspect-session":
         await inspect_session_store(args.thread_id)
+    elif args.command == "reconcile-files":
+        await reconcile_files()
     else:
         parser.print_help()
 
