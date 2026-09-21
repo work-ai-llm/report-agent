@@ -150,6 +150,9 @@ def _show_running(running: dict):
         note = info.get("ctx_note")
         if note:
             print(f"  ! ctx: {note}")
+        s_note = info.get("streaming")
+        if s_note:
+            print(f"  ! streaming: {s_note}")
 
 
 def _show_available(available: dict):
@@ -248,6 +251,9 @@ def cmd_launch(args):
               f"http://{_server_url(args).split('//')[1].split(':')[0]}:{port}/v1")
     if secret:
         print(f"\nSaved secret + endpoint to {STATE_FILE}")
+    s_note = data.get("streaming")
+    if s_note:
+        print(f"  ! streaming: {s_note}")
 
 
 def cmd_stop(args):
@@ -422,7 +428,8 @@ def cmd_estimate(args):
     if args.json:
         print(json.dumps(data, indent=2))
 
-
+# NOTE, this seem to be broken
+# it seem to show old env state of the model launch (if you do another launch --env still shows old model and old api key)
 def cmd_endpoint(args):
     state = _load_state()
     model = args.model or next(iter(state), None)
