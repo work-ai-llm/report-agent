@@ -21,6 +21,9 @@ Usage (mock, default):
 Live (server must run via `python -m agent.a2a_connector` from repo root):
   python tests/acceptance/7_a2a_client_acceptance.py --test 3 --live
 """
+# FLAW OF THE TESTS
+# they works with 1 filesystem, hence situations of accumulating report files, that agent start seeing in further runs
+# means it would keep seeing them and can get confused.
 
 import argparse
 import asyncio
@@ -251,131 +254,129 @@ async def run_test_4_sequential_trio(client: A2AClient):
 
 
 # ------------------------------------------------------------------
-# TEST 5: simple drop (old 5-simple)
-# NOTE — REQUIRES REDESIGN (2026-09-17 live result): this test relies on the
-# old A2A assumption that dropping the streaming client stops the server
-# task. It does NOT under the lock model — the queue keeps dropped tasks and
-# they run to completion anyway (verified live: all 5 tasks went WORKING, 2
-# finished with real output, 3 had to be cancelled via API). Redesign around
-# cancel_task semantics instead of disconnect semantics.
+# TEST 5: cancel semantics (old 5-simple, redesigned 2026-09-18)
+# Design: fire 5, let 1 & 2 stream to completion, cancel 3/4/5 via API and
+# verify CANCELED. (The old disconnect-based drop is invalid under the lock
+# model — dropped client streams do NOT stop server tasks.)
 # ------------------------------------------------------------------
 async def run_test_5_simple_drop(client: A2AClient):
     print("\n" + "=" * 60)
-    print("[TEST 5] Concurrency Limit & Client Drop Simulation")
-    print("=" * 60)
-    print("Firing 5 tasks. Tasks 1 & 2 should finish; 3, 4, 5 get dropped.\n")
-
-    async def run_single_stream(task_num, text):
-        ctx_id = str(uuid.uuid4())
-        print(f"[TEST5 SENT Task {task_num:02d}]: {text}")
-        try:
-            task_id, returned_ctx, response_text = await client.send_streaming_message(
-                text, context_id=ctx_id, label=f"[Task {task_num:02d}] "
-            )
-            print(f"[Task {task_num:02d}] Finished normally. task_id={task_id}")
-            print(f"[TEST5 RECEIVED Task {task_num:02d}]: "
-                  f"{(response_text[:200] if response_text else None)}")
-            return returned_ctx, response_text
-        except asyncio.CancelledError:
-            print(f"[Task {task_num:02d}] !!! CLIENT CONNECTION DROPPED (Cancelled) !!!")
-            raise
-        except Exception as e:
-            print(f"[Task {task_num:02d}] Stream ended with error: {type(e).__name__}: {e}")
-            return ctx_id, None
-
-    all_tasks = []
-    for i in range(5):
-        all_tasks.append(asyncio.create_task(
-            run_single_stream(i + 1, f"Task {i + 1}: Quick summary of recon phase.")
-        ))
-
-    print("\n--- WAITING 5 SECONDS TO LET QUEUE BUILD UP ---")
-    await asyncio.sleep(5)
-
-    print("\n--- DROPPING CLIENT CONNECTIONS FOR TASKS 3, 4, 5 ---")
-    for i in range(2, 5):
-        all_tasks[i].cancel()
-
-    print("\n--- WAITING FOR TASKS 1 & 2 TO COMPLETE ---")
-    results = await asyncio.gather(*all_tasks, return_exceptions=True)
-
-    print("\n" + "-" * 50)
-    print("--- TEST 5 RESULTS (SENT vs mock RECEIVED) ---")
-    for i, res in enumerate(results):
-        sent = f"Task {i + 1}: Quick summary of recon phase."
-        if isinstance(res, asyncio.CancelledError):
-            print(f"Task {i + 1}: DROPPED (Client disconnected) SENT={sent!r}")
-        elif isinstance(res, Exception):
-            print(f"Task {i + 1}: FAILED with {type(res).__name__} SENT={sent!r}")
-        else:
-            ctx, resp = res
-            snippet = (resp[:120].replace('\n', ' ') if resp else "No response")
-            print(f"Task {i + 1}: COMPLETED (Context: {ctx[:8]}...) "
-                  f"SENT={sent!r} RECEIVED={snippet}...")
-    print("\n[TEST 5 COMPLETE]")
-
-
-# ------------------------------------------------------------------
-# TEST 6: advanced lifecycle (old 5)
-# NOTE — REQUIRES REDESIGN (same reason as test 5): phases 2-4 assume
-# dropping background subscribers kills the server tasks ("zombie" idea from
-# the abandoned scheduler design). Under the lock model dropped tasks keep
-# running; phases 5-7 (get/cancel/subscribe/poll) are still valid and should
-# be kept in the redesign. Never run live yet — mock-only so far.
-# ------------------------------------------------------------------
-async def run_test_6_advanced_lifecycle(client: A2AClient):
-    print("\n" + "=" * 60)
-    print("[TEST 6] Advanced Lifecycle: Drop, Zombie, Subscribe & Get")
+    print("[TEST 5] Cancel Semantics (redesigned): 1 & 2 finish, 3/4/5 cancelled")
     print("=" * 60)
     service = client
 
-    print("\n[PHASE 1] Firing 5 tasks and extracting Server Task IDs...")
-    active_tasks, task_ids = {}, {}
+    print("\n[PHASE 1] Firing 5 tasks (fast IDs via single send)...")
+    task_ids = {}
     for i in range(1, 6):
-        text = f"Task {i}: Generate a quick recon summary."
-        print(f"  [SENT Task {i}]: {text}")
+        text = f"Task {i}: Quick summary of recon phase."
+        print(f"[TEST5 SENT Task {i}]: {text}")
         tid, _cid, _first = await service.send_message(text, label=f"  [Task {i} send] ")
         task_ids[i] = tid
         print(f"  -> Task {i} created. Server ID: {tid}")
 
-        async def consume(task_id=tid, num=i):
-            try:
-                await service.subscribe_to_task(task_id, label=f"  [Task {num} sub] ")
-            except asyncio.CancelledError:
-                print(f"  [Task {num}] subscriber dropped (Cancelled)")
-                raise
-            except Exception as e:
-                print(f"  [Task {num}] subscribe ended: {type(e).__name__}: {e}")
-
-        active_tasks[i] = asyncio.create_task(consume())
-
-    # Mock-shortened (live used 5s). Pass --mock-delay 1.0+ for deeper queues.
-    print("\n[PHASE 2] Letting server process briefly, then dropping 3, 4, 5...")
-    await asyncio.sleep(2)
-    for i in [3, 4, 5]:
-        active_tasks[i].cancel()
-
-    print("\n[PHASE 3] Letting Tasks 1 & 2 finish normally...")
-    for i in [1, 2]:
+    async def consume(task_id, num):
         try:
-            await active_tasks[i]
+            _tid, _cid, artifact = await service.subscribe_to_task(
+                task_id, label=f"  [Task {num} sub] "
+            )
+            print(f"[TEST5 RECEIVED Task {num}]: {(artifact[:200] if artifact else None)}")
+            return artifact
+        except asyncio.CancelledError:
+            print(f"  [Task {num}] subscriber dropped (Cancelled)")
+            raise
+        except Exception as e:
+            print(f"  [Task {num}] subscribe ended: {type(e).__name__}: {e}")
+            return None
+
+    print("\n[PHASE 2] Streaming tasks 1 & 2 to completion in background...")
+    bg = {i: asyncio.create_task(consume(task_ids[i], i)) for i in (1, 2)}
+
+    print("\n[PHASE 3] Checking state of 3/4/5, then cancelling via API...")
+    from a2a.types.a2a_pb2 import TaskState as _TS
+    for i in (3, 4, 5):
+        data = await service.get_task(task_ids[i], label="  ")
+        print(f"  -> Task {i} observed state before cancel: {int(data.status.state)}")
+        cancelled = await service.cancel_task(task_ids[i], label="  ")
+        print(f"  -> Task {i} state right after cancel: {int(cancelled.status.state)}")
+
+    print("\n[PHASE 4] Verifying 3/4/5 read back CANCELED...")
+    cancelled_ok = True
+    for i in (3, 4, 5):
+        data = await service.get_task(task_ids[i], label="  ")
+        ok = data.status.state == _TS.TASK_STATE_CANCELED
+        cancelled_ok &= bool(ok)
+        print(f"  -> Task {i} final state: {int(data.status.state)} "
+              f"({'CANCELED ok' if ok else 'NOT CANCELED'})")
+
+    print("\n[PHASE 5] Letting tasks 1 & 2 finish...")
+    for i in (1, 2):
+        try:
+            await bg[i]
         except asyncio.CancelledError:
             print(f"  -> Task {i} subscriber was cancelled unexpectedly.")
             continue
         print(f"  -> Task {i} finished normally.")
 
-    print("\n[PHASE 4] Waiting briefly for server to process 'zombie' tasks...")
-    await asyncio.sleep(2)
+    print("\n[TEST 5 COMPLETE] "
+          f"({'all cancels verified' if cancelled_ok else 'CANCEL VERIFICATION FAILED'})")
 
-    print("\n[PHASE 5] Handling Task 3 (Check status, then cancel)...")
+
+# RESULT (2026-09-18): redesigned around cancel_task; mock PASS (3/3 CANCELED
+# verified, 1 & 2 finished). Live pending.
+
+
+
+# ------------------------------------------------------------------
+# TEST 6: advanced lifecycle (old 5, redesigned 2026-09-18)
+# Design: 1 & 2 stream in background; 3/4/5 launch via single send. Then:
+# check-then-cancel 3, subscribe 4 to completion, poll 5 + retrieve. (The old
+# "drop subscribers to kill tasks" phases are gone — disconnects do not stop
+# server tasks under the lock model.)
+# ------------------------------------------------------------------
+async def run_test_6_advanced_lifecycle(client: A2AClient):
+    print("\n" + "=" * 60)
+    print("[TEST 6] Advanced Lifecycle: stream, cancel, subscribe & poll")
+    print("=" * 60)
+    service = client
+
+    async def stream_bg(num, text):
+        print(f"  [SENT Task {num} (streaming)]: {text}")
+        try:
+            tid, _cid, artifact = await service.send_streaming_message(
+                text, label=f"  [Task {num} stream] "
+            )
+            print(f"  -> Task {num} streamed to completion. Server ID: {tid}")
+            return tid, artifact
+        except asyncio.CancelledError:
+            print(f"  [Task {num}] streaming dropped (Cancelled)")
+            raise
+        except Exception as e:
+            print(f"  [Task {num}] streaming ended: {type(e).__name__}: {e}")
+            return None, None
+
+    print("\n[PHASE 1] Streaming tasks 1 & 2 in background...")
+    bg = {
+        1: asyncio.create_task(stream_bg(1, "Task 1: Generate a quick recon summary.")),
+        2: asyncio.create_task(stream_bg(2, "Task 2: Generate a quick recon summary.")),
+    }
+
+    print("\n[PHASE 2] Firing 3/4/5 via single send (fast IDs)...")
+    task_ids = {}
+    for i in (3, 4, 5):
+        text = f"Task {i}: Generate a quick recon summary."
+        print(f"  [SENT Task {i} (single)]: {text}")
+        tid, _cid, _first = await service.send_message(text, label=f"  [Task {i} send] ")
+        task_ids[i] = tid
+        print(f"  -> Task {i} created. Server ID: {tid}")
+
+    print("\n[PHASE 3] Task 3: check state, then cancel...")
     task3_data = await service.get_task(task_ids[3], label="  ")
-    if task3_data.status.state == TaskState.TASK_STATE_WORKING:
-        print("  -> Task 3 is still working. cancel")
-        await service.cancel_task(task_ids[3], label="  ")
-    else:
-        print(f"  -> Task 3 already terminal: {task3_data.status.state}, no cancel needed")
+    print(f"  -> Task 3 observed state: {int(task3_data.status.state)}")
+    await service.cancel_task(task_ids[3], label="  ")
+    task3_final = await service.get_task(task_ids[3], label="  ")
+    print(f"  -> Task 3 final state: {int(task3_final.status.state)}")
 
-    print("\n[PHASE 6] Handling Task 4 (Get & Subscribe)...")
+    print("\n[PHASE 4] Task 4: subscribe to completion...")
     task4_data = await service.get_task(task_ids[4], label="  [Get 4] ")
     if task4_data.status.state == TaskState.TASK_STATE_WORKING:
         print("  -> Task 4 is still working. subscribing...")
@@ -386,7 +387,7 @@ async def run_test_6_advanced_lifecycle(client: A2AClient):
     else:
         print(f"  -> Task 4 already terminal: {task4_data.status.state}, skip subscribe")
 
-    print("\n[PHASE 7] Handling Task 5 (Poll, then Retrieve)...")
+    print("\n[PHASE 5] Task 5: poll to completion, then retrieve...")
     # Mock-shortened (live: interval=60, max=10). Keeps observation fast.
     task5_data = await service.poll_until_complete(
         task_ids[5], interval=1, max_attempts=10, label="  "
@@ -420,8 +421,20 @@ async def run_test_6_advanced_lifecycle(client: A2AClient):
     else:
         print("  -> Task 5 did not complete in time!")
 
-    print("\n[TEST 6 COMPLETE] (SENT 5x recon summaries, RECEIVED mock "
-          "'Report generated successfully.' via STATUS/ARTIFACT above)")
+    print("\n[PHASE 6] Letting background tasks 1 & 2 finish...")
+    for i in (1, 2):
+        try:
+            await bg[i]
+        except asyncio.CancelledError:
+            print(f"  -> Task {i} streaming was cancelled unexpectedly.")
+            continue
+        print(f"  -> Task {i} finished normally.")
+
+    print("\n[TEST 6 COMPLETE]")
+
+
+# RESULT (2026-09-18): redesigned (no drop-kill phases; 1&2 stream, 3 cancel,
+# 4 subscribe, 5 poll); mock PASS all phases. Live pending.
 
 
 # ------------------------------------------------------------------
