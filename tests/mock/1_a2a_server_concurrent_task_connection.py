@@ -1,10 +1,11 @@
 # tests/mock/1_a2a_server_concurrent_task_connection.py
 #
 # ============================================================================
-# PURPOSE OF THIS FILE
+# PURPOSE OF THIS FILE (uses shared mocks from tests/mock/a2a_mocks.py)
 # ============================================================================
 # These tests validate TWO SEPARATE layers of the A2A report server WITHOUT any
-# external services. All real dependencies are swapped for in-memory stand-ins:
+# external services. All real dependencies are swapped for in-memory stand-ins
+# now imported from a2a_mocks.py:
 #
 #   FakeLangChainAgent  → replaces the real LangChain agent (no LLM API calls,
 #                         no token cost). Simulates a full agent run by yielding
@@ -30,135 +31,24 @@
 # task lifecycle; the task lifecycle is managed by the A2A SDK. They interact:
 # cancelling a running task releases the lock it held, which is why the lifecycle
 # test also asserts the lock is free afterwards.
-# ============================================================================
+# See a2a_mocks.py for shared definitions; this file keeps the original
+# purpose/logic docs and assertions intact, just imports mocks centrally.
 
 import asyncio
 import time
 import pytest
-from unittest.mock import MagicMock
 
-# Import the REAL components
 from agent.a2a_connector import ReportA2AExecutor
-from agent.report_agent import runtime
-from a2a.server.request_handlers import DefaultRequestHandler
-from a2a.server.tasks import InMemoryTaskStore, InMemoryPushNotificationConfigStore
 from a2a.server.context import ServerCallContext
-from a2a.types.a2a_pb2 import (
-    AgentCard, AgentCapabilities, AgentInterface, AgentSkill,
-    Message, Part, Role, SendMessageRequest, SendMessageConfiguration,
-    CancelTaskRequest, GetTaskRequest, TaskState
-)
+from a2a.types.a2a_pb2 import CancelTaskRequest, GetTaskRequest, TaskState
 from a2a.helpers import get_message_text
 
-# ==========================================
-# 1. MOCK LANGFUSE (no real server needed)
-# ==========================================
-# MagicMock supports __enter__/__exit__ so it works as a context manager.
-# .start_as_current_observation() returns another MagicMock (root_span),
-# which itself supports .start_as_current_observation() → gen, and .update().
-# This satisfies all of _process_task's langfuse usage without a real server.
-
-mock_langfuse = MagicMock()
-
-@pytest.fixture(autouse=True)
-def patch_runtime_langfuse():
-    """Replace runtime.langfuse with a no-op mock for every test."""
-    original = runtime.langfuse
-    runtime.langfuse = mock_langfuse
-    yield
-    runtime.langfuse = original
-
-
-# ==========================================
-# 2. THE MOCK DEPENDENCIES
-# ==========================================
-
-class FakeLangChainAgent:
-    """
-    Simulates ONE full agent run (what the real agent's astream() produces).
-
-    It yields three LangGraph updates, one per await step, each preceded by
-    `delay` seconds so we can control how long a "run" takes:
-      1. an AIMessage requesting a tool call (read_file)
-      2. a ToolMessage with the tool's result (success)
-      3. a final AIMessage with the report text
-
-    `execution_count` increments on every astream() invocation. Tests use it to
-    assert how many times the agent actually ran (e.g. exactly twice when two
-    tasks execute sequentially, or once+once when one task is cancelled).
-    """
-    def __init__(self, delay: float = 0.1):
-        self.delay = delay
-        self.execution_count = 0
-
-    async def astream(self, *args, **kwargs):
-        self.execution_count += 1
-        from langchain_core.messages import AIMessage, ToolMessage
-        
-        await asyncio.sleep(self.delay)
-        yield {"agent": {"messages": [
-            AIMessage(content="", tool_calls=[{"name": "read_file", "args": {"file_path": "/test.txt"}, "id": "1"}])
-        ]}}
-        
-        await asyncio.sleep(self.delay)
-        yield {"tools": {"messages": [
-            ToolMessage(content="success", tool_call_id="1")
-        ]}}
-        
-        await asyncio.sleep(self.delay)
-        yield {"agent": {"messages": [
-            AIMessage(content="Report generated successfully.")
-        ]}}
-
-
-def create_mock_request_handler(executor: ReportA2AExecutor) -> DefaultRequestHandler:
-    """Sets up the full A2A SDK stack in memory."""
-    
-    agent_card = AgentCard(
-        name="Test Agent",
-        description="Test Agent for Mocking",
-        capabilities=AgentCapabilities(streaming=True),
-        default_input_modes=["text/plain"],
-        default_output_modes=["text/plain"],
-        supported_interfaces=[
-            AgentInterface(protocol_binding="JSONRPC", url="http://localhost")
-        ],
-        skills=[AgentSkill(id="test", name="Test", description="Test")],
-    )
-    
-    return DefaultRequestHandler(
-        agent_executor=executor,
-        task_store=InMemoryTaskStore(),
-        agent_card=agent_card,
-        push_config_store=InMemoryPushNotificationConfigStore(),
-    )
-
-
-def create_mock_send_request(context_id: str) -> SendMessageRequest:
-    msg = Message(
-        message_id="test-msg",
-        role=Role.ROLE_USER,
-        parts=[Part(text="Generate report")],
-        context_id=context_id
-    )
-    return SendMessageRequest(
-        message=msg,
-        configuration=SendMessageConfiguration(return_immediately=False)
-    )
-
-
-# ==========================================
-# 3. HELPER TO CONSUME STREAMS
-# ==========================================
-async def consume_stream(handler, req, context):
-    """Wraps an async generator stream into a standard coroutine that asyncio.gather can handle."""
-    try:
-        results = []
-        async for item in handler.on_message_send_stream(req, context):
-            results.append((time.time(), item))
-        return results
-    except Exception as e:
-        return e
+from tests.mock.a2a_mocks import (
+    FakeLangChainAgent,
+    create_mock_request_handler,
+    create_mock_send_request,
+    consume_stream,
+)
 
 
 # ==========================================
@@ -233,7 +123,7 @@ async def test_sequential_execution_and_state_updates():
     executor = ReportA2AExecutor()
     executor.agent = FakeLangChainAgent(delay=12)  # 12s per step * 3 steps = ~36s per task (>30s lock timeout)
     handler = create_mock_request_handler(executor)
-    
+
     req1 = create_mock_send_request("ctx-1")
     req2 = create_mock_send_request("ctx-2")
     mock_context = ServerCallContext()
@@ -262,14 +152,14 @@ async def test_sequential_execution_and_state_updates():
     def is_status_event(event):
         """Check if event has a status with a message."""
         return hasattr(event, 'status') and event.status is not None
-    
+
     def has_message_with_text(event, text_substring):
         """Check if event's status message contains the given text."""
         if not is_status_event(event):
             return False
         msg_text = get_message_text(event.status.message)
         return text_substring in msg_text if msg_text else False
-    
+
     def get_events_with_message_text(events, text_substring):
         """Filter events that have a status message containing the given text."""
         return [e for e in events if has_message_with_text(e, text_substring)]
@@ -286,7 +176,7 @@ async def test_sequential_execution_and_state_updates():
     # Extract all status events with messages for each task
     status_events1 = [e for e in events1 if is_status_event(e) and e.status.message]
     status_events2 = [e for e in events2 if is_status_event(e) and e.status.message]
-    
+
     assert len(status_events1) > 0, "Task 1 should have status events with messages"
     assert len(status_events2) > 0, "Task 2 should have status events with messages"
 
@@ -311,21 +201,21 @@ async def test_sequential_execution_and_state_updates():
     # CRITICAL ASSERTION: Sequential execution timing
     # The key proof of lock behavior is that Task 2 receives "Still waiting in queue" messages
     # BEFORE it receives "Processing request", proving it waited for Task 1
-    
+
     # Find the FIRST "Still waiting in queue" message for Task 2
     task2_first_wait_ts = None
     for ts, ev in results[1]:
         if has_message_with_text(ev, "Still waiting in queue"):
             task2_first_wait_ts = ts
             break
-    
+
     # Find the FIRST "Processing request" message for Task 2
     task2_processing_ts = None
     for ts, ev in results[1]:
         if has_message_with_text(ev, "Processing request"):
             task2_processing_ts = ts
             break
-    
+
     # Find timestamp when Task 1 completes
     task1_completed_ts = None
     for ts, ev in results[0]:
@@ -335,18 +225,18 @@ async def test_sequential_execution_and_state_updates():
 
     assert task1_completed_ts is not None, "Task 1 should complete"
     assert task2_processing_ts is not None, "Task 2 should start processing"
-    
+
     # The critical assertion: Task 2 must have received "Still waiting in queue" messages
     # This proves it was blocked waiting for Task 1
     assert task2_first_wait_ts is not None, \
         "Task 2 should have 'Still waiting in queue' messages (proving lock behavior)"
-    
+
     # Verify the order: Task 2 waits BEFORE it processes
     assert task2_first_wait_ts < task2_processing_ts, (
         f"LOCK BEHAVIOR FAILED: Task 2 started processing BEFORE it showed waiting messages. "
         f"First wait at {task2_first_wait_ts}, processing at {task2_processing_ts}."
     )
-    
+
     # Additional verification: Task 1 should complete around the same time Task 2 starts processing
     # (allowing small margin for timing precision)
     time_diff = task2_processing_ts - task1_completed_ts
@@ -377,7 +267,7 @@ async def test_sequential_execution_and_state_updates():
     assert task1 is not None, f"Task 1 (id={task1_id}) should exist in task store"
     assert task1.status.state == TaskState.TASK_STATE_COMPLETED, \
         f"Task 1 in store should be COMPLETED, got {task1.status.state}"
-    
+
     task2 = await handler.task_store.get(task2_id, mock_context)
     assert task2 is not None, f"Task 2 (id={task2_id}) should exist in task store"
     assert task2.status.state == TaskState.TASK_STATE_COMPLETED, \
@@ -458,7 +348,7 @@ async def test_cancellation_via_handler_and_lock_release():
     executor = ReportA2AExecutor()
     executor.agent = FakeLangChainAgent(delay=5.0)  # Slow agent to ensure it's running when we cancel
     handler = create_mock_request_handler(executor)
-    
+
     req = create_mock_send_request("ctx-cancel")
     mock_context = ServerCallContext()
 
@@ -478,18 +368,18 @@ async def test_cancellation_via_handler_and_lock_release():
 
     # 2. Start the task in the background
     stream_task = asyncio.create_task(consume_stream_tracked(handler, req, mock_context))
-    
+
     # Wait for the first event (SUBMITTED) which contains the task ID
     await first_event_received.wait()
     task_id_to_cancel = events_buffer[0][1].id
-    
+
     # Let it acquire the lock and start "processing"
     await asyncio.sleep(0.5)
-    
+
     # 3. PROPERLY CANCEL VIA THE HANDLER
     cancel_req = CancelTaskRequest(id=task_id_to_cancel)
     await handler.on_cancel_task(cancel_req, mock_context)
-    
+
     # 4. ASSERTION: Verify the task is actually marked as CANCELED in the store
     get_req = GetTaskRequest(id=task_id_to_cancel)
     canceled_task = await handler.on_get_task(get_req, mock_context)
@@ -500,11 +390,11 @@ async def test_cancellation_via_handler_and_lock_release():
     # 5. ASSERTION: Verify the lock was released by immediately firing a new task.
     # If the lock wasn't released, this new task would hang and timeout.
     req2 = create_mock_send_request("ctx-after")
-    
+
     result = await asyncio.wait_for(
         consume_stream(handler, req2, mock_context),
         timeout=20.0  # Should finish quickly since the slow agent was canceled and lock released
     )
-    
+
     assert not isinstance(result, Exception), f"Lock was not released after cancellation: {result}"
     assert executor.agent.execution_count == 2, "The second task should have executed after the first was canceled."
