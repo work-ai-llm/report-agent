@@ -1,5 +1,7 @@
 import sys
 import asyncio
+import os
+import socket
 
 # NOTE, this fix loop creation for postgres async connection ONLY if you make "uvicorn<0.36.0"
 if sys.platform == "win32":
@@ -7,6 +9,7 @@ if sys.platform == "win32":
 
 import uvicorn
 from contextlib import asynccontextmanager
+from psycopg import OperationalError
 from starlette.applications import Starlette
 import httpx
 import logging
@@ -138,6 +141,98 @@ class ReportA2AExecutor(AgentExecutor):
             # Release the lock for the next task
             global_execution_lock.release()
 
+    async def _consume_agent_stream(
+        self,
+        agent_query: str,
+        config: dict,
+        task: Task,
+        task_updater: TaskUpdater,
+        gen,
+    ) -> tuple:
+        """Consume one agent astream pass; returns (report_artifact_sent, response_text).
+
+        Transient remote-DB drops surface here as psycopg.OperationalError from
+        inside LangGraph's checkpointer. Heal once (reopen pool, refresh agent
+        handle) and resume the SAME thread — LangGraph continues from its last
+        checkpoint instead of failing the run. Raises on second failure.
+        """
+        # Flags live outside the retry so a resumed pass keeps progress
+        # (no duplicate "report started" artifact, no lost partial text).
+        report_artifact_sent = False
+        response_text = ""
+        for _db_attempt in (0, 1):
+            try:
+                async for chunk in self.agent.astream(
+                    {"messages": [{"role": "user", "content": agent_query}]},
+                    config=config,
+                    stream_mode="updates"
+                ):
+                    # chunk is a dict like {'model': {'messages': [AIMessage(...)]}}
+                    for node_name, node_output in chunk.items():
+                        if 'messages' in node_output:
+                            for msg in node_output['messages']:
+                                # CASE A: The Agent (LLM) is making a tool call
+                                if isinstance(msg, AIMessage):
+                                    if msg.tool_calls:
+                                        for tc in msg.tool_calls:
+                                            tool_name = tc['name']
+                                            tool_args = tc.get('args', {})
+
+                                            preview_args = tool_args.copy()
+
+                                            if tool_name == 'write_file' and 'content' in preview_args:
+                                                # Grab first 50 chars of the file content and remove newlines
+                                                preview_content = preview_args['content'][:100].replace('\n', ' ')
+                                                preview_args['content'] = f"{preview_content}..."
+
+                                            # Check if the agent is writing the final report to the store
+                                            if tool_name == 'write_file' and not report_artifact_sent and 'report' in tool_args.get('file_path', ''):
+                                                await task_updater.add_artifact(
+                                                    parts=[new_text_part(text="Report creation process started.", media_type='text/plain')]
+                                                )
+                                                report_artifact_sent = True # <--- Prevents spam on subsequent calls
+                                                logger.info("Detected report write_file tool call. Artifact sent to client.")
+
+                                            args_json = json.dumps(preview_args, indent=2)
+                                            # Send a clean status update with ONLY the tool name
+                                            update_text = f"Agent is calling tool: {tool_name} with args: {args_json}"
+                                            await task_updater.update_status(
+                                                state=TaskState.TASK_STATE_WORKING,
+                                                message=new_text_message(update_text)
+                                            )
+                                    elif msg.content:
+                                        # This is the final text response from the LLM
+                                        response_text = msg.content
+
+                                        gen.update(
+                                            output={"response": response_text}
+                                        )
+                                # CASE B: The Tools node has finished executing a tool
+                                elif isinstance(msg, ToolMessage):
+                                    update_text = f"Agent received result from tool: {msg.status}"
+
+                                    # Push this as an A2A Status Update Event
+                                    await task_updater.update_status(
+                                        state=TaskState.TASK_STATE_WORKING,
+                                        message=new_text_message(update_text)
+                                    )
+                return report_artifact_sent, response_text
+            except OperationalError:
+                if _db_attempt == 1:
+                    raise
+                logger.warning(
+                    "Checkpointer connection lost mid-run; healing pool and "
+                    "resuming thread %s",
+                    task.context_id,
+                )
+                await task_updater.update_status(
+                    state=TaskState.TASK_STATE_WORKING,
+                    message=new_text_message('Database connection lost, healing and resuming...'),
+                )
+                await runtime.ensure_pool()
+                self.agent = runtime.agent
+                continue
+
     async def _process_task(
         self,
         context: RequestContext,
@@ -196,60 +291,9 @@ class ReportA2AExecutor(AgentExecutor):
                     name="generate-response",
                     model="mistral"
                 ) as gen:
-                    async for chunk in self.agent.astream(
-                        {"messages": [{"role": "user", "content": agent_query}]},
-                        config=config,
-                        stream_mode="updates"
-                    ):
-                        # chunk is a dict like {'model': {'messages': [AIMessage(...)]}}
-                        for node_name, node_output in chunk.items():
-                            if 'messages' in node_output:
-                                for msg in node_output['messages']:
-                                    # CASE A: The Agent (LLM) is making a tool call
-                                    if isinstance(msg, AIMessage):
-                                        if msg.tool_calls:
-                                            for tc in msg.tool_calls:
-                                                tool_name = tc['name']
-                                                tool_args = tc.get('args', {})
-
-                                                preview_args = tool_args.copy()
-
-                                                if tool_name == 'write_file' and 'content' in preview_args:
-                                                    # Grab first 50 chars of the file content and remove newlines
-                                                    preview_content = preview_args['content'][:100].replace('\n', ' ')
-                                                    preview_args['content'] = f"{preview_content}..."
-                                                
-                                                # Check if the agent is writing the final report to the store
-                                                if tool_name == 'write_file' and not report_artifact_sent and 'report' in tool_args.get('file_path', ''):
-                                                    await task_updater.add_artifact(
-                                                        parts=[new_text_part(text="Report creation process started.", media_type='text/plain')]
-                                                    )
-                                                    report_artifact_sent = True # <--- Prevents spam on subsequent calls
-                                                    logger.info("Detected report write_file tool call. Artifact sent to client.")
-                                                
-                                                args_json = json.dumps(preview_args, indent=2)
-                                                # Send a clean status update with ONLY the tool name
-                                                update_text = f"Agent is calling tool: {tool_name} with args: {args_json}"
-                                                await task_updater.update_status(
-                                                    state=TaskState.TASK_STATE_WORKING,
-                                                    message=new_text_message(update_text)
-                                                )
-                                        elif msg.content:
-                                            # This is the final text response from the LLM
-                                            response_text = msg.content
-
-                                            gen.update(
-                                                output={"response": response_text}
-                                            )
-                                    # CASE B: The Tools node has finished executing a tool
-                                    elif isinstance(msg, ToolMessage):
-                                        update_text = f"Agent received result from tool: {msg.status}"
-                                        
-                                        # Push this as an A2A Status Update Event
-                                        await task_updater.update_status(
-                                            state=TaskState.TASK_STATE_WORKING,
-                                            message=new_text_message(update_text)
-                                        )
+                    report_artifact_sent, response_text = await self._consume_agent_stream(
+                        agent_query, config, task, task_updater, gen
+                    )
             root_span.update(
                 output={"response": response_text}
             )
@@ -331,6 +375,26 @@ async def lifespan(app: Starlette):
 # ==========================================
 # 2. Setup and Run the A2A Server
 # ==========================================
+def _resolve_lan_ip() -> str:
+    """LAN IP to advertise in the agent card.
+
+    Priority: A2A_HOST env override, else auto-detected outbound-interface IP
+    (UDP trick, no traffic sent), else loopback. Auto-detect keeps working
+    across Wi-Fi changes where a hardcoded IP would fail to bind.
+    """
+    override = (os.getenv("A2A_HOST") or "").strip()
+    if override:
+        return override
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+
 def main():
 
     # Define the agent's skills (capabilities)
@@ -344,9 +408,11 @@ def main():
         examples=['Generate a report from the uploaded findings.', 'Analyze the attached port scan results.'],
     )
 
-    # DEFINE YOUR LOCAL NETWORK IP HERE
-    LOCAL_IP = "192.168.0.107"
-    PORT = 9999
+    # Bind address: configurable via A2A_HOST/A2A_PORT, auto-detected by default.
+    # The socket binds 0.0.0.0 (all interfaces) so Wi-Fi IP changes can't break
+    # startup; LOCAL_IP is only what we advertise in the agent card.
+    LOCAL_IP = _resolve_lan_ip()
+    PORT = int(os.getenv("A2A_PORT", "9999"))
     
     # Define the public-facing Agent Card
     public_agent_card = AgentCard(
@@ -384,11 +450,12 @@ def main():
 
     app = Starlette(routes=routes, lifespan=lifespan)
 
-    print(f"A2A Server running at http://{LOCAL_IP}:{PORT}")
+    print(f"A2A Server running at http://{LOCAL_IP}:{PORT} (listening on 0.0.0.0:{PORT})")
     print(f"Agent Card available at: http://{LOCAL_IP}:{PORT}/.well-known/agent-card.json")
-    
-    # CRITICAL: host='0.0.0.0' allows connections from the local network
-    uvicorn.run(app, host=LOCAL_IP, port=PORT)
+
+    # Bind all interfaces so the server survives Wi-Fi/IP changes;
+    # clients can use the advertised LAN IP or 127.0.0.1 locally.
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
     main()

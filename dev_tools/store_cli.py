@@ -206,7 +206,9 @@ async def list_sessions():
         import traceback
         traceback.print_exc()
 
-async def inspect_session_store(thread_id: str):
+async def inspect_session_store(thread_id: str, last_n: int = 0):
+    if last_n and last_n > 0:
+        print(f"(showing last {last_n} message(s) — full history stays in the checkpointer)")
     print(f"Inspecting session state for thread_id: '{thread_id}'...")
     config = {"configurable": {"thread_id": thread_id}}
     # Use alist for full history (all checkpoints), not just latest
@@ -253,7 +255,10 @@ async def inspect_session_store(thread_id: str):
         # Show ALL messages in full (the entire purpose of this function)
         if 'messages' in values:
             msgs = values['messages']
-            print(f"\n=== Full session messages ({len(msgs)}) ===")
+            total = len(msgs)
+            if last_n and last_n > 0 and total > last_n:
+                msgs = msgs[-last_n:]
+            print(f"\n=== Full session messages ({len(msgs)} of {total}) ===")
             for idx, m in enumerate(msgs, 1):
                 # Handle both LangChain message objects and dicts
                 if isinstance(m, dict):
@@ -394,6 +399,8 @@ Examples:
 
     p_session = subparsers.add_parser("inspect-session", help="Inspect full session history from checkpointer")
     p_session.add_argument("--thread-id", type=str, required=True, help="The thread_id (context_id) of the session")
+    p_session.add_argument("--tail", type=int, default=0, help="Show only the last N messages (0 = all)")
+    p_session.add_argument("--out", type=Path, default=None, help="Also write full output to this file (for long threads that overflow the cmd window)")
 
     args = parser.parse_args()
 
@@ -414,7 +421,21 @@ Examples:
     elif args.command == "delete":
         await delete_file(args.store_path)
     elif args.command == "inspect-session":
-        await inspect_session_store(args.thread_id)
+        if args.out:
+            # Tee: full output goes to file AND console (cmd window cuts long
+            # threads, the file keeps everything).
+            import io
+            buf = io.StringIO()
+            import contextlib
+            with contextlib.redirect_stdout(buf):
+                await inspect_session_store(args.thread_id, last_n=args.tail)
+            text = buf.getvalue()
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(text, encoding="utf-8")
+            print(text)
+            print(f"(full output also saved to {args.out.absolute()})")
+        else:
+            await inspect_session_store(args.thread_id, last_n=args.tail)
     else:
         parser.print_help()
 
