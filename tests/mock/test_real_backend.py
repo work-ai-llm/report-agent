@@ -94,14 +94,18 @@ class TestRealFileStoreAdapter:
         assert fs.read_file("findings/nmap.txt") == b"PORT 80/TCP  open"
 
     def test_stored_value_uses_v2_agent_format(self, backend):
-        runner, runtime = backend
-        fs = rb.RealFileStoreAdapter(runner, runtime.store)
+        writer, runtime = backend
+        fs = rb.RealFileStoreAdapter(writer, runtime.store)
         fs.write_file("reports/r.md", b"# Report")
-        item = runner.run(runtime.store.aget(rb._NAMESPACE, "reports/r.md"))
+        # write_file stores under the agent's /slash-canonical key...
+        item = writer.run(runtime.store.aget(rb._NAMESPACE, "/reports/r.md"))
         assert item is not None
         assert isinstance(item.value, dict)
         assert item.value["content"] == "# Report"
         assert item.value["encoding"] == "utf-8"
+        # ...and never under the old slash-less key (the UI bug being fixed).
+        legacy = writer.run(runtime.store.aget(rb._NAMESPACE, "reports/r.md"))
+        assert legacy is None
 
     def test_read_missing_returns_none(self, backend):
         runner, runtime = backend
@@ -185,8 +189,8 @@ class TestRealAgentRunnerAdapter:
             self._exc = exc
             self.calls = []
 
-        async def astream(self, stream_input, config=None):
-            self.calls.append((stream_input, config))
+        async def astream(self, stream_input, config=None, stream_mode=None):
+            self.calls.append((stream_input, config, stream_mode))
             if self._exc is not None:
                 raise self._exc
             for batch in self._chunks:
@@ -199,7 +203,8 @@ class TestRealAgentRunnerAdapter:
         return list(adapter.run(message, thread_id))
 
     def test_streams_tool_call_then_message(self, backend, monkeypatch):
-        """langchain's Agent.astream yields {node: {"messages": [...]}} diffs."""
+        """Default node-diff mode drives tool_call/tool_result/message events;
+        legacy (message_chunk, metadata) tuples are still tolerated."""
         from langchain_core.messages import AIMessageChunk, ToolMessage
 
         monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
@@ -208,15 +213,21 @@ class TestRealAgentRunnerAdapter:
                 content="", tool_calls=[{"name": "nmap_scan", "args": {"target": "10.0.0.1"},
                                          "id": "c1", "type": "tool_call"}])]}},
             {"agent": {"messages": [ToolMessage(content="80/tcp open", tool_call_id="c1", name="nmap_scan")]}},
+            (AIMessageChunk(content="Scan"), {"langgraph_node": "agent"}),
+            (AIMessageChunk(content=" complete."), {"langgraph_node": "agent"}),
             {"agent": {"messages": [AIMessageChunk(content="Scan complete.")]}},
         ])
         events = self._events(backend, agent, "scan target", "th1")
-        assert [e["type"] for e in events] == ["tool_call", "tool_result", "message"]
+        assert [e["type"] for e in events] == [
+            "tool_call", "tool_result", "token", "token", "message",
+        ]
         assert events[0]["data"] == {"name": "nmap_scan", "args": {"target": "10.0.0.1"}}
         assert events[1]["data"]["name"] == "nmap_scan"
-        assert events[2]["data"] == "Scan complete."
-        stream_input, config = agent.calls[0]
+        assert [e["data"] for e in events if e["type"] == "token"] == ["Scan", " complete."]
+        assert events[-1]["data"] == "Scan complete."
+        stream_input, config, stream_mode = agent.calls[0]
         assert stream_input == {"messages": [{"role": "user", "content": "scan target"}]}
+        assert stream_mode is None
         assert config["configurable"]["thread_id"] == "th1"
         assert config["configurable"]["checkpoint_ns"] == ""
 

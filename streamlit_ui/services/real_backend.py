@@ -93,6 +93,16 @@ def is_agent_output_print_enabled() -> bool:
     return _env_enabled("STREAMLIT_AGENT_PRINT")
 
 
+def is_streaming_enabled() -> bool:
+    """True when the UI should render live token deltas (streaming).
+
+    Defaults to on. Disabled only by ``STREAMLIT_STREAM`` set to
+    ``0`` / ``false`` / ``no`` (the real agent keeps emitting raw events
+    either way - this only controls whether the chat shows them live).
+    """
+    return os.environ.get("STREAMLIT_STREAM", "1").strip().lower() not in ("0", "false", "no")
+
+
 def backend_label(runtime: Any) -> str:
     """Human-readable backend description for the debug status report.
 
@@ -509,13 +519,15 @@ class RealAgentRunnerAdapter:
             _updates = 0
             try:
                 _print(f"[AGENT STREAM]: calling astream() at t={_ts()}")
-                # stream_mode=["messages", "updates"]: the "messages" channel
-                # yields per-token AIMessageChunk deltas (live streaming) while
-                # "updates" still delivers whole-step node diffs for tool calls
-                # and results. Checkpointing is unaffected by the stream mode.
-                astream_iter = self._agent.astream(
-                    stream_input, config=config, stream_mode=["messages", "updates"]
-                )
+                # NOTE: stream_mode=["messages","updates"] was tried for live
+                # token streaming but the langchain create_agent + middleware
+                # graph only yields (str, metadata) tuples on the messages
+                # channel (no dict updates at all), so structured events
+                # (tool_call / tool_result / the final message) never arrive.
+                # Plain node-diff streaming works: dict updates drive the UI
+                # events and the final message. Live token deltas would need a
+                # graph/middleware that also emits structured node outputs.
+                astream_iter = self._agent.astream(stream_input, config=config)
                 _print(f"[AGENT STREAM]: astream() returned iterator at t={_ts()}, type={type(astream_iter).__name__}")
                 _print(f"[AGENT STREAM]: entering async for loop at t={_ts()}")
                 async for update in astream_iter:
@@ -546,6 +558,26 @@ class RealAgentRunnerAdapter:
                     text = "".join(final_parts)
                     events.put({"type": "message", "data": text})
                     _print(f"[AGENT RESPONSE]: {text}")
+                else:
+                    # Safety net: if the stream produced no structured dict
+                    # updates (e.g. a middleware that only emits raw strings on
+                    # the messages channel), fall back to the last assistant
+                    # message recorded by the checkpointer.
+                    try:
+                        state = await self._agent.aget_state(config)
+                        values = getattr(state, "values", None) or {}
+                        last: str | None = None
+                        for m in reversed(values.get("messages", [])):
+                            if isinstance(m, (AIMessage, AIMessageChunk)):
+                                content = getattr(m, "content", "")
+                                if isinstance(content, str) and content.strip():
+                                    last = content
+                                    break
+                        if last is not None:
+                            events.put({"type": "message", "data": last})
+                            _print(f"[AGENT RESPONSE (checkpointer)]: {last[:300]}")
+                    except Exception as exc:  # noqa: BLE001 - safety net must never throw
+                        _print(f"[AGENT STREAM]: checkpointer fallback failed: {exc}")
                 events.put(sentinel)
 
         self._runner.schedule(_consume())
