@@ -1,3 +1,6 @@
+[tool.setuptools.packages.find]
+include = ["agent*", "client*", "dev_tools*", "tests*"]
+exclude = ["results*", "__pycache__*", "*.pyc"]
 [project]
 name = "report-agent"
 version = "0.1.0"

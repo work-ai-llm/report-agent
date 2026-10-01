@@ -478,6 +478,32 @@ class AgentRuntime:
         await self.store.setup()
         print(f"Using local SQLite backend: {LOCAL_DB_PATH}", flush=True)
     
+    async def ensure_pool(self) -> bool:
+        """Reopen the DB pool if it is missing or broken (transient remote drops).
+
+        Local SQLite mode (pool None) needs no healing. After a reopen the
+        agent is rebuilt against the fresh checkpointer/store, so callers must
+        refresh their own agent handle — the same thread_id then resumes from
+        its last checkpoint instead of failing the whole run.
+        Returns True if a reopen happened.
+        """
+        if self.pool is None:
+            return False
+        try:
+            async with self.pool.connection(timeout=3.0):
+                pass
+            return False
+        except Exception as e:
+            print(f"Pool unhealthy ({e}), reopening...")
+            try:
+                await self.pool.close()
+            except Exception:
+                pass
+            self.pool = None
+            await self._init_pool()
+            await self._create_agent(debug_mode=self.debug_mode)
+            return True
+
     async def _create_agent(self, debug_mode: bool = False):
         """Create the LangChain agent with active middleware construction.
         
