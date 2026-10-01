@@ -208,8 +208,13 @@ async def list_sessions():
 
 async def inspect_session_store(thread_id: str):
     print(f"Inspecting session state for thread_id: '{thread_id}'...")
-    config = {"configurable": {"thread_id": thread_id}}
-    # Use alist for full history (all checkpoints), not just latest
+    # The agent's own checkpoints live under the empty namespace; the UI chat
+    # copy lives under checkpoint_ns="ui" (metadata {"source": "ui"}). Without
+    # checkpoint_ns, alist() returns both, and the reversed() + [-1] "latest"
+    # here would land on the UI display checkpoint instead of the real agent
+    # state. Scope to the agent namespace so the count and the shown messages
+    # (incl. tool calls + results) are the true conversation history.
+    config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
     # alist = async iterator over CheckpointTuple history for thread_id
     # aget_tuple = single latest checkpoint
     try:
@@ -222,7 +227,7 @@ async def inspect_session_store(thread_id: str):
             return
         # alist returns newest first, reverse to show chronological
         checkpoints = list(reversed(checkpoints))
-        print(f"Found {len(checkpoints)} checkpoint(s) for this thread.")
+        print(f"Found {len(checkpoints)} agent checkpoint(s) for this thread.")
         # Show latest checkpoint's full state
         latest = checkpoints[-1]
         checkpoint = latest.checkpoint
