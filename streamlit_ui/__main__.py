@@ -13,9 +13,10 @@ variables - those still work when a flag is omitted):
   layer. ``sqlite`` forces the local SQLite store (``agent/agent_session.db``);
   ``postgres`` uses Postgres when ``POSTGRES_URI`` is reachable and falls back
   to SQLite otherwise. Default: ``postgres``.
-- ``--agent real|mock`` - agent runner. ``real`` runs the live LangGraph agent
-  (needs model keys in ``.env``); ``mock`` uses the mock agent against real
-  persistence (no API keys needed; sessions/files still survive reloads).
+- ``--agent real|mock|mocks`` - agent runner. ``real`` runs the live LangGraph
+  agent (needs model keys in ``.env``); ``mock`` uses the mock agent against
+  real persistence (no API keys needed; sessions/files still survive reloads);
+  ``mocks`` is the full in-memory sandbox (mock checkpointer, store AND agent).
   Default: ``real``.
 - ``--streaming`` / ``--no-streaming`` - render live token deltas in the chat
   (default: streaming on).
@@ -25,6 +26,7 @@ Examples::
     python -m streamlit_ui                               # production (real agent, postgres)
     python -m streamlit_ui --backend sqlite --agent real --debug
     python -m streamlit_ui --agent mock --backend sqlite run streamlit_ui/app.py
+    python -m streamlit_ui --agent mocks                 # full in-memory mock sandbox
     python -m streamlit_ui --agent real --backend sqlite --no-streaming
 
 The selected mode is fixed for the lifetime of the server process. The report
@@ -50,7 +52,38 @@ _AGENT_FLAG = "--agent"
 _STREAMING_FLAG = "--streaming"
 _NO_STREAMING_FLAG = "--no-streaming"
 _BACKENDS = ("sqlite", "postgres")
-_AGENTS = ("mock", "real")
+_AGENTS = ("mock", "real", "mocks")
+_HELP_FLAGS = ("-h", "--help")
+
+
+def _usage(prog: str = "python -m streamlit_ui") -> str:
+    """The custom CLI help text (shown on ``-h`` / ``--help`` / errors)."""
+    return (
+        f"usage: {prog} [--debug] [--backend sqlite|postgres] "
+        f"[--agent mock|real|mocks] [--streaming|--no-streaming] "
+        f"[streamlit args...]\n"
+        f"\n"
+        f"Runtime selection (each flag overrides the equivalent env var when\n"
+        f"present; flags are stripped before delegating to Streamlit):\n"
+        f"\n"
+        f"  --debug                     print the connectivity report (same as\n"
+        f"                              STREAMLIT_RUNTIME_DEBUG=1)\n"
+        f"  --backend sqlite|postgres   persistence backend. sqlite forces the\n"
+        f"                              local store (agent/agent_session.db);\n"
+        f"                              postgres uses POSTGRES_URI and falls back\n"
+        f"                              to sqlite. Default: postgres\n"
+        f"  --agent mock|real|mocks     agent runner:\n"
+        f"      real    live LangGraph agent (needs model keys in .env)\n"
+        f"      mock    mock agent + real persistence (no API keys needed)\n"
+        f"      mocks   full in-memory sandbox (mock checkpointer, store + agent)\n"
+        f"                              Default: real\n"
+        f"  --streaming / --no-streaming   render live token deltas in the chat\n"
+        f"                              (Default: streaming on)\n"
+        f"\n"
+        f"If no streamlit args are given, runs: {prog} "
+        f"{' '.join(_DEFAULT_ARGS)}\n"
+        f"Run streamlit's own CLI help with: python -m streamlit --help\n"
+    )
 
 
 def _apply_runtime_flags(args):
@@ -124,6 +157,10 @@ def _apply_runtime_flags(args):
         os.environ["STREAMLIT_USE_REAL_BACKEND"] = "1"
         os.environ.pop("STREAMLIT_USE_MOCKS", None)
         os.environ.pop("STREAMLIT_USE_REAL_AGENT", None)
+    elif agent == "mocks":
+        os.environ["STREAMLIT_USE_MOCKS"] = "1"
+        os.environ.pop("STREAMLIT_USE_REAL_BACKEND", None)
+        os.environ.pop("STREAMLIT_USE_REAL_AGENT", None)
 
     if streaming is not None:
         os.environ["STREAMLIT_STREAM"] = "1" if streaming else "0"
@@ -144,15 +181,15 @@ def main(argv=None) -> None:
     """
     args = list(argv) if argv is not None else sys.argv[1:]
 
+    if any(flag in args for flag in _HELP_FLAGS):
+        print(_usage())
+        raise SystemExit(0)
+
     try:
         args, flag_debug = _apply_runtime_flags(args)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        usage = " | ".join(f"--{name} {values}" for name, values in (
-            ("backend", "sqlite|postgres"), ("agent", "mock|real")))
-        print(f"usage: python -m streamlit_ui [--debug] [{usage}] "
-              f"[--streaming|--no-streaming] [streamlit args...]",
-              file=sys.stderr)
+        print(_usage(), file=sys.stderr)
         raise SystemExit(2) from exc
 
     debug = flag_debug or is_debug_mode()
