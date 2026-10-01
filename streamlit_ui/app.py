@@ -521,47 +521,65 @@ def render_main_chat(service: PenTestAgentService) -> None:
                     flushed_len = len(stream_acc)
                     last_flush = now
 
-            # Process streaming events
-            for event in service.send_message(prompt):
-                if event["type"] == "tool_call":
-                    name = event["data"]["name"]
-                    args = event["data"]["args"]
-                    tool_events.append({"type": "tool_call", "name": name, "args": args})
-                    render_tool_call(name, args)
-                elif event["type"] == "tool_result":
-                    name = event["data"].get("name", "")
-                    output = event["data"].get("output", "")
-                    # Attach the result to the oldest tool_call still awaiting
-                    # one (FIFO, matches tool-call execution order), so the
-                    # persisted history keeps args + results (store_cli reads
-                    # them) without breaking chat rendering.
-                    for te in tool_events:
-                        if te.get("type") == "tool_call" and "result" not in te:
-                            te["result"] = str(output)
-                            break
-                    if output:
-                        st.caption(f"✅ {name} → {str(output)[:120]}")
-                elif event["type"] == "token":
-                    stream_acc += event["data"]
-                    if stream_ph is None:
-                        stream_ph = st.empty()
-                    _flush_stream()
-                elif event["type"] == "message":
-                    full_response = event["data"]
-                    if stream_ph is not None:
-                        stream_ph.markdown(full_response or stream_acc)
-                    else:
-                        st.write(full_response)
-            
-            # Persist tool calls + assistant reply as structured entries
-            if tool_events or full_response:
-                st.session_state.chat_messages.extend(tool_events)
-                if full_response:
-                    st.session_state.chat_messages.append({
-                        "type": "assistant",
-                        "content": full_response,
-                    })
+            # Persist entries incrementally - after every tool call, tool
+            # result and assistant text - so a failed or interrupted run does
+            # not lose the history already rendered in the chat window. The
+            # checkpointer write is idempotent (the whole list is rewritten).
+            def _save_chat() -> None:
                 service.save_chat_history(st.session_state.chat_messages)
+
+            try:
+                # Process streaming events
+                for event in service.send_message(prompt):
+                    if event["type"] == "tool_call":
+                        name = event["data"]["name"]
+                        args = event["data"]["args"]
+                        entry = {"type": "tool_call", "name": name, "args": args}
+                        tool_events.append(entry)
+                        st.session_state.chat_messages.append(entry)
+                        render_tool_call(name, args)
+                        _save_chat()
+                    elif event["type"] == "tool_result":
+                        name = event["data"].get("name", "")
+                        output = event["data"].get("output", "")
+                        # Attach the result to the oldest tool_call still
+                        # awaiting one (FIFO, matches tool-call execution
+                        # order), so the persisted history keeps args +
+                        # results (store_cli reads them) without breaking
+                        # chat rendering.
+                        for te in tool_events:
+                            if te.get("type") == "tool_call" and "result" not in te:
+                                te["result"] = str(output)
+                                break
+                        if output:
+                            st.caption(f"✅ {name} → {str(output)[:120]}")
+                        _save_chat()
+                    elif event["type"] == "token":
+                        stream_acc += event["data"]
+                        if stream_ph is None:
+                            stream_ph = st.empty()
+                        _flush_stream()
+                    elif event["type"] == "message":
+                        full_response = event["data"]
+                        st.session_state.chat_messages.append({
+                            "type": "assistant",
+                            "content": full_response,
+                        })
+                        if stream_ph is not None:
+                            stream_ph.markdown(full_response or stream_acc)
+                        else:
+                            st.write(full_response)
+                        _save_chat()
+            except Exception as exc:
+                # Surface run failures instead of silently freezing the chat.
+                note = f"⚠️ Agent run failed: {exc}"
+                st.session_state.chat_messages.append({"type": "assistant", "content": note})
+                if stream_ph is not None:
+                    stream_ph.markdown(note)
+                else:
+                    st.write(note)
+            finally:
+                _save_chat()
 
         # If this was the first message of a brand-new session, rerun once so the
         # sidebar (which renders before the chat input handler runs) picks up the
