@@ -140,6 +140,7 @@ class AgentRuntime:
         self.agent = None
         self.langfuse = None
         self.langfuse_handler = None
+        self.langfuse_ok = False
         self.system_prompt_text = None
         self.fs_middleware = None
         self.llm = None
@@ -170,29 +171,66 @@ class AgentRuntime:
         await self._init_pool(force_sqlite=force_sqlite)
         await self._create_agent(debug_mode=debug_mode)
     
+    async def initialize_persistence(self):
+        """
+        Initialize ONLY observability + database persistence (checkpointer + store).
+        
+        Skips the LLM, middleware, and agent creation entirely - so no model API
+        keys are required. Used by the Streamlit UI's partial swap, where the
+        UI wants the real persistence backend (session checkpoints + virtual
+        filesystem) but still runs the mock agent runner.
+        
+        Delegates to the same private methods the full ``initialize()`` uses.
+        """
+        self._init_langfuse()
+        await self._init_pool()
+    
+    async def initialize_persistence(self):
+        """
+        Initialize ONLY observability + database persistence (checkpointer + store).
+        
+        Skips the LLM, middleware, and agent creation entirely - so no model API
+        keys are required. Used by the Streamlit UI's partial swap, where the
+        UI wants the real persistence backend (session checkpoints + virtual
+        filesystem) but still runs the mock agent runner.
+        
+        Delegates to the same private methods the full ``initialize()`` uses.
+        """
+        self._init_langfuse()
+        await self._init_pool()
+    
     # ==========================================
     # Private initialization methods
     # ==========================================
     
     def _init_langfuse(self):
-        """Initialize Langfuse observability client (optional, fails gracefully offline)."""
+        """Initialize Langfuse observability client (optional, fails gracefully offline).
+
+        ``self.langfuse_ok`` records whether the client actually authenticated -
+        a disabled client (missing env keys) makes ``auth_check()`` return False
+        instead of raising, which would otherwise look "connected".
+        """
         try:
             self.langfuse = get_client()
             # auth_check does network I/O - guard with try so offline doesn't crash initialize()
             try:
                 if self.langfuse.auth_check():
-                    print("Langfuse client is authenticated and ready!")
+                    print("Langfuse client is authenticated and ready!", flush=True)
+                    self.langfuse_ok = True
                 else:
-                    print("Authentication failed. Please check your credentials and host.")
+                    print("Authentication failed. Please check your credentials and host.", flush=True)
+                    self.langfuse_ok = False
             except Exception as e:
-                print(f"Langfuse auth_check failed ({e}), running without observability")
+                print(f"Langfuse auth_check failed ({e}), running without observability", flush=True)
                 self.langfuse_handler = None
+                self.langfuse_ok = False
                 return
             self.langfuse_handler = CallbackHandler()
         except Exception as e:
-            print(f"Langfuse init failed ({e}), running without observability")
+            print(f"Langfuse init failed ({e}), running without observability", flush=True)
             self.langfuse = None
             self.langfuse_handler = None
+            self.langfuse_ok = False
     
     def _init_system_prompt(self):
         """Load the system prompt from disk."""
@@ -201,8 +239,7 @@ class AgentRuntime:
         
         # Read the entire contents of the file into a string
         self.system_prompt_text = sys_prompt_path.read_text(encoding="utf-8")
-        print(f"Loaded system prompt ({len(self.system_prompt_text)} characters)")
-
+        print(f"Loaded system prompt ({len(self.system_prompt_text)} characters)", flush=True)
     # ==========================================
     # LLM Initialization (single function — all provider logic here)
     # ==========================================
@@ -353,6 +390,12 @@ class AgentRuntime:
             force_sqlite: When True, bypasses Postgres entirely and uses local SQLite
                           even when POSTGRES_URI is configured and reachable.
         """
+        # Env override so any caller (Streamlit UI launch, scripts, tests) can
+        # force the local backend without making Postgres unreachable or editing
+        # .env - in cmd `set POSTGRES_URI=` would UNSET the var and let .env win:
+        #   set REPORT_AGENT_FORCE_SQLITE=1
+        if not force_sqlite:
+            force_sqlite = os.getenv("REPORT_AGENT_FORCE_SQLITE", "").strip().lower() in ("1", "true", "yes")
         # Legacy code: sync pool implementation (just a reminder for devs)
         # """self.pool = ConnectionPool(
         #     conninfo=DB_URI,
@@ -398,17 +441,17 @@ class AgentRuntime:
                 
                 self.store = AsyncPostgresStore(self.pool)
                 await self.store.setup()
-                print(f"Using Postgres backend: {DB_URI[:30]}...")
+                print(f"Using Postgres backend: {DB_URI[:30]}...", flush=True)
                 return
             except Exception as e:
-                print(f"Postgres unreachable ({e}), falling back to local SQLite: {LOCAL_DB_PATH}")
+                print(f"Postgres unreachable ({e}), falling back to local SQLite: {LOCAL_DB_PATH}", flush=True)
                 if self.pool is not None:
                     try:
                         await self.pool.close()
                     except Exception:
                         pass
-                    self.pool = None
-        
+                self.pool = None
+
         # --- Fallback: local SQLite (same file, two tables - checkpoints + store) ---
         # This mirrors Postgres pattern: one server/file, separate tables for saver vs store.
         # Reuses same self.checkpointer / self.store variables, just different backend.
@@ -433,7 +476,7 @@ class AgentRuntime:
         
         self.store = AsyncSqliteStore(conn_store)
         await self.store.setup()
-        print(f"Using local SQLite backend: {LOCAL_DB_PATH}")
+        print(f"Using local SQLite backend: {LOCAL_DB_PATH}", flush=True)
     
     async def ensure_pool(self) -> bool:
         """Reopen the DB pool if it is missing or broken (transient remote drops).
