@@ -45,7 +45,6 @@ from a2a.helpers import (
 # Import runtime from report_agent for initialization in lifespan
 from agent.report_agent import runtime
 from langchain_core.messages import AIMessage, ToolMessage
-from langfuse import observe, propagate_attributes
 
 
 # Configure standard logger
@@ -147,7 +146,6 @@ class ReportA2AExecutor(AgentExecutor):
         config: dict,
         task: Task,
         task_updater: TaskUpdater,
-        gen,
     ) -> tuple:
         """Consume one agent astream pass; returns (report_artifact_sent, response_text).
 
@@ -203,10 +201,6 @@ class ReportA2AExecutor(AgentExecutor):
                                     elif msg.content:
                                         # This is the final text response from the LLM
                                         response_text = msg.content
-
-                                        gen.update(
-                                            output={"response": response_text}
-                                        )
                                 # CASE B: The Tools node has finished executing a tool
                                 elif isinstance(msg, ToolMessage):
                                     update_text = f"Agent received result from tool: {msg.status}"
@@ -256,7 +250,11 @@ class ReportA2AExecutor(AgentExecutor):
         # CRITICAL: High recursion limit for the multi-step scratchpad workflow
         config = {
             "configurable": {"thread_id": task.context_id},
-            "metadata": {"session.id": task.context_id}, # Add this line for Langfuse
+            # "metadata": {"session.id": task.context_id},  # NOTE, left for historical reasons
+            # "session.id" is not a key the Langfuse CallbackHandler recognises, so
+            # the line above was a no-op. "langfuse_session_id" below is the key that
+            # actually groups every turn of this thread under one Langfuse session.
+            "metadata": {"langfuse_session_id": task.context_id},
             "recursion_limit": 40, 
         }
         # 1. Initialize the flag BEFORE the streaming loop starts
@@ -266,38 +264,15 @@ class ReportA2AExecutor(AgentExecutor):
         
          # --- STREAMING LOOP ---
         # We stream the LangGraph agent execution node-by-node
-        # Manually added langfuse observation
-        # NOTE, unfortenatly there is no way to handle trace root level input, output, the functions for that are depreciated
-        # and langfuse langchain hanlder isn't populating langfuse properly, so only manual way remains.
-        # TODO: The simple metadata tag approach worked properly in tailscale db test (tests/acceptance/4_tailscale_db.py:34)
-        # via config["metadata"]["langfuse_session_id"]. Investigate whether manual span creation below can be replaced
-        # or simplified by relying on the metadata-based tracing instead.
+        # Langfuse tracing is driven entirely by the metadata tag on `config`
+        # above ("langfuse_session_id"): the LangChain CallbackHandler reads it at
+        # the chain root and propagates the session to every child observation, so
+        # all turns of one thread collapse into a single Langfuse session.
         # TODO: Langfuse may not be the only tracing option. Arize Phoenix is an alternative that could work with
         # SQLite as a local DB instead of a remote server, which would simplify dev/test environments.
-        with runtime.langfuse.start_as_current_observation(
-            as_type="span",
-            name="my-pipeline",
-            input={"query": text_query}
-        ) as root_span:
-            # Propagate session_id to all child observations
-            with propagate_attributes(
-                session_id=task.context_id,
-                trace_name="A2A-report-agent",
-                version="2.2"
-            ):
-                # All observations created here automatically have session_id
-                with root_span.start_as_current_observation(
-                    as_type="generation",
-                    name="generate-response",
-                    model="mistral"
-                ) as gen:
-                    report_artifact_sent, response_text = await self._consume_agent_stream(
-                        agent_query, config, task, task_updater, gen
-                    )
-            root_span.update(
-                output={"response": response_text}
-            )
-                            
+        report_artifact_sent, response_text = await self._consume_agent_stream(
+            agent_query, config, task, task_updater
+        )
 
         # --- FIX 1: Sanitize response_text --- #
         if isinstance(response_text, list):

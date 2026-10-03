@@ -418,7 +418,13 @@ class RealAgentRunnerAdapter:
         events: "queue.Queue[Any]" = queue.Queue()
         sentinel = object()
         final_parts: List[str] = []
-        config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        config = {
+            "configurable": {"thread_id": thread_id, "checkpoint_ns": ""},
+            # Langfuse reads this at the chain root and propagates it to every
+            # child observation, so all turns of one UI thread collapse into a
+            # single Langfuse session instead of one trace per model call.
+            "metadata": {"langfuse_session_id": thread_id},
+        }
         stream_input = {"messages": [{"role": "user", "content": message}]}
 
         def _print(*parts: Any) -> None:

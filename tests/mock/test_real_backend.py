@@ -230,6 +230,7 @@ class TestRealAgentRunnerAdapter:
         assert stream_mode is None
         assert config["configurable"]["thread_id"] == "th1"
         assert config["configurable"]["checkpoint_ns"] == ""
+        assert config["metadata"]["langfuse_session_id"] == "th1"
 
     def test_handles_top_level_messages_and_serialized_dicts(self, backend, monkeypatch):
         monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
