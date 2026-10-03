@@ -185,20 +185,6 @@ class AgentRuntime:
         self._init_langfuse()
         await self._init_pool()
     
-    async def initialize_persistence(self):
-        """
-        Initialize ONLY observability + database persistence (checkpointer + store).
-        
-        Skips the LLM, middleware, and agent creation entirely - so no model API
-        keys are required. Used by the Streamlit UI's partial swap, where the
-        UI wants the real persistence backend (session checkpoints + virtual
-        filesystem) but still runs the mock agent runner.
-        
-        Delegates to the same private methods the full ``initialize()`` uses.
-        """
-        self._init_langfuse()
-        await self._init_pool()
-    
     # ==========================================
     # Private initialization methods
     # ==========================================
