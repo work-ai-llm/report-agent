@@ -11,8 +11,10 @@
 #                         no token cost). Simulates a full agent run by yielding
 #                         a tool call, a tool result, and a final answer.
 #   MagicMock           → replaces runtime.langfuse (no Langfuse server reachable).
-#                         _process_task() uses langfuse spans as context managers;
-#                         a MagicMock satisfies that protocol with zero setup.
+#                         NOTE, left for historical reasons: _process_task() no
+#                         longer opens langfuse spans as context managers — tracing
+#                         is driven by the langfuse_session_id metadata tag on the
+#                         runnable config. The mock is harmless but no longer load-bearing.
 #   InMemoryTaskStore   → replaces the Postgres-backed task store.
 #
 # The two layers under test:
