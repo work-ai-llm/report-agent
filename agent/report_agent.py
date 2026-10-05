@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import time
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 import os
@@ -7,7 +8,7 @@ import logging
 import httpx
 import aiosqlite
 from pathlib import Path
-from dotenv import load_dotenv
+from dotenv import dotenv_values, find_dotenv, load_dotenv
 from langchain.agents import create_agent
 from langchain.tools import tool, ToolRuntime
 #from langgraph.checkpoint.memory import InMemorySaver
@@ -24,6 +25,7 @@ from langgraph.store.sqlite.aio import AsyncSqliteStore
 from deepagents.middleware import FilesystemMiddleware
 from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
 from langchain_core.rate_limiters import InMemoryRateLimiter
+from langchain.agents.middleware._retry import calculate_delay, should_retry_exception
 from langchain.agents.middleware import LLMToolEmulator, ModelRetryMiddleware
 from langchain_mistralai import ChatMistralAI # Required to attach rate limiter to the model
 from langchain_openai import ChatOpenAI   # OpenAI-compatible servers (llama.cpp, model server proxy)
@@ -149,6 +151,143 @@ _BACKEND_MODEL_DEFAULTS = {
 # ids are namespaced, so it is the only one where the absence of a "/" is a
 # reliable signal of a leftover value.
 _BACKEND_NAMESPACED_MODEL_IDS = frozenset({"openrouter"})
+
+
+# --- Credential-refresh retry middleware ---
+#
+# ModelRetryMiddleware as shipped retries with whatever credential the client
+# already holds. For an expired or rotated key that means the same 401 three
+# times, separated by ~2s/4s/8s of backoff, before giving up - which is why a
+# rotated key reads as a hard outage rather than a transient one (issue #13).
+#
+# This subclass keeps the parent's loop untouched and only adds one step ahead
+# of it: when a failure looks like an auth error, re-read the credential from
+# the environment and, if it actually changed, retry immediately. No backoff,
+# because the previous attempt carried information rather than failing on its
+# own merits.
+#
+# Auth detection is by class name rather than by importing the openai exception
+# types, so this module keeps working for a backend whose SDK is not installed -
+# the middleware is constructed unconditionally, while only openai_local and
+# openrouter ever produce a matching failure.
+
+_AUTH_ERROR_NAMES = frozenset({
+    "AuthenticationError",
+    "PermissionDeniedError",
+    "UnauthorizedError",
+})
+
+
+def _looks_like_auth_error(exc: BaseException) -> bool:
+    """True for a 401/403 from any layer, including wrapped SDK errors."""
+    for candidate in _exception_chain(exc):
+        if type(candidate).__name__ in _AUTH_ERROR_NAMES:
+            return True
+        status = getattr(candidate, "status_code", None)
+        if status in (401, 403):
+            return True
+    return False
+
+
+def _exception_chain(exc: BaseException):
+    """Yield ``exc`` and the causes/contexts under it, guarding against cycles."""
+    seen = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+class CredentialRefreshRetryMiddleware(ModelRetryMiddleware):
+    """``ModelRetryMiddleware`` that re-reads a rotated credential once.
+
+    The retry schedule is the parent's, unchanged: same ``max_retries``, same
+    backoff, same ``retry_on`` filtering, same ``_handle_failure`` behaviour.
+    The loop is re-implemented here rather than wrapped only because the refresh
+    has to happen *inside* an attempt. Wrapping instead - try once, refresh,
+    delegate - looks equivalent and is not: the outer call is an extra request
+    that the parent's budget does not know about, which changes the attempt
+    count for every exception type and skips the first backoff for all of them.
+
+    The one addition: when an attempt fails with an auth error and reloading
+    the credential actually changed it, the request is retried immediately, in
+    the same attempt slot. No delay, because the previous failure carried
+    information rather than failing on its own merits - the key had been
+    rotated, not the service flaked.
+    """
+
+    def __init__(self, refresh, **kwargs):
+        super().__init__(**kwargs)
+        self._refresh = refresh
+
+    def _maybe_refresh(self, exc: BaseException) -> bool:
+        if not _looks_like_auth_error(exc):
+            return False
+        try:
+            return bool(self._refresh())
+        except Exception as refresh_exc:  # pragma: no cover - never mask the error
+            print(
+                f"Credential refresh failed ({refresh_exc}); continuing with the "
+                f"original error.",
+                flush=True,
+            )
+            return False
+
+    def wrap_model_call(self, request, handler):
+        for attempt in range(self.max_retries + 1):
+            try:
+                return handler(request)
+            except Exception as exc:
+                if self._maybe_refresh(exc):
+                    try:
+                        return handler(request)
+                    except Exception as retry_exc:
+                        exc = retry_exc
+                attempts_made = attempt + 1
+                if not should_retry_exception(exc, self.retry_on):
+                    return self._handle_failure(exc, attempts_made)
+                if attempt < self.max_retries:
+                    delay = calculate_delay(
+                        attempt,
+                        backoff_factor=self.backoff_factor,
+                        initial_delay=self.initial_delay,
+                        max_delay=self.max_delay,
+                        jitter=self.jitter,
+                    )
+                    if delay > 0:
+                        time.sleep(delay)
+                else:
+                    return self._handle_failure(exc, attempts_made)
+        raise RuntimeError("Unexpected: retry loop completed without returning")
+
+    async def awrap_model_call(self, request, handler):
+        for attempt in range(self.max_retries + 1):
+            try:
+                return await handler(request)
+            except Exception as exc:
+                if self._maybe_refresh(exc):
+                    try:
+                        return await handler(request)
+                    except Exception as retry_exc:
+                        exc = retry_exc
+                attempts_made = attempt + 1
+                if not should_retry_exception(exc, self.retry_on):
+                    return self._handle_failure(exc, attempts_made)
+                if attempt < self.max_retries:
+                    delay = calculate_delay(
+                        attempt,
+                        backoff_factor=self.backoff_factor,
+                        initial_delay=self.initial_delay,
+                        max_delay=self.max_delay,
+                        jitter=self.jitter,
+                    )
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                else:
+                    return self._handle_failure(exc, attempts_made)
+        raise RuntimeError("Unexpected: retry loop completed without returning")
+
 
 DB_URI = os.getenv("POSTGRES_URI")
 
@@ -517,15 +656,109 @@ class AgentRuntime:
 
         # model request retry middleware, catches api exception and repeats the requests with intervals
         # the timer should be small, otherwise this stuck with rate_limiter and everything breaks
-        self.retry_middleware = ModelRetryMiddleware(
+        self.retry_middleware = CredentialRefreshRetryMiddleware(
+            refresh=self._reload_llm_credential,
             max_retries=3,
             retry_on=(Exception,), # Catch standard API errors
-            on_failure='raise',
+            # 'error' re-raises the underlying exception once the retry budget is
+            # spent. The value that was here before, 'raise', is not recognised:
+            # _handle_failure only re-raises for 'error' or a callable, and
+            # anything else formats the failure into a ModelResponse holding an
+            # AIMessage. That made a dead key surface as the agent apparently
+            # answering with an error string, which is why a rotated credential
+            # (#13) looked like a mysterious bad reply instead of a failure.
+            on_failure='error',
             backoff_factor=2.0,  
             initial_delay=2.0, # Wait 5s, then 10s, then 15 before retrying
             max_delay=10.0, # Will wait up to 60 seconds between retries if the API is struggling
             jitter=True
         )
+
+    def _reload_llm_credential(self) -> bool:
+        """Re-read the chat credential and push it into the live clients.
+
+        Called when a model call fails with an auth error, to recover from a
+        credential that changed underneath a running process. Returns True when
+        a live client was actually updated.
+
+        Why in-place rather than rebuilding the model: ``create_agent`` binds
+        ``model=self.llm`` when the graph is compiled, so a freshly constructed
+        ChatOpenAI would never be the object the graph calls. But the openai
+        clients resolve ``api_key`` per request (they build ``auth_headers`` on
+        each call), so assigning to it takes effect on the next request without
+        touching the compiled graph, the middleware stack, or the emulator that
+        captured ``llm_small`` at construction.
+
+        Both clients are updated. ChatOpenAI keeps a separate ``root_client``
+        and ``root_async_client``, and this agent is async end to end, so
+        updating only the sync one changes nothing at runtime.
+
+        The value comes from the ``.env`` FILE, preferring it over
+        ``os.environ``. That is the #13 case - a user editing ``.env`` while a
+        long-running server holds the old value - and it removes the "sync the
+        key, then restart the process" step.
+
+        Only the openai family is handled - openai_local and openrouter both
+        build on the openai SDK, whose clients expose the key as a plain
+        attribute. Mistral keeps its key inside its own client object with no
+        equivalent handle, so a mistral 401 falls through to the normal retry
+        path and fails as before.
+        """
+        if self.llm_backend == "mistral":
+            return False
+
+        # Read the key from the .env FILE, not from os.environ. load_dotenv()
+        # ran once at import, so os.environ holds the value as it was at
+        # startup and re-reading it here would return the stale key. But
+        # load_dotenv(override=True) is the wrong tool for the same reason: it
+        # makes .env outrank the live environment, which would silently undo any
+        # value a launcher had already put there.
+        #
+        # Precedence: the .env file if it defines the key, else os.environ. That
+        # is the #13 case - a user editing .env under a running server - without
+        # demoting every other source.
+        env_var = "OPENROUTER" if self.llm_backend == "openrouter" else "LLM_API_KEY"
+        new_key = None
+        try:
+            dotenv_path = find_dotenv()
+            if dotenv_path:
+                from_file = dotenv_values(dotenv_path).get(env_var)
+                if from_file is not None:
+                    new_key = from_file.strip()
+        except Exception as exc:  # pragma: no cover - fall back to os.environ
+            print(
+                f"Could not read {env_var} from .env ({exc}); using the "
+                f"environment value.",
+                flush=True,
+            )
+
+        if new_key is None:
+            new_key = (os.environ.get(env_var) or "").strip()
+        if not new_key:
+            new_key = "none"
+
+        updated = False
+        for model in (self.llm, self.llm_small):
+            # BOTH clients have to be updated. ChatOpenAI builds a sync
+            # `root_client` and a separate async `root_async_client`, and the
+            # agent only ever runs async (LangGraph is async throughout, and the
+            # Streamlit UI crosses an EventLoopThread). Updating only the sync
+            # one looks correct in a unit test with a fake client and changes
+            # nothing at runtime - the request keeps sending the old key.
+            for attr in ("root_client", "root_async_client"):
+                client = getattr(model, attr, None)
+                if client is None or getattr(client, "api_key", None) == new_key:
+                    continue
+                client.api_key = new_key
+                updated = True
+
+        if updated:
+            print(
+                f"Auth failed; reloaded {env_var} from .env into the "
+                f"{self.llm_backend} client(s). Retrying the request.",
+                flush=True,
+            )
+        return updated
     
     async def _init_pool(self, force_sqlite: bool = False):
         """Initialize database pool, checkpointer, and store.
