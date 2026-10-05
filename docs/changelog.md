@@ -48,6 +48,21 @@ After the initial agent (2026-08-28 → 2026-10-03).
   2026-09-08); `AGENTS.md` as the orientation and trap reference for agents
   (2026-10-03).
 
+### Security
+
+- **The A2A server no longer binds every network interface by default.** The bind
+  is now a two-way `--host` flag: `local` (the default) binds `127.0.0.1`, so the
+  port is reachable only from the host, and `all_interfaces` restores the previous
+  `0.0.0.0` behaviour, which is also what survives a Wi-Fi IP change. A specific
+  address is set with `A2A_BIND` rather than being a third flag value, since
+  pinning one interface gives up the IP-change resilience. The agent card's
+  advertised URL is derived from the bind, because the client sends every JSON-RPC
+  call to the address in the card rather than to the address it was pointed at —
+  previously the two could not disagree only because the wildcard bind happened to
+  cover whatever was advertised. There is still no authentication on the endpoint
+  and every caller shares one task-store owner, so the server says so on startup
+  when it is bound widely. (#32, #38)
+
 ### Changed
 
 - Storage framing is now Postgres-first with an automatic local SQLite fallback,

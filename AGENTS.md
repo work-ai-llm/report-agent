@@ -41,7 +41,8 @@ python -m streamlit_ui --agent mock --backend sqlite    # real persistence, mock
 python -m streamlit_ui --agent mocks                    # full in-memory sandbox
 python -m streamlit_ui --debug                          # print connectivity report first
 
-python agent/a2a_connector.py                           # A2A server (0.0.0.0, card at /.well-known/agent-card.json)
+python agent/a2a_connector.py                           # A2A server, loopback only
+python agent/a2a_connector.py --host all_interfaces      # A2A server on LAN + tailnet too
 python dev_tools/a2a_cli.py --server http://127.0.0.1:9999 send "build a report"
 python dev_tools/store_cli.py [--sqlite] {seed,wipe,inspect,list-sessions,export,delete,inspect-session,reconcile-files}
 python dev_tools/model_server_cli.py {status,launch,stop,resources,estimate,endpoint,chat}
@@ -125,9 +126,9 @@ Each of these cost real debugging time. They are not obvious from the code.
 
 Two suites, deliberately separate (see `tests/tests.md`).
 
-- **Mock** — `pytest`, no external services and no keys. This is the fast inner loop
-  and the gate for UI and adapter changes. Currently 104 tests, all passing.
-- **Acceptance** — numbered scripts in `tests/acceptance/`, driven against live
+- Mock — `pytest`, no external services and no keys. This is the fast inner loop
+  and the gate for UI and adapter changes.
+- Acceptance — numbered scripts in `tests/acceptance/`, driven against live
   services. Run them by explicit path.
 
 Two things that will waste your time otherwise:
@@ -147,7 +148,10 @@ Two things that will waste your time otherwise:
 - Provider credentials — local OpenAI-compatible server, OpenRouter, or Mistral.
 - Observability — Langfuse, optional, degrades to no-op when unreachable.
 - Storage — `POSTGRES_URI`, with local SQLite as the fallback.
-- A2A — advertised host and port.
+- A2A — the server's bind address is the `--host` flag, two presets only:
+  `local` (default) binds loopback, `all_interfaces` binds every NIC and is what
+  survives a Wi-Fi IP change. `A2A_BIND` is the escape hatch for a specific
+  address, and `A2A_HOST` only overrides the IP advertised in the agent card.
 - Logging — `LOG_LEVEL`, honoured at import.
 
 ## Working agreements
