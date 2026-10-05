@@ -1,8 +1,8 @@
-"""Error rendering for the A2A CLI (issue #33).
+"""Error rendering for the A2A CLI (issues #33 and #34).
 
-A protocol-level refusal escaped ``main()`` unhandled, so an ordinary, correct
-server rejection rendered as a Python traceback. The server's answer here is one
-line of text; the terminal showed a stack trace.
+The same defect seen from two sides: a protocol-level refusal and a Ctrl-C both
+escaped ``main()`` unhandled, so ordinary outcomes rendered as Python
+tracebacks. #33 covers the A2AError path, #34 the KeyboardInterrupt one.
 
 The tests drive the real ``main()`` - real argparse, real ``asyncio.run``, real
 subcommand - and stub only ``A2AClient.create``, which is where a server refusal
@@ -10,6 +10,7 @@ actually enters the client. Nothing opens a socket: the point is what the
 terminal shows, not that the server refuses correctly.
 """
 
+import asyncio
 import sys
 
 import pytest
@@ -161,6 +162,64 @@ class TestSuccessPath:
         out = capsys.readouterr().out
         assert "artifact text" in out
         assert "[server]" not in out
+
+
+class TestKeyboardInterruptRendering:
+    """#34: Ctrl-C is a disconnect, not a crash."""
+
+    def test_prints_one_clean_line_and_exits_130(self, run_cli, capsys):
+        code = run_cli(
+            ["subscribe", "--task", "t1"],
+            client=_BoomClient(KeyboardInterrupt()),
+        )
+        err = capsys.readouterr().err
+        # 130 is the conventional shell code for SIGINT.
+        assert code == 130
+        assert "Traceback" not in err
+        assert "KeyboardInterrupt" not in err
+
+    def test_message_states_that_the_server_keeps_working(self, run_cli, capsys):
+        # The property being demonstrated is that disconnecting does not kill the
+        # work, so the terminal should say so rather than leave it implied. A
+        # bare "disconnected" reads like the work was cancelled.
+        run_cli(["subscribe", "--task", "t1"], client=_BoomClient(KeyboardInterrupt()))
+        err = capsys.readouterr().err.lower()
+        assert "disconnected" in err
+        assert "server" in err
+
+    def test_is_not_reported_as_a_server_error(self, run_cli, capsys):
+        # A local Ctrl-C is not something the server said, so it must not share
+        # the [server] prefix or the exit code of a protocol refusal.
+        run_cli(["subscribe", "--task", "t1"], client=_BoomClient(KeyboardInterrupt()))
+        assert "[server]" not in capsys.readouterr().err
+
+    def test_goes_to_stderr(self, run_cli, capsys):
+        run_cli(["subscribe", "--task", "t1"], client=_BoomClient(KeyboardInterrupt()))
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "disconnected" in captured.err.lower()
+
+    def test_handles_interrupt_raised_inside_a_running_task(self):
+        """The real shape of a Ctrl-C: raised while a coroutine is mid-flight.
+
+        asyncio.run() cancels the main task and re-raises KeyboardInterrupt out
+        of itself, so the handler has to sit *outside* the asyncio.run call. A
+        handler wrapped around the individual protocol calls would never see it.
+        """
+        import inspect
+
+        source = inspect.getsource(a2a_cli.main)
+        run_call = source.index("asyncio.run")
+        handler = source.index("except KeyboardInterrupt")
+        assert handler > run_call, "KeyboardInterrupt must be caught outside asyncio.run"
+
+        async def interrupted():
+            raise KeyboardInterrupt
+
+        # Precondition for the ordering above to matter: the interrupt does
+        # escape asyncio.run rather than being swallowed inside it.
+        with pytest.raises(KeyboardInterrupt):
+            asyncio.run(interrupted())
 
 
 async def _return(value):

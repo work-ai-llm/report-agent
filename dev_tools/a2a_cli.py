@@ -31,7 +31,8 @@ else ``http://127.0.0.1:9999``.
 
 Exit codes: ``0`` success, ``1`` a protocol-level error reported by the server
 (printed as one ``[server] <ErrorType>: <message>`` line, with a hint naming the
-command to use instead where one applies), ``2`` bad usage from argparse.
+command to use instead where one applies), ``2`` bad usage from argparse,
+``130`` Ctrl-C (the client disconnected; the server keeps working).
 """
 
 import argparse
@@ -275,6 +276,17 @@ def main():
     args = parser.parse_args()
     try:
         asyncio.run(args.func(args))
+    except KeyboardInterrupt:
+        # Ctrl-C is a disconnect, not a crash. The server needs no change here:
+        # on client disconnect the SDK's producer task is independent of the HTTP
+        # request and a background consumer keeps persisting events, so the work
+        # continues. Only the client-side rendering was wrong.
+        #
+        # The message states that property rather than leaving it implied, since
+        # a bare "disconnected" reads like the work was cancelled. Exit 130 is
+        # the conventional shell code for SIGINT.
+        print("[client disconnected - the server keeps working]", file=sys.stderr)
+        raise SystemExit(130) from None
     except A2AError as exc:
         # Exit 1: the command failed, but for a reported reason rather than a
         # crash. `from None` because the traceback of the A2AError itself is
