@@ -324,7 +324,7 @@ class AgentRuntime:
                 return ChatOpenAI(
                     model=model,
                     base_url=os.getenv("LLM_BASE_URL") or "http://localhost:1234/v1",
-                    api_key=os.getenv("LLM_API_KEY", "none"),
+                    api_key=os.getenv("LLM_API_KEY", "").strip() or "none",
                     temperature=0.2,
                     streaming=streaming,
                     # Token counts, and why this flag has to be spelled out.
