@@ -327,12 +327,41 @@ class AgentRuntime:
                     api_key=os.getenv("LLM_API_KEY", "none"),
                     temperature=0.2,
                     streaming=streaming,
-                    # NOTE, token counts: without this every generation reports zero
-                    # tokens (promptTokens 0, usageDetails {}) in Langfuse. Passing an
-                    # explicit base_url stops langchain-openai auto-enabling
-                    # stream_usage, so the server is never asked for a usage chunk and
-                    # a streaming server has no reason to send one. Local llama.cpp
-                    # servers honour include_usage and then report usage.
+                    # Token counts, and why this flag has to be spelled out.
+                    #
+                    # `ChatOpenAI.stream_usage` defaults to None, and
+                    # langchain-openai only auto-flips None to True when the
+                    # client is talking to the DEFAULT OpenAI base URL
+                    # (langchain_openai/chat_models/base.py, the block guarded
+                    # by "Enable stream_usage by default if using default base
+                    # URL"). The line above always passes an explicit
+                    # `base_url`, so that auto-enable never fires and the flag
+                    # stays off. With it off, no `stream_options` is sent on the
+                    # wire at all, the server has no reason to emit a usage
+                    # chunk, and every generation lands in Langfuse as
+                    # promptTokens 0 / usageDetails {} - a silent zero, which is
+                    # what this used to do.
+                    #
+                    # Passing True explicitly overrides the auto-enable entirely;
+                    # it is not a workaround, it is the intended way to turn the
+                    # feature on for a custom endpoint. Verified on the wire:
+                    # the outgoing body then carries
+                    # stream_options={"include_usage": true} and a llama.cpp
+                    # server replies with a usage chunk before [DONE]. See
+                    # tests/experiments/exp_token_usage.py, which also runs the
+                    # stream_usage=False control to prove the flag is what makes
+                    # the difference.
+                    #
+                    # Note the counts arrive on an INTERMEDIATE streamed chunk,
+                    # not the last one - chunks[-1].usage_metadata is None. And
+                    # the OpenAI field names are renamed on the way in:
+                    # prompt_tokens -> input_tokens, completion_tokens ->
+                    # output_tokens. Cached prompt tokens are preserved
+                    # separately as input_token_details.cache_read rather than
+                    # folded in, and the Langfuse handler subtracts them from
+                    # `input` so its figure is the billable one, not the
+                    # headline. This is the only place token accounting exists
+                    # today; nothing in this repo reads the counts.
                     stream_usage=True,
                     timeout=timeout,
                     rate_limiter=None,
