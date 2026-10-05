@@ -28,9 +28,15 @@ Three modes are reported:
 - ``STREAMLIT_USE_MOCKS=1`` (default for dev) - all in-memory mocks.
 - ``STREAMLIT_USE_REAL_BACKEND=1`` (partial swap) - real SQLite/Postgres
   checkpointer + store, still the mock agent (no LLM wired yet).
-- ``STREAMLIT_USE_REAL_AGENT=1`` or no env (production) - full real integration:
-  real persistence + the real agent.
-- neither env - production mode, active by default.
+- ``STREAMLIT_USE_REAL_AGENT=1`` - full real integration: real persistence +
+  the real agent.
+- neither env - no real runtime, so nothing is probed and every line says so.
+
+Only the first two probe anything, and they probe real objects. When there is
+no real runtime to probe, every component reports "not probed" with the reason,
+rather than a hardcoded status: this report is a diagnosis, and a line that
+reads "connected" without having checked anything sends the reader down the
+wrong path.
 
 The probes use the same dependency objects the app will use. For mock mode the
 objects are stateless in-memory singletons, so a fresh probe and the app's
@@ -83,7 +89,26 @@ def component_status_lines() -> List[str]:
         from streamlit_ui.services import real_backend as rb
 
         return rb.component_status_lines()
-    return _production_component_lines()
+    # No real runtime to probe. The previous fallback here returned five
+    # hardcoded "connected" lines - it asserted a state it never checked, and
+    # named MISTRAL_API_KEY while the usual backend is a local llama.cpp
+    # server. A wrong answer that looks authoritative is worse than no answer:
+    # it stays green through a broken setup. Say what is actually true instead.
+    #
+    # Reaching this point with STREAMLIT_USE_REAL_AGENT set is not expected -
+    # is_real_mode() would have routed to the real prober above. The single
+    # reason is kept accurate rather than assumed away.
+    if os.environ.get("STREAMLIT_USE_REAL_AGENT", "").strip().lower() in _MOCK_MODES:
+        reason = "real agent requested but not initialized yet"
+    else:
+        reason = "real agent not started - pass --agent real to probe it"
+    return [
+        f"checkpointer: not probed ({reason})",
+        f"virtual filesystem store: not probed ({reason})",
+        f"llm api: not probed ({reason})",
+        f"agent object: not probed ({reason})",
+        f"observability (langfuse): not probed ({reason})",
+    ]
 
 
 def _mock_component_lines() -> List[str]:
@@ -120,16 +145,6 @@ def _mock_component_lines() -> List[str]:
     lines.append("observability (langfuse): not connected (not wired yet)")
 
     return lines
-
-
-def _production_component_lines() -> List[str]:
-    return [
-        "checkpointer: connected (production - AgentRuntime persistence, verified at app startup)",
-        "virtual filesystem store: connected (production - AgentRuntime store, verified at app startup)",
-        "llm api: connected (production - requires MISTRAL_API_KEY in .env)",
-        "agent object: connected (production - real LangGraph agent)",
-        "observability (langfuse): connected (production - requires LANGFUSE keys in .env)",
-    ]
 
 
 def print_status_banner() -> None:

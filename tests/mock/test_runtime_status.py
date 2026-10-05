@@ -79,13 +79,43 @@ class TestMockModeReport:
 
 
 class TestProductionModeReport:
-    """Connectivity lines when the production backend is requested."""
+    """Connectivity lines when no real runtime is available to probe."""
 
-    def test_all_components_report_production_active(self, monkeypatch):
+    def test_all_components_report_not_probed(self, monkeypatch):
+        # No real runtime means nothing was checked, so nothing may claim to be
+        # "connected". This replaced a branch that returned five hardcoded
+        # "connected (production ...)" lines - including one naming
+        # MISTRAL_API_KEY while the usual backend is a local llama.cpp server.
+        # An unverified green banner is worse than an honest gap: it survives a
+        # broken setup instead of pointing at it.
         monkeypatch.delenv("STREAMLIT_USE_MOCKS", raising=False)
+        monkeypatch.delenv("STREAMLIT_USE_REAL_BACKEND", raising=False)
+        monkeypatch.delenv("STREAMLIT_USE_REAL_AGENT", raising=False)
         lines = rs.component_status_lines()
         assert len(lines) == 5
         for line in lines:
             assert line.startswith(("checkpointer:", "virtual filesystem store:",
                                     "llm api:", "agent object:", "observability (langfuse):"))
-            assert "connected (production" in line
+            assert "connected" not in line
+            assert "not probed" in line
+
+    def test_llm_line_explains_how_to_probe(self, monkeypatch):
+        monkeypatch.delenv("STREAMLIT_USE_MOCKS", raising=False)
+        monkeypatch.delenv("STREAMLIT_USE_REAL_BACKEND", raising=False)
+        monkeypatch.delenv("STREAMLIT_USE_REAL_AGENT", raising=False)
+        llm_line = next(ln for ln in rs.component_status_lines()
+                        if ln.startswith("llm api:"))
+        assert "--agent real" in llm_line
+
+    def test_real_agent_line_names_the_resolved_backend(self, monkeypatch):
+        # The point of storing runtime.llm_backend: with the real agent up, the
+        # line has to say WHICH backend answered, because the backend decides
+        # which model ids are valid. A stale AGENT_MODEL carried across backends
+        # only fails later, at request time, with a 404 - so this line is the
+        # only place that can be checked cheaply.
+        monkeypatch.delenv("STREAMLIT_USE_MOCKS", raising=False)
+        monkeypatch.setenv("STREAMLIT_USE_REAL_AGENT", "1")
+        llm_line = next(ln for ln in rs.component_status_lines()
+                        if ln.startswith("llm api:"))
+        assert "backend:" in llm_line
+        assert "model:" in llm_line

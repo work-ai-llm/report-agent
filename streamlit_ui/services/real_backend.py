@@ -920,7 +920,12 @@ def component_status_lines() -> List[str]:
             getattr(runtime.llm, "name", None),
         ]
         model = next((c for c in candidates if c), "?")
-        lines.append(f"llm api: configured (model: {model})")
+        # Report the backend too. The backend decides which model ids are even
+        # valid, so "configured (model: X)" without it is not enough to tell a
+        # working setup from a stale AGENT_MODEL carried over from another
+        # backend - that combination fails at request time with a 404, not here.
+        backend = getattr(runtime, "llm_backend", None) or "?"
+        lines.append(f"llm api: configured (backend: {backend}, model: {model})")
     else:
         lines.append("llm api: not connected (agent not wired - use STREAMLIT_USE_REAL_AGENT=1)")
 

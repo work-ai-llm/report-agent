@@ -193,6 +193,9 @@ class AgentRuntime:
         self.fs_middleware = None
         self.llm = None
         self.llm_small = None
+        # Which backend _init_llm resolved. Set there, not here; declared so the
+        # attribute exists before initialize() for code that reads it early.
+        self.llm_backend = None
         self.tool_emulator = None
         self.retry_middleware = None
     
@@ -293,6 +296,11 @@ class AgentRuntime:
         ``AGENT_EMULATOR_MODEL`` env vars.  Falls back to provider-specific
         defaults (``LLM_MODEL`` for openai_local, free-tier for openrouter, etc.).
         Both models become instance attributes: ``self.llm`` and ``self.llm_small``.
+
+        The resolved backend name is kept on ``self.llm_backend`` so that
+        anything outside this module can report what was actually selected,
+        rather than the reader having to re-derive it from the environment.
+        See ``streamlit_ui/services/real_backend.py::component_status_lines``.
         """
         # --- Resolve backend ---
         backend = (os.getenv("LLM_BACKEND") or "").strip().lower()
@@ -303,6 +311,10 @@ class AgentRuntime:
                 backend = "openrouter"
             else:
                 backend = "mistral"
+
+        # Kept for anything that needs to name the selected backend without
+        # re-reading the environment (status output, diagnostics, errors).
+        self.llm_backend = backend
 
         # --- Per-backend default model id ---
         # TODO, for later, to remake nested function pattern into unified 1 function
