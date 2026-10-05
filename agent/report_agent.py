@@ -111,6 +111,45 @@ elif _TIER >= _LOG_TIERS["FULL"]:
 # Module-level constants (safe, no side effects)
 # ==========================================
 
+# Default model ids per backend, keyed by role.
+#
+# These are DEFAULTS, not overrides. AGENT_MODEL / AGENT_EMULATOR_MODEL sit on
+# top of them, and they are backend-agnostic on purpose: one pair of names for
+# all three backends beats three pairs, and a user who switches LLM_BACKEND
+# should not have to learn a new variable.
+#
+# The hazard that follows from "backend-agnostic" is an override left over from
+# a different backend - AGENT_MODEL=ornith survives a switch to openrouter,
+# where it is not a valid model id, and the failure surfaces as a 404 from the
+# provider on the first call rather than at startup. So the id a user actually
+# asked for is validated against the selected backend below, and a mismatch is
+# reported at startup where it can be read.
+#
+# There is deliberately no per-backend "fallback default" variable any more.
+# LLM_MODEL used to serve that role for openai_local alone, which made a
+# backend-specific knob look like a global one.
+_BACKEND_MODEL_DEFAULTS = {
+    # Local OpenAI-compatible server (llama.cpp and friends).
+    "openai_local": {
+        "agent": "ornith",
+        "emulator": "ornith",
+    },
+    # OpenRouter free tier. Ids are namespaced "<vendor>/<model>".
+    "openrouter": {
+        "agent": "inclusionai/ling-3.0-flash-sante:free",
+        "emulator": "inclusionai/ling-3.0-flash:free",
+    },
+    "mistral": {
+        "agent": "mistral-medium-latest",
+        "emulator": "mistral-small-latest",
+    },
+}
+
+# Model ids that only exist on one backend. OpenRouter is the only one whose
+# ids are namespaced, so it is the only one where the absence of a "/" is a
+# reliable signal of a leftover value.
+_BACKEND_NAMESPACED_MODEL_IDS = frozenset({"openrouter"})
+
 DB_URI = os.getenv("POSTGRES_URI")
 
 CONTEXT_DIR = Path(__file__).parent / "context"
@@ -293,9 +332,13 @@ class AgentRuntime:
           ``LLM_BASE_URL`` → openai_local, ``OPENROUTER`` → openrouter, else mistral.
 
         Model ids (agent / emulator) come from ``AGENT_MODEL`` /
-        ``AGENT_EMULATOR_MODEL`` env vars.  Falls back to provider-specific
-        defaults (``LLM_MODEL`` for openai_local, free-tier for openrouter, etc.).
-        Both models become instance attributes: ``self.llm`` and ``self.llm_small``.
+        ``AGENT_EMULATOR_MODEL``. These two are backend-agnostic by design -
+        one pair of names for every backend. Each falls back to that backend's
+        default from ``_BACKEND_MODEL_DEFAULTS``, so switching ``LLM_BACKEND``
+        switches the default model with it and no other edit is needed. An
+        override that cannot belong to the selected backend is reported and
+        ignored rather than passed through to fail later. Both models become
+        instance attributes: ``self.llm`` and ``self.llm_small``.
 
         The resolved backend name is kept on ``self.llm_backend`` so that
         anything outside this module can report what was actually selected,
@@ -319,16 +362,16 @@ class AgentRuntime:
         # --- Per-backend default model id ---
         # TODO, for later, to remake nested function pattern into unified 1 function
         # since it works for now, then i'll leave it for later
-        def _default_model(role: str) -> str:
-            if backend == "openai_local":
-                return os.getenv("LLM_MODEL", "ornith")
-            if backend == "openrouter":
-                return (
-                    "inclusionai/ling-3.0-flash-sante:free" if role == "agent"
-                    else "inclusionai/ling-3.0-flash:free"
-                )
-            # mistral
-            return "mistral-medium-latest" if role == "agent" else "mistral-small-latest"
+        # NOTE, A table rather than a nested if-chain, so that adding a backend is one
+        # row instead of a new branch in two places. Roles are "agent" (the model
+        # that does the work) and "emulator" (the cheap model behind
+        # LLMToolEmulator, only wired in when debug_mode is on).
+        defaults = _BACKEND_MODEL_DEFAULTS.get(backend)
+        if defaults is None:
+            raise ValueError(
+                f"Unknown LLM_BACKEND {backend!r}; expected one of "
+                f"{sorted(_BACKEND_MODEL_DEFAULTS)}."
+            )
 
         # --- Build one model instance ---
         def _build(model: str, timeout: float, max_retries: int):
@@ -402,8 +445,30 @@ class AgentRuntime:
             raise ValueError(f"Unknown LLM_BACKEND: {backend!r} (use 'openai_local', 'openrouter', or 'mistral')")
 
         # --- Create both models ---
-        self.llm      = _build(os.getenv("AGENT_MODEL")      or _default_model("agent"),    180.0, 3)
-        self.llm_small = _build(os.getenv("AGENT_EMULATOR_MODEL") or _default_model("emulator"), 60.0, 0)
+        def _resolve(role: str, env_var: str) -> str:
+            """Pick the model id for `role`: env override, else backend default."""
+            override = (os.getenv(env_var) or "").strip()
+            if not override:
+                return defaults[role]
+            # Catch the cross-backend leftover here rather than letting it reach
+            # the provider. It costs nothing when the override is fine, and when
+            # it is not, the message says which variable to change instead of
+            # leaving a 404 to be interpreted from a stack trace mid-conversation.
+            if backend in _BACKEND_NAMESPACED_MODEL_IDS and "/" not in override:
+                print(
+                    f"WARNING: {env_var}={override!r} is not a valid model id for "
+                    f"backend {backend!r}, whose ids are namespaced "
+                    f"'<vendor>/<model>' (e.g. {defaults[role]!r}). "
+                    f"Using the {backend} default instead. This usually means the "
+                    f"value was left over from a different LLM_BACKEND - either "
+                    f"namespaced it, or unset {env_var} to use the default.",
+                    flush=True,
+                )
+                return defaults[role]
+            return override
+
+        self.llm      = _build(_resolve("agent", "AGENT_MODEL"), 180.0, 3)
+        self.llm_small = _build(_resolve("emulator", "AGENT_EMULATOR_MODEL"), 60.0, 0)
 
         print(
             f"Resolved LLM: {type(self.llm).__name__} "
