@@ -1,10 +1,10 @@
 """Tests for the ``python -m streamlit_ui`` CLI runtime-selection flags.
 
-The CLI translates ``--backend`` / ``--agent`` / ``--streaming`` into the same
-environment variables the service layer already reads, so the app, debug
-banner and backend construction logic are unchanged. These tests lock the
-translation table: flag → env var, value validation, and pass-through of
-Streamlit's own args.
+The CLI translates ``--backend`` / ``--agent`` / ``--llm-backend`` /
+``--streaming`` into the same environment variables the service layer already
+reads, so the app, debug banner and backend construction logic are unchanged.
+These tests lock the translation table: flag → env var, value validation, and
+pass-through of Streamlit's own args.
 """
 
 import os
@@ -20,6 +20,7 @@ RELEVANT_KEYS = (
     "STREAMLIT_USE_REAL_BACKEND",
     "STREAMLIT_USE_MOCKS",
     "STREAMLIT_STREAM",
+    "LLM_BACKEND",
 )
 _TRUE = ("1", "true", "yes")
 
@@ -163,6 +164,91 @@ class TestValidation:
         err = capsys.readouterr().err
         assert "usage:" in err
         assert "--backend" in err
+
+
+class TestLlmBackendFlag:
+    """``--llm-backend`` selects the chat backend and nothing else."""
+
+    @pytest.mark.parametrize("name", ["openai_local", "openrouter", "mistral"])
+    def test_each_backend_is_accepted(self, name):
+        remaining, _debug = m._apply_runtime_flags(["--llm-backend", name])
+        assert os.environ["LLM_BACKEND"] == name
+        assert remaining == []
+
+    def test_equals_form(self):
+        remaining, _debug = m._apply_runtime_flags(["--llm-backend=openrouter"])
+        assert os.environ["LLM_BACKEND"] == "openrouter"
+        assert remaining == []
+
+    def test_composes_with_other_flags(self):
+        remaining, debug = m._apply_runtime_flags([
+            "--debug", "--backend", "sqlite", "--agent", "real",
+            "--llm-backend", "openrouter",
+        ])
+        assert debug is True
+        assert remaining == []
+        assert _env_export() == {
+            "REPORT_AGENT_FORCE_SQLITE": "1",
+            "STREAMLIT_USE_REAL_AGENT": "1",
+            "LLM_BACKEND": "openrouter",
+        }
+
+    def test_unknown_backend_raises(self):
+        with pytest.raises(ValueError, match="llm-backend"):
+            m._apply_runtime_flags(["--llm-backend", "gemini"])
+
+    def test_missing_value_raises(self):
+        with pytest.raises(ValueError, match="llm-backend"):
+            m._apply_runtime_flags(["--llm-backend"])
+
+    def test_absent_flag_leaves_env_untouched(self):
+        os.environ["LLM_BACKEND"] = "mistral"
+        m._apply_runtime_flags(["--agent", "real"])
+        assert os.environ["LLM_BACKEND"] == "mistral"
+
+    def test_flag_overrides_dotenv_value(self, monkeypatch, capsys):
+        # load_dotenv does not override, and the flag is written before the
+        # agent module is imported, so the flag is what _init_llm will read.
+        monkeypatch.setenv("LLM_BACKEND", "openai_local")
+        m._apply_runtime_flags(["--llm-backend", "openrouter"])
+        assert os.environ["LLM_BACKEND"] == "openrouter"
+        out = capsys.readouterr().out
+        assert "openai_local -> openrouter" in out
+
+    def test_no_note_when_value_is_unchanged(self, monkeypatch, capsys):
+        monkeypatch.setenv("LLM_BACKEND", "openrouter")
+        m._apply_runtime_flags(["--llm-backend", "openrouter"])
+        assert "->" not in capsys.readouterr().out
+
+    def test_model_vars_are_never_written(self, monkeypatch):
+        # The flag selects a backend, never a model. AGENT_MODEL /
+        # AGENT_EMULATOR_MODEL are backend-agnostic, so silently rewriting them
+        # here would be choosing a model on the user's behalf; the runtime warns
+        # instead when an override cannot belong to the selected backend.
+        monkeypatch.setenv("AGENT_MODEL", "ornith")
+        monkeypatch.setenv("AGENT_EMULATOR_MODEL", "ornith")
+        m._apply_runtime_flags(["--llm-backend", "openrouter"])
+        assert os.environ["AGENT_MODEL"] == "ornith"
+        assert os.environ["AGENT_EMULATOR_MODEL"] == "ornith"
+
+    def test_accepted_values_match_the_agent_table(self):
+        # __main__ must not import agent.report_agent (that would drag in the
+        # runtime and its dependencies), so the two lists are duplicated. This
+        # is what keeps them from drifting apart.
+        from agent.report_agent import _BACKEND_MODEL_DEFAULTS
+
+        assert set(m._LLM_BACKENDS) == set(_BACKEND_MODEL_DEFAULTS)
+
+    def test_help_documents_the_flag_and_the_model_limit(self, capsys):
+        with pytest.raises(SystemExit):
+            m.main(["--help"])
+        out = capsys.readouterr().out
+        assert "--llm-backend" in out
+        assert "openai_local" in out
+        # The help has to say where model ids actually come from, since the flag
+        # cannot set them.
+        assert "AGENT_MODEL" in out
+        assert "_BACKEND_MODEL_DEFAULTS" in out
 
 
 class TestHelp:

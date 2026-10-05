@@ -51,10 +51,17 @@ _DEFAULT_ARGS = ["run", "streamlit_ui/app.py"]
 _DEBUG_FLAG = "--debug"
 _BACKEND_FLAG = "--backend"
 _AGENT_FLAG = "--agent"
+_LLM_BACKEND_FLAG = "--llm-backend"
 _STREAMING_FLAG = "--streaming"
 _NO_STREAMING_FLAG = "--no-streaming"
 _BACKENDS = ("sqlite", "postgres")
 _AGENTS = ("mock", "real", "mocks")
+# Must match AgentRuntime._BACKEND_MODEL_DEFAULTS in agent/report_agent.py, which
+# is what actually raises on an unknown name. Kept as a literal here on purpose:
+# this module must stay importable without pulling in the agent runtime and its
+# dependencies, so the two lists cannot share a constant. test_streamlit_main_cli
+# asserts they agree.
+_LLM_BACKENDS = ("openai_local", "openrouter", "mistral")
 _HELP_FLAGS = ("-h", "--help")
 
 
@@ -62,7 +69,9 @@ def _usage(prog: str = "python -m streamlit_ui") -> str:
     """The custom CLI help text (shown on ``-h`` / ``--help`` / errors)."""
     return (
         f"usage: {prog} [--debug] [--backend sqlite|postgres] "
-        f"[--agent mock|real|mocks] [--streaming|--no-streaming] "
+        f"[--agent mock|real|mocks] "
+        f"[--llm-backend openai_local|openrouter|mistral] "
+        f"[--streaming|--no-streaming] "
         f"[streamlit args...]\n"
         f"\n"
         f"Runtime selection (each flag overrides the equivalent env var when\n"
@@ -79,6 +88,21 @@ def _usage(prog: str = "python -m streamlit_ui") -> str:
         f"      mock    mock agent + real persistence (no API keys needed)\n"
         f"      mocks   full in-memory sandbox (mock checkpointer, store + agent)\n"
         f"                              Default: real\n"
+        f"  --llm-backend NAME          which chat backend the real agent uses:\n"
+        f"      openai_local  any OpenAI-compatible server (LLM_BASE_URL)\n"
+        f"      openrouter    OpenRouter free tier (OPENROUTER)\n"
+        f"      mistral       Mistral API (MISTRAL_API_KEY)\n"
+        f"\n"
+        f"                              Sets LLM_BACKEND. The model id is NOT\n"
+        f"                              selected here: each backend has its own\n"
+        f"                              id syntax (OpenRouter ids are namespaced\n"
+        f"                              <vendor>/<model>), so the backend's\n"
+        f"                              default model is used. To choose a model,\n"
+        f"                              set AGENT_MODEL (and/or\n"
+        f"                              AGENT_EMULATOR_MODEL) in .env. Defaults\n"
+        f"                              live in agent/report_agent.py\n"
+        f"                              (_BACKEND_MODEL_DEFAULTS).\n"
+        f"                              No effect with --agent mock/mocks.\n"
         f"  --streaming / --no-streaming   render live token deltas in the chat\n"
         f"                              (Default: streaming on)\n"
         f"                              (WIP: flag is plumbed but live token\n"
@@ -99,8 +123,8 @@ def _apply_runtime_flags(args):
 
     Returns:
         Tuple ``(remaining, debug)`` where ``remaining`` is ``args`` with
-        ``--debug`` / ``--backend`` / ``--agent`` stripped and ``debug`` is
-        True when ``--debug`` was present.
+        ``--debug`` / ``--backend`` / ``--agent`` / ``--llm-backend`` stripped
+        and ``debug`` is True when ``--debug`` was present.
 
     Raises:
         ValueError: A flag has no value or an unrecognized value.
@@ -108,10 +132,17 @@ def _apply_runtime_flags(args):
     A present flag always wins over any pre-existing env value; a flag that is
     absent leaves the environment untouched (so the usual env-var paths and
     the production default still behave as before).
+
+    Ordering note: the flags are applied to ``os.environ`` here, and
+    ``agent.report_agent`` is imported later - via
+    ``real_backend.get_real_backend()``. So a flag is already in place before
+    ``load_dotenv()`` runs, and since that call does not override existing
+    values, the flag wins over .env.
     """
     remaining: list = []
     backend = None
     agent = None
+    llm_backend = None
     streaming = None
     debug = False
     i = 0
@@ -121,7 +152,11 @@ def _apply_runtime_flags(args):
             debug = True
         elif arg == _STREAMING_FLAG or arg == _NO_STREAMING_FLAG:
             streaming = arg == _STREAMING_FLAG
-        elif arg == _BACKEND_FLAG or arg == _AGENT_FLAG:
+        elif (
+            arg == _BACKEND_FLAG
+            or arg == _AGENT_FLAG
+            or arg == _LLM_BACKEND_FLAG
+        ):
             flag = arg
             i += 1
             if i >= len(args):
@@ -131,20 +166,36 @@ def _apply_runtime_flags(args):
                 if value not in _BACKENDS:
                     raise ValueError(f"{flag}: unknown value {value!r}; choose from {_BACKENDS}")
                 backend = value
-            else:
+            elif flag == _AGENT_FLAG:
                 if value not in _AGENTS:
                     raise ValueError(f"{flag}: unknown value {value!r}; choose from {_AGENTS}")
                 agent = value
-        elif arg.startswith(_BACKEND_FLAG + "=") or arg.startswith(_AGENT_FLAG + "="):
+            else:
+                if value not in _LLM_BACKENDS:
+                    raise ValueError(
+                        f"{flag}: unknown value {value!r}; choose from {_LLM_BACKENDS}"
+                    )
+                llm_backend = value
+        elif (
+            arg.startswith(_BACKEND_FLAG + "=")
+            or arg.startswith(_AGENT_FLAG + "=")
+            or arg.startswith(_LLM_BACKEND_FLAG + "=")
+        ):
             flag, value = arg.split("=", 1)
             if flag == _BACKEND_FLAG:
                 if value not in _BACKENDS:
                     raise ValueError(f"{flag}: unknown value {value!r}; choose from {_BACKENDS}")
                 backend = value
-            else:
+            elif flag == _AGENT_FLAG:
                 if value not in _AGENTS:
                     raise ValueError(f"{flag}: unknown value {value!r}; choose from {_AGENTS}")
                 agent = value
+            else:
+                if value not in _LLM_BACKENDS:
+                    raise ValueError(
+                        f"{flag}: unknown value {value!r}; choose from {_LLM_BACKENDS}"
+                    )
+                llm_backend = value
         else:
             remaining.append(arg)
         i += 1
@@ -172,6 +223,30 @@ def _apply_runtime_flags(args):
     if streaming is not None:
         os.environ["STREAMLIT_STREAM"] = "1" if streaming else "0"
 
+    # LLM backend. Sets LLM_BACKEND, which AgentRuntime._init_llm reads when it
+    # builds the chat models.
+    #
+    # AGENT_MODEL / AGENT_EMULATOR_MODEL are deliberately NOT touched. They are
+    # backend-agnostic, so a value left over from the previously selected
+    # backend survives the switch and is then wrong for the new one - which is
+    # how `LLM_BACKEND=openrouter` ended up asking for `ornith` and 404ing. The
+    # agent already warns and falls back when it can detect that
+    # (_BACKEND_NAMESPACED_MODEL_IDS in report_agent.py), but only for backends
+    # whose id syntax makes a leftover detectable. Rather than silently editing
+    # the user's model choice, say what is set and let them decide: picking the
+    # model is an explicit act, either in .env or in the defaults table.
+    if llm_backend is not None:
+        previous = os.environ.get("LLM_BACKEND")
+        os.environ["LLM_BACKEND"] = llm_backend
+        if previous and previous != llm_backend:
+            print(
+                f"note: LLM_BACKEND {previous} -> {llm_backend} (--llm-backend). "
+                f"Model ids are unchanged; check AGENT_MODEL / AGENT_EMULATOR_MODEL "
+                f"in .env are valid for {llm_backend}, or leave them unset to use "
+                f"that backend's defaults.",
+                flush=True,
+            )
+
     return remaining, debug
 
 
@@ -180,11 +255,11 @@ def main(argv=None) -> None:
 
     Args:
         argv: Optional argument list (defaults to ``sys.argv[1:]``). Runtime
-              selection flags (``--backend`` / ``--agent`` / ``--debug``) are
-              consumed and stripped; everything else is passed through, so
-              ``python -m streamlit_ui run app.py`` works exactly like ``python
-              -m streamlit run app.py``. With no arguments it defaults to ``run
-              streamlit_ui/app.py``.
+              selection flags (``--backend`` / ``--agent`` / ``--llm-backend`` /
+              ``--debug``) are consumed and stripped; everything else is passed
+              through, so ``python -m streamlit_ui run app.py`` works exactly
+              like ``python -m streamlit run app.py``. With no arguments it
+              defaults to ``run streamlit_ui/app.py``.
     """
     args = list(argv) if argv is not None else sys.argv[1:]
 
