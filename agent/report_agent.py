@@ -279,11 +279,12 @@ class AgentRuntime:
                     api_key=os.getenv("LLM_API_KEY", "none"),
                     temperature=0.2,
                     streaming=streaming,
-                    # Ask the server for a final usage chunk while streaming.
-                    # langchain-openai only auto-enables this for the default OpenAI
-                    # base URL, so an explicit base_url silently turns it off and
-                    # every streamed generation reports zero tokens. Local
-                    # llama.cpp servers honour include_usage and then report usage.
+                    # NOTE, token counts: without this every generation reports zero
+                    # tokens (promptTokens 0, usageDetails {}) in Langfuse. Passing an
+                    # explicit base_url stops langchain-openai auto-enabling
+                    # stream_usage, so the server is never asked for a usage chunk and
+                    # a streaming server has no reason to send one. Local llama.cpp
+                    # servers honour include_usage and then report usage.
                     stream_usage=True,
                     timeout=timeout,
                     rate_limiter=None,
