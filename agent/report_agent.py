@@ -39,24 +39,72 @@ load_dotenv()
 # ==========================================
 # Logging setup (global process state, stays at module level)
 # ==========================================
-# Selectable via env: LOG_LEVEL=DEBUG for httpx/langchain, else INFO (default)
-# Best practice (vs hard-coded DEBUG): use env var so import doesn't force verbose
-# Professional codebases use logging.getLogger(__name__) + dictConfig/env, not basicConfig(DEBUG) at import
-LOG_LEVEL_STR = os.getenv("LOG_LEVEL", "INFO").upper()
-LOG_LEVEL = getattr(logging, LOG_LEVEL_STR, logging.INFO)
-logging.basicConfig(level=LOG_LEVEL)
-# Only enable verbose for httpx/httpcore/langchain when explicitly DEBUG
-if LOG_LEVEL == logging.DEBUG:
-    logging.getLogger("httpx").setLevel(logging.DEBUG)
-    logging.getLogger("httpcore").setLevel(logging.DEBUG)
-    logging.getLogger("langchain").setLevel(logging.DEBUG)
-else:
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("langchain").setLevel(logging.WARNING)
-# aiosqlite DEBUG is noisy (every PRAGMA/SELECT) - keep at INFO unless LOG_LEVEL==DEBUG
-if LOG_LEVEL != logging.DEBUG:
-    logging.getLogger("aiosqlite").setLevel(logging.WARNING)
+# ALLOWLIST at one tier, plain pass-through above it.
+#
+# `import logging` hands every module in the process the SAME root logger, so
+# `logging.getLogger(name)` only ever creates a handle - it selects nothing. A
+# logger's effective level is its own if one was set, otherwise the nearest
+# ancestor's, otherwise root's (NOTSET means inherit). That is exactly why the
+# old denylist leaked: it silenced the three library names it happened to know,
+# and when the openai SDK moved from httpx to httpx2 the new logger inherited root
+# and started printing. A denylist is a list of today's dependencies; it cannot
+# know about tomorrow's.
+#
+# Four tiers, chosen by LOG_LEVEL at import so that importing this module never
+# forces verbosity:
+#
+#   NONE    - nothing at all. The default: this is a tool you drive, not a server
+#             you watch, and silence is the only reliably readable setting.
+#   INFO    - one line per LLM HTTP request, plus warnings and errors. Both HTTP
+#             client names are listed because the backends use different
+#             libraries: the openai SDK logs to `httpx2`, the openrouter SDK to
+#             plain `httpx`. Naming only one leaves the other backend looking
+#             mute, which is what issue #24 was.
+#   FULL    - root at INFO, so every logger in the process reports at INFO. This
+#             is the "tell me what the libraries are doing" tier.
+#   DEBUG   - root at DEBUG: every logger at DEBUG, including ones nobody named.
+#
+# This governs `logging` only. The startup, fallback and resolution messages in
+# this module are `print()` calls rather than log records, so they still appear
+# at NONE.
+LOG_LEVEL_STR = os.getenv("LOG_LEVEL", "NONE").upper()
+_LOG_TIERS = {"NONE": 0, "INFO": 1, "FULL": 2, "DEBUG": 3}
+_TIER = _LOG_TIERS.get(LOG_LEVEL_STR)
+if _TIER is None:
+    # Fail loud, then fall back to the default. A typo that silently mutes or
+    # floods the whole process is the one failure nobody can debug.
+    print(
+        f"Unknown LOG_LEVEL {LOG_LEVEL_STR!r}; expected one of "
+        f"{sorted(_LOG_TIERS)}. Using NONE.",
+        flush=True,
+    )
+    _TIER = _LOG_TIERS["NONE"]
+
+# The floor for the entire process. Anything not named below inherits it, and
+# that inheritance is what bounds the output at the two lower tiers.
+_ROOT_FLOOR = {
+    _LOG_TIERS["NONE"]: logging.CRITICAL + 10,  # above CRITICAL: nothing passes
+    _LOG_TIERS["INFO"]: logging.WARNING,
+    _LOG_TIERS["FULL"]: logging.INFO,
+    _LOG_TIERS["DEBUG"]: logging.DEBUG,
+}
+logging.basicConfig(level=_ROOT_FLOOR[_TIER])
+
+if _LOG_TIERS["INFO"] <= _TIER < _LOG_TIERS["FULL"]:
+    # The single exception to the floor, and the only tier that needs one: at
+    # INFO the per-request line is the entire point, and it arrives on one of
+    # these two loggers depending on which backend is in use.
+    for _name in ("httpx", "httpx2"):
+        logging.getLogger(_name).setLevel(logging.INFO)
+elif _TIER >= _LOG_TIERS["FULL"]:
+    # Release both back to inheritance. A library imported above us may already
+    # have pinned one of them - langfuse's own logging setup sets `httpx` to
+    # WARNING on import - and if that pin survived, FULL and DEBUG would report
+    # the openrouter backend as mute while `httpx2` followed root, which is the
+    # same asymmetry issue #24 is about, just inverted. NOTSET hands the
+    # decision back to root.
+    for _name in ("httpx", "httpx2"):
+        logging.getLogger(_name).setLevel(logging.NOTSET)
 
 
 # ==========================================
