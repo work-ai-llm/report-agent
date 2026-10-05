@@ -61,13 +61,23 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from streamlit_ui.services.agent_service import PenTestAgentService
+from streamlit_ui.services.run_registry import REGISTRY, RunState, spawn
 
 _NAMESPACE = ("filesystem",)
 _UI_CHECKPOINT_NS = "ui"
 
+# How often the blocking run() facade checks for new events. Small enough to feel
+# live, large enough not to spin a core.
+_POLL_INTERVAL = 0.02
+
 _TRUE_MODES = ("1", "true", "yes")
 
 logger = logging.getLogger(__name__)
+
+
+async def _noop() -> None:
+    """Awaitable no-op, so persistence can be unconditional."""
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +198,22 @@ class RealCheckpointerAdapter:
         self._saver = saver
         self._checkpoint_ns = checkpoint_ns
 
+    async def _anext_blob_version(self, thread_id: str) -> int:
+        """Async body of :meth:`_next_blob_version`.
+
+        Split out so the loop thread can await it directly. Calling
+        ``self._runner.run(...)`` from the loop thread would deadlock: ``run``
+        blocks the calling thread on a future that only the loop can complete.
+        """
+        tup = await self._saver.aget_tuple(self._config(thread_id))
+        if tup is not None and tup.checkpoint is not None:
+            base = (tup.checkpoint.get("channel_versions") or {}).get("messages", 0)
+            try:
+                return int(base) + 1
+            except (TypeError, ValueError):
+                return 1
+        return 1
+
     def _next_blob_version(self, thread_id: str) -> int:
         """Return the next ``messages`` blob version for a thread.
 
@@ -199,17 +225,37 @@ class RealCheckpointerAdapter:
         ``channel_versions`` so it stays correct across adapter instances (a
         per-instance counter would reset and collide).
         """
-        async def _get() -> Optional[Any]:
-            return await self._saver.aget_tuple(self._config(thread_id))
+        return self._runner.run(self._anext_blob_version(thread_id))
 
-        tup = self._runner.run(_get())
-        if tup is not None and tup.checkpoint is not None:
-            base = (tup.checkpoint.get("channel_versions") or {}).get("messages", 0)
-            try:
-                return int(base) + 1
-            except (TypeError, ValueError):
-                return 1
-        return 1
+    async def aput_state(self, thread_id: str, state: Dict[str, Any]) -> None:
+        """Persist UI conversation state from inside the event loop.
+
+        This is the loop-thread-safe twin of :meth:`put`. The agent stream now
+        persists itself as events arrive (so an interrupted Streamlit script run
+        cannot lose the turn), which means the write happens ON the loop thread.
+        Going through :meth:`put` there would call ``EventLoopThread.run`` and
+        block the loop on itself - a hard deadlock. Hence a separate awaitable
+        entry point that talks to the saver directly.
+        """
+        messages = list(state.get("messages", []))
+        ver = await self._anext_blob_version(thread_id)
+        checkpoint = {
+            "v": 1,
+            "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            "id": "ui",
+            "channel_values": {"messages": messages},
+            "channel_versions": {"messages": ver},
+            "versions_seen": {},
+            "pending_sends": [],
+        }
+        # Fixed id -> upsert in place. Never deletes the thread, so the agent's
+        # own checkpoints (different namespace) survive.
+        await self._saver.aput(
+            self._config(thread_id),
+            checkpoint,
+            {"source": "ui"},
+            new_versions={"messages": ver},
+        )
 
     def _config(self, thread_id: str) -> Dict[str, Any]:
         return {
@@ -230,30 +276,8 @@ class RealCheckpointerAdapter:
         return self._runner.run(_get())
 
     def put(self, thread_id: str, state: Dict[str, Any]) -> None:
-        messages = list(state.get("messages", []))
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
-        ver = self._next_blob_version(thread_id)
-        checkpoint = {
-            "v": 1,
-            "ts": ts,
-            "id": "ui",
-            "channel_values": {"messages": messages},
-            "channel_versions": {"messages": ver},
-            "versions_seen": {},
-            "pending_sends": [],
-        }
-
-        async def _put() -> None:
-            # Fixed id -> upsert in place. Never deletes the thread, so the
-            # agent's own checkpoints (different namespace) survive.
-            await self._saver.aput(
-                self._config(thread_id),
-                checkpoint,
-                {"source": "ui"},
-                new_versions={"messages": ver},
-            )
-
-        self._runner.run(_put())
+        """Persist UI conversation state from the Streamlit script thread."""
+        self._runner.run(self.aput_state(thread_id, state))
 
     def list_threads(self) -> List[str]:
         async def _scan() -> List[str]:
@@ -391,32 +415,145 @@ class RealFileStoreAdapter:
 # Agent runner adapter (the real LangGraph agent)
 # ---------------------------------------------------------------------------
 
+def _copy_rows(rows: List[Any]) -> List[Any]:
+    """Shallow-copy a message list, copying each dict row.
+
+    Used when seeding a run from persisted history. An in-memory checkpointer
+    hands back its stored list by reference; sharing those row objects would let
+    the run's in-place annotation (``result=`` on a tool_call) mutate persisted
+    state without a write.
+    """
+    return [dict(r) if isinstance(r, dict) else r for r in rows]
+
+
 class RealAgentRunnerAdapter:
     """Adapt ``runtime.agent`` to ``AgentRunnerProtocol``.
 
-    Streams ``agent.astream(...)`` over the persistent event loop into a queue
-    that the synchronous ``run()`` generator drains, so the UI sees tool calls
-    arrive live and the final answer text after the run completes.
+    Streams ``agent.astream(...)`` on the persistent event loop, recording every
+    event into a :class:`~streamlit_ui.services.run_registry.RunState` and
+    persisting the UI-namespace conversation as it goes.
 
-    The agent persists its own LangChain message history in the real
-    checkpointer (namespace ``""``) keyed by ``thread_id``.
+    ## Why the run owns its own persistence
 
-    When ``STREAMLIT_AGENT_PRINT=1`` every streamed event is also printed to
-    stdout so a developer can watch exactly what the LLM is outputting while the
-    UI runs - mirroring the acceptance-test loop of 3_a2a_testing.
+    The agent stream is scheduled on ``EventLoopThread`` and is NOT tied to the
+    Streamlit script run that started it. That is deliberate - it is what makes a
+    turn survive the user clicking a sidebar widget mid-stream. But it means the
+    script thread cannot be the thing that saves progress: a queued rerun unwinds
+    the script without warning, so anything the script had not yet written is
+    lost from the UI even though the agent keeps working.
+
+    So the write happens here, on the loop thread, immediately after each event.
+    The script thread becomes a pure reader. Losing the script run now costs at
+    most the *rendering* of an event, never the event itself.
+
+    ## Message shapes persisted here
+
+    These are the same shapes ``app.py`` renders, so the persisted row is a
+    faithful transcript and can be re-read on a later rerun:
+
+    - ``{"type": "user", "content": str}``
+    - ``{"type": "tool_call", "name": str, "args": dict, "result": str}``
+    - ``{"type": "assistant", "content": str}``
     """
 
-    def __init__(self, runner: EventLoopThread, agent: Any) -> None:
+    def __init__(self, runner: EventLoopThread, agent: Any, checkpointer: Any = None) -> None:
         self._runner = runner
         self._agent = agent
+        # Optional: without it the run is still tracked in the registry (so the
+        # UI can follow progress) but nothing is persisted. Tests construct the
+        # adapter with two args and assert event flow only.
+        self._checkpointer = checkpointer
+
+    # -- public API ---------------------------------------------------------
+
+    def supports_polling(self) -> bool:
+        """Always True: the registry path works with or without a checkpointer."""
+        return True
+
+    def start(self, message: str, thread_id: str) -> RunState:
+        """Begin a turn and return immediately. Never blocks on the agent.
+
+        The user message is persisted *before* the stream is scheduled, so a turn
+        is durable from the moment it exists rather than from its first event.
+
+        Returns:
+            The registered :class:`RunState`; poll it for events.
+        """
+        existing: List[Dict[str, Any]] = []
+        if self._checkpointer is not None:
+            stored = self._checkpointer.get(thread_id) or {}
+            existing = _copy_rows(stored.get("messages", []))
+
+        state = REGISTRY.start(
+            thread_id,
+            message,
+            existing + [{"type": "user", "content": message}],
+        )
+        # Durable immediately. Synchronous here is safe: we are on the script
+        # thread, not the loop, so the blocking bridge cannot deadlock.
+        if self._checkpointer is not None:
+            self._checkpointer.put(thread_id, {"messages": list(state.messages)})
+
+        self._runner.schedule(self._consume(state, message, thread_id))
+        return state
+
+    def poll(self, thread_id: str, index: int) -> Tuple[List[Dict[str, Any]], int, int]:
+        """Return ``(events, next_index, revision)`` for incremental rendering."""
+        state = REGISTRY.get(thread_id)
+        if state is None:
+            return [], index, 0
+        events, next_index = state.events_since(index)
+        return events, next_index, state.revision
+
+    def run_revision(self) -> Optional[int]:
+        """Change counter for this adapter's thread, or ``None`` if unknown."""
+        return None
+
+    def active_run(self, thread_id: str) -> Optional[RunState]:
+        return REGISTRY.get(thread_id)
+
+    def is_running(self, thread_id: str) -> bool:
+        return REGISTRY.is_running(thread_id)
 
     def run(self, message: str, thread_id: str) -> Iterator[Dict[str, Any]]:
+        """Blocking facade over :meth:`start` + :meth:`poll`.
+
+        Yields exactly the events the agent produced, in order, then returns. Used
+        by the UI's live-render loop and by tests. Prefer :meth:`start` when the
+        caller must not be tied to the lifetime of one script run.
+        """
+        state = self.start(message, thread_id)
+        index = 0
+        while True:
+            events, index, _rev = self.poll(thread_id, index)
+            for event in events:
+                yield event
+            if not state.is_running:
+                # Drain anything appended between the poll and the status check.
+                events, index, _rev = self.poll(thread_id, index)
+                for event in events:
+                    yield event
+                return
+            time.sleep(_POLL_INTERVAL)
+
+    # -- internals ----------------------------------------------------------
+
+    def _persist(self, state: RunState, thread_id: str) -> Any:
+        """Persist the run's message list. Returns an awaitable.
+
+        Called on the loop thread, so it MUST NOT go through
+        ``RealCheckpointerAdapter.put`` (which blocks on the bridge and would
+        deadlock the loop against itself).
+        """
+        if self._checkpointer is None:
+            return _noop()
+        return self._checkpointer.aput_state(thread_id, {"messages": list(state.messages)})
+
+    def _build_consumer(self, state: RunState, message: str, thread_id: str) -> Any:
         from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 
         emit_print = is_agent_output_print_enabled()
         trace_path = os.environ.get("STREAMLIT_AGENT_LOG")
-        events: "queue.Queue[Any]" = queue.Queue()
-        sentinel = object()
         final_parts: List[str] = []
         # Set when the consumer abandons this run, so the finally block can tell
         # "stopped by the user" apart from "finished".
@@ -452,6 +589,21 @@ class RealAgentRunnerAdapter:
                 except OSError:  # pragma: no cover - logging must never break the run
                     pass
 
+        def _emit(event: Dict[str, Any], additions: Optional[List[Dict[str, Any]]] = None) -> None:
+            state.record_event(event, additions)
+
+        def _attach_result(rows: List[Dict[str, Any]], output: str) -> List[Dict[str, Any]]:
+            """Attach a tool result to the oldest unanswered tool_call (FIFO).
+
+            Mirrors what ``app.py`` did when the script thread owned the list, so
+            the persisted transcript keeps args + results the same way.
+            """
+            for row in rows:
+                if row.get("type") == "tool_call" and "result" not in row:
+                    row["result"] = output
+                    break
+            return []
+
         def _handle_chunk(chunk: Any) -> None:
             if isinstance(chunk, dict):
                 _handle_dict_chunk(chunk)
@@ -459,7 +611,10 @@ class RealAgentRunnerAdapter:
             if isinstance(chunk, ToolMessage):
                 name = getattr(chunk, "name", "") or ""
                 output = getattr(chunk, "content", "")
-                events.put({"type": "tool_result", "data": {"name": name, "output": output}})
+                _emit(
+                    {"type": "tool_result", "data": {"name": name, "output": output}},
+                    _attach_result(state.messages, str(output)),
+                )
                 preview = str(output)[:300]
                 _print(f"[TOOL RESULT]: {name} -> {preview}")
                 return
@@ -467,7 +622,10 @@ class RealAgentRunnerAdapter:
             if isinstance(chunk, (AIMessage, AIMessageChunk)):
                 for tc in getattr(chunk, "tool_calls", []) or []:
                     data = {"name": tc.get("name"), "args": tc.get("args", {})}
-                    events.put({"type": "tool_call", "data": data})
+                    _emit(
+                        {"type": "tool_call", "data": data},
+                        [{"type": "tool_call", "name": data["name"], "args": data["args"]}],
+                    )
                     _print(f"[TOOL CALL]: {data['name']} args={data['args']}")
 
                 content = getattr(chunk, "content", "")
@@ -483,11 +641,18 @@ class RealAgentRunnerAdapter:
                 for tc in chunk["tool_calls"]:
                     data = {"name": tc.get("name") or tc.get("function", {}).get("name"),
                             "args": tc.get("args") or tc.get("function", {}).get("arguments", {})}
-                    events.put({"type": "tool_call", "data": data})
+                    _emit(
+                        {"type": "tool_call", "data": data},
+                        [{"type": "tool_call", "name": data["name"], "args": data["args"]}],
+                    )
                     _print(f"[TOOL CALL]: {data['name']} args={data['args']}")
             if chunk.get("role") == "tool":
                 name = chunk.get("name") or ""
-                events.put({"type": "tool_result", "data": {"name": name, "output": chunk.get("content", "")}})
+                output = chunk.get("content", "")
+                _emit(
+                    {"type": "tool_result", "data": {"name": name, "output": output}},
+                    _attach_result(state.messages, str(output)),
+                )
                 preview = str(chunk.get("content", ""))[:300]
                 _print(f"[TOOL RESULT]: {name} -> {preview}")
             content = chunk.get("content") or ""
@@ -527,6 +692,7 @@ class RealAgentRunnerAdapter:
             _print(f"[AGENT STREAM]: config={config}")
             _print(f"[AGENT STREAM]: agent type={type(self._agent).__name__} graph_type={type(getattr(self._agent, 'builder', None)).__name__}")
             _updates = 0
+            failure: Optional[str] = None
             try:
                 _print(f"[AGENT STREAM]: calling astream() at t={_ts()}")
                 # NOTE: stream_mode=["messages","updates"] was tried for live
@@ -548,14 +714,20 @@ class RealAgentRunnerAdapter:
                         if isinstance(message_chunk, AIMessageChunk):
                             delta = getattr(message_chunk, "content", "")
                             if isinstance(delta, str) and delta:
-                                events.put({"type": "token", "data": delta})
+                                _emit({"type": "token", "data": delta})
                         continue
                     _print(
                         f"[AGENT STREAM]: update#{_updates} t={_ts()} "
                         f"keys={list(update) if isinstance(update, dict) else type(update).__name__}"
                     )
+                    before = state.revision
                     for chunk in _iter_messages(update):
                         _handle_chunk(chunk)
+                    # Persist on the loop thread, right after the batch. This is
+                    # the write that used to live in the script thread's
+                    # `finally` - and therefore used to be lost on a rerun.
+                    if state.revision != before:
+                        await self._persist(state, thread_id)
                 _print(f"[AGENT STREAM]: astream loop finished at t={_ts()} total_updates={_updates}")
             except asyncio.CancelledError:
                 # The consumer went away (Streamlit's Stop closes the generator
@@ -569,7 +741,8 @@ class RealAgentRunnerAdapter:
                 _print(f"[AGENT ERROR]: t={_ts()} {type(exc).__name__}: {exc}")
                 import traceback
                 _print(f"[AGENT ERROR] traceback:\n{traceback.format_exc()}")
-                events.put({"type": "error", "data": f"{type(exc).__name__}: {exc}"})
+                failure = f"{type(exc).__name__}: {exc}"
+                _emit({"type": "error", "data": failure})
             finally:
                 _print(f"[AGENT STREAM]: finally block at t={_ts()}")
                 if cancelled:
@@ -579,7 +752,7 @@ class RealAgentRunnerAdapter:
                     _print("[AGENT STREAM]: skipping final message for a cancelled run")
                 elif final_parts:
                     text = "".join(final_parts)
-                    events.put({"type": "message", "data": text})
+                    _emit({"type": "message", "data": text}, [{"type": "assistant", "content": text}])
                     _print(f"[AGENT RESPONSE]: {text}")
                 else:
                     # Safety net: if the stream produced no structured dict
@@ -587,8 +760,8 @@ class RealAgentRunnerAdapter:
                     # the messages channel), fall back to the last assistant
                     # message recorded by the checkpointer.
                     try:
-                        state = await self._agent.aget_state(config)
-                        values = getattr(state, "values", None) or {}
+                        state_values = await self._agent.aget_state(config)
+                        values = getattr(state_values, "values", None) or {}
                         last: str | None = None
                         for m in reversed(values.get("messages", [])):
                             if isinstance(m, (AIMessage, AIMessageChunk)):
@@ -597,32 +770,23 @@ class RealAgentRunnerAdapter:
                                     last = content
                                     break
                         if last is not None:
-                            events.put({"type": "message", "data": last})
+                            _emit({"type": "message", "data": last}, [{"type": "assistant", "content": last}])
                             _print(f"[AGENT RESPONSE (checkpointer)]: {last[:300]}")
                     except Exception as exc:  # noqa: BLE001 - safety net must never throw
                         _print(f"[AGENT STREAM]: checkpointer fallback failed: {exc}")
-                events.put(sentinel)
+                # Final persist BEFORE marking the run terminal, so a reader that
+                # sees a finished run can trust the persisted row is complete.
+                try:
+                    await self._persist(state, thread_id)
+                except Exception as exc:  # noqa: BLE001 - never lose the run over a save failure
+                    _print(f"[AGENT STREAM]: final persist failed: {exc}")
+                    failure = failure or f"persist failed: {exc}"
+                state.finish(error=failure)
 
-        # Hold on to the handle. EventLoopThread.schedule returns a
-        # concurrent.futures.Future, and cancelling it DOES propagate to the
-        # asyncio task even after the coroutine has started (verified on 3.11),
-        # which is what makes the finally below able to stop work in flight.
-        #
-        # This has to be a try/finally, not a bare call: abandoning this
-        # generator is exactly what happens when Streamlit's Stop button ends a
-        # script run, and without this the agent stream keeps running to
-        # completion after the UI has moved on.
-        handle = self._runner.schedule(_consume())
-        try:
-            while True:
-                item = events.get()
-                if item is sentinel:
-                    break
-                yield item
-        finally:
-            # Normal completion has already put the sentinel, so the task is
-            # done and this cancel() is a no-op returning False.
-            handle.cancel()
+return _consume
+
+    def _consume(self, state: RunState, message: str, thread_id: str) -> Any:
+        return self._build_consumer(state, message, thread_id)()
 
 
 # ---------------------------------------------------------------------------
@@ -662,16 +826,93 @@ class PersistingMockAdapter:
         self._inner.set_final_message(message)
 
     def run(self, message: str, thread_id: str) -> Iterator[Dict[str, Any]]:
-        # Seed with the EXISTING persisted history (so mid-stream checkpoints
-        # keep the whole conversation, not just the current turn), then append
-        # the new user message.
-        existing = (self._checkpointer.get(thread_id) or {}).get("messages", [])
-        messages: List[Dict[str, Any]] = list(existing)
-        messages.append({"role": "user", "content": message})
+        """Blocking facade over :meth:`start` (see :meth:`poll`)."""
+        self.start(message, thread_id)
+        index = 0
+        while True:
+            events, index, _rev = self.poll(thread_id, index)
+            for event in events:
+                yield event
+            state = REGISTRY.get(thread_id)
+            if state is None or not state.is_running:
+                events, index, _rev = self.poll(thread_id, index)
+                for event in events:
+                    yield event
+                return
+            time.sleep(_POLL_INTERVAL)
 
+    # -- rerun-safe API -----------------------------------------------------
+
+    def supports_polling(self) -> bool:
+        """Always True: partial mode tracks runs in the registry too."""
+        return True
+
+    def start(self, message: str, thread_id: str) -> RunState:
+        """Begin a turn on a worker thread; the script thread is not involved."""
+        existing: List[Dict[str, Any]] = []
+        stored = self._checkpointer.get(thread_id) or {}
+        existing = list(stored.get("messages", []))
+        state = REGISTRY.start(
+            thread_id, message, existing + [{"role": "user", "content": message}]
+        )
+        self._checkpointer.put(thread_id, {"messages": list(state.messages)})
+        spawn(state, lambda: self._produce(message, thread_id, state),
+              persist=lambda msgs: self._checkpointer.put(thread_id, {"messages": msgs}),
+              name=f"mock-agent-{thread_id}")
+        return state
+
+    def poll(self, thread_id: str, index: int) -> Tuple[List[Dict[str, Any]], int, int]:
+        state = REGISTRY.get(thread_id)
+        if state is None:
+            return [], index, 0
+        events, next_index = state.events_since(index)
+        return events, next_index, state.revision
+
+    def active_run(self, thread_id: str) -> Optional[RunState]:
+        return REGISTRY.get(thread_id)
+
+    def is_running(self, thread_id: str) -> bool:
+        return REGISTRY.is_running(thread_id)
+
+    def _produce(self, message: str, thread_id: str, state: RunState) -> Iterator[Tuple[Dict[str, Any], List[Dict[str, Any]]]]:
+        """Yield ``(event, rows)`` pairs, mirroring the inner mock runner."""
         for event in self._inner.run(message, thread_id):
-            yield event
-            self._persist(messages, event, thread_id)
+            rows = self._rows_for(event)
+            yield event, rows
+
+    def _rows_for(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Translate an event into the message rows it contributes.
+
+        Note the shape is the historical partial-mode one (``role``/``tool_calls``)
+        rather than the UI's ``type`` shape. Kept as-is so partial-mode sessions
+        on disk stay readable; only the *timing* of the write changed.
+        """
+        event_type = event.get("type")
+        rows: List[Dict[str, Any]] = []
+        if event_type == "message":
+            # A message event carries the text directly in "data" as a string -
+            # not a nested payload like the tool events do.
+            rows.append({"role": "assistant", "content": event.get("data", "")})
+            return rows
+        data = event.get("data") or {}
+        if not isinstance(data, dict):
+            data = {}
+        if event_type == "tool_call":
+            name = data.get("name", "")
+            args = data.get("args", {})
+            rows.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"name": name, "args": args}],
+            })
+            self._write_mock_tool_result(name, args)
+        elif event_type == "tool_result":
+            rows.append({
+                "role": "tool",
+                "content": str(data.get("output", "")),
+                "name": data.get("name", ""),
+            })
+        return rows
 
     # -- internal helpers ---------------------------------------------------
 
@@ -681,26 +922,8 @@ class PersistingMockAdapter:
         event: Dict[str, Any],
         thread_id: str,
     ) -> None:
-        event_type = event.get("type")
-
-        if event_type == "tool_call":
-            name = event.get("data", {}).get("name", "")
-            args = event.get("data", {}).get("args", {})
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{"name": name, "args": args}],
-            })
-            self._write_mock_tool_result(name, args)
-
-        elif event_type == "tool_result":
-            name = event.get("data", {}).get("name", "")
-            output = event.get("data", {}).get("output", "")
-            messages.append({"role": "tool", "content": str(output), "name": name})
-
-        elif event_type == "message":
-            messages.append({"role": "assistant", "content": event.get("data", "")})
-
+        """Legacy single-event save, retained for callers outside the registry path."""
+        self._rows_for(event)
         self._save_checkpoint(messages, thread_id)
 
     def _save_checkpoint(
@@ -896,11 +1119,16 @@ def build_real_backend_service(
             "Real agent is not available. Check your .env (MISTRAL_API_KEY) "
             "and that STREAMLIT_USE_REAL_AGENT=1 / production mode is active."
         )
+    # The runner persists the turn itself, from the event-loop thread, so the
+    # UI-namespace row survives a Streamlit rerun that kills the script run.
+    ui_checkpointer = RealCheckpointerAdapter(
+        runner, runtime.checkpointer, checkpoint_ns=_UI_CHECKPOINT_NS
+    )
     return PenTestAgentService(
         thread_id=thread_id,
-        checkpointer=RealCheckpointerAdapter(runner, runtime.checkpointer, checkpoint_ns=_UI_CHECKPOINT_NS),
+        checkpointer=ui_checkpointer,
         file_store=RealFileStoreAdapter(runner, runtime.store),
-        agent_runner=RealAgentRunnerAdapter(runner, runtime.agent),
+        agent_runner=RealAgentRunnerAdapter(runner, runtime.agent, checkpointer=ui_checkpointer),
     )
 
 

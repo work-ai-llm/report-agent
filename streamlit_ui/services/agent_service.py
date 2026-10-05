@@ -52,11 +52,17 @@ st.session_state.
 """
 
 from typing import Optional, List, Dict, Any, Iterator
+import time
+
 from streamlit_ui.services.interfaces import (
     CheckpointerProtocol,
     FileStoreProtocol,
     AgentRunnerProtocol,
 )
+
+# How often send_message() checks the run registry for new events while a turn
+# is in flight. Small enough to feel live, large enough not to spin a core.
+_RUN_POLL_INTERVAL = 0.02
 
 
 class PenTestAgentService:
@@ -173,7 +179,26 @@ class PenTestAgentService:
                     st.write(event["data"])  # Show final response
             ```
         """
-        # Delegate to agent runner with current thread_id
+        # Prefer the runner's rerun-safe start/poll pair when it has one. Going
+        # through the registry is what makes the turn survive a Streamlit rerun:
+        # the run is recorded and persisted by the runner's own thread, so this
+        # generator is only a *reader*. A runner without it (a bare two-arg
+        # MockAgentRunner, say) falls back to its plain generator.
+        if getattr(self._agent_runner, "supports_polling", None) and self._agent_runner.supports_polling():
+            self._agent_runner.start(message, self._thread_id)
+            index = 0
+            while True:
+                events, index, _revision = self._agent_runner.poll(self._thread_id, index)
+                for event in events:
+                    yield event
+                if not self._agent_runner.is_running(self._thread_id):
+                    # Drain anything recorded between the poll and the status
+                    # check, then stop.
+                    events, index, _revision = self._agent_runner.poll(self._thread_id, index)
+                    for event in events:
+                        yield event
+                    return
+                time.sleep(_RUN_POLL_INTERVAL)
         yield from self._agent_runner.run(message, self._thread_id)
     
     def download_report(self, filename: str) -> Optional[bytes]:
@@ -220,7 +245,15 @@ class PenTestAgentService:
         state = self._checkpointer.get(self._thread_id)
         if state is None:
             return []
-        return state.get("messages", [])
+        messages = state.get("messages", [])
+        # Copy before handing out. The UI appends to (and annotates) what it gets
+        # back - `app.py` appends the user row to this list, and the runner
+        # annotates tool_call rows in place with their result. An in-memory
+        # checkpointer returns its stored list by reference, so handing that out
+        # directly would let the UI mutate persisted state with no write at all,
+        # and the next run would read its own edits back as history. Rows are
+        # copied too, since `result` is added in place.
+        return [dict(m) if isinstance(m, dict) else m for m in messages]
     
     def save_chat_history(self, messages: List[Dict[str, Any]]) -> None:
         """Persist conversation history for current thread.
@@ -252,7 +285,47 @@ class PenTestAgentService:
         Returns:
             True if the thread existed and was deleted, False otherwise
         """
-        return self._checkpointer.delete(thread_id)
+        deleted = self._checkpointer.delete(thread_id)
+        if deleted:
+            # Drop the run entry too, so a deleted session cannot still report
+            # "running" in the UI.
+            try:
+                from streamlit_ui.services.run_registry import REGISTRY
+
+                REGISTRY.drop(thread_id)
+            except Exception:  # noqa: BLE001 - never fail a delete over bookkeeping
+                pass
+        return deleted
+
+    # -- run state ----------------------------------------------------------
+    #
+    # The agent turn is owned by the runner (and the run registry), not by the
+    # Streamlit script run. These let the UI ask "has anything changed since I
+    # last looked?" without touching the database and without blocking, which is
+    # what lets a rerun pick up a turn that finished while the script was dead.
+
+    def run_revision(self) -> int:
+        """Monotonic change counter for this thread's latest run (``0`` if none).
+
+        Cheap: an in-memory read. The UI compares it against the value it last
+        rendered and re-reads history only when it moved.
+        """
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        return REGISTRY.revision(self._thread_id)
+
+    def is_run_active(self) -> bool:
+        """True while an agent turn for this thread is still in flight."""
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        return REGISTRY.is_running(self._thread_id)
+
+    def active_run_snapshot(self) -> Optional[Dict[str, Any]]:
+        """A consistent copy of this thread's latest run, or ``None``."""
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        state = REGISTRY.get(self._thread_id)
+        return state.snapshot() if state is not None else None
 
     def delete_finding(self, filename: str) -> bool:
         """Delete a findings file from the virtual filesystem.

@@ -189,8 +189,25 @@ def _shared_mock_agent_runner() -> MockAgentRunner:
 
     Pre-loaded with plausible tool calls and a small per-event delay so the
     chat visibly streams (tool call blocks, then the reply) like a real run.
+
+    The shared mock checkpointer is injected so the runner can persist each turn
+    itself and expose the rerun-safe start/poll pair. Without it the runner has
+    nowhere to save, and mock mode would silently lose history on every reload -
+    the exact failure #20 is about, just in the sandbox.
+
+    ``STREAMLIT_MOCK_DELAY`` overrides the per-event delay in seconds. Tests need
+    a wide window to interrupt a turn mid-stream, and they cannot reach this
+    cached instance from outside a script run (``st.cache_resource`` does not
+    dedupe outside one), so the knob has to be an env var.
     """
-    runner = MockAgentRunner(delay_seconds=0.35)
+    try:
+        delay = float(os.environ.get("STREAMLIT_MOCK_DELAY", "0.35"))
+    except (TypeError, ValueError):
+        delay = 0.35
+    runner = MockAgentRunner(
+        delay_seconds=delay,
+        checkpointer=_shared_mock_checkpointer(),
+    )
     runner.set_tool_calls([
         {"name": "nmap_scan", "args": {"target": "10.0.0.1"}},
         {"name": "nikto_scan", "args": {"url": "http://10.0.0.1"}},
@@ -521,12 +538,19 @@ def render_main_chat(service: PenTestAgentService) -> None:
                     flushed_len = len(stream_acc)
                     last_flush = now
 
-            # Persist entries incrementally - after every tool call, tool
-            # result and assistant text - so a failed or interrupted run does
-            # not lose the history already rendered in the chat window. The
-            # checkpointer write is idempotent (the whole list is rewritten).
+            # Persisting is NOT done here. The agent runner owns the UI-namespace
+            # conversation and writes it from the event-loop thread as events
+            # arrive, so an interrupted script run (a queued rerun unwinds this
+            # stack without warning) costs the rendering of an event but never
+            # the event itself. See services/run_registry.py.
+            # Rows appended below are display-only, for the in-progress turn; a
+            # later rerun reconciles them against the persisted truth.
             def _save_chat() -> None:
-                service.save_chat_history(st.session_state.chat_messages)
+                """No-op shim retained so the event loop below reads unchanged.
+
+                Deliberately does not persist. The runner already has.
+                """
+                return None
 
             try:
                 # Process streaming events
@@ -649,6 +673,24 @@ def main() -> None:
         service = get_or_create_service(st.session_state.current_thread_id)
         st.session_state.chat_messages = service.get_chat_history()
         st.session_state._service_thread = st.session_state.current_thread_id
+        st.session_state._seen_run_revision = service.run_revision()
+
+    # Reconcile against the run that owns the turn.
+    #
+    # A widget click mid-stream aborts THIS script run, but not the agent turn:
+    # the runner keeps streaming on the event-loop thread and keeps persisting.
+    # So on the next rerun the persisted conversation is ahead of what this
+    # session is holding. The registry's revision counter says whether that
+    # happened, cheaply, without a checkpointer round-trip on every rerun.
+    #
+    # Rehydrating from the checkpointer (rather than patching the in-memory list)
+    # is what makes the UI converge on the same transcript the agent recorded,
+    # instead of accumulating a second, drifting copy.
+    if st.session_state.current_thread_id is not None:
+        revision = service.run_revision()
+        if revision != st.session_state.get("_seen_run_revision"):
+            st.session_state.chat_messages = service.get_chat_history()
+            st.session_state._seen_run_revision = revision
 
     # Render UI
     render_main_chat(service)
