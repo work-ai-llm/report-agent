@@ -483,52 +483,103 @@ def _history_from_stored(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return normalised
 
 
-RUN_STATUS_POLL_SECONDS = 1.0
+LIVE_TURN_POLL_SECONDS = 0.4
 
 
-def render_run_status(service: PenTestAgentService) -> None:
-    """A live strip that keeps reporting while a turn is in flight.
+def _pair_tool_results(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Fold ``tool_result`` events onto the tool calls they belong to.
 
-    Streamlit has no push channel. A script run is over the moment it returns, so
-    "is the agent still working?" cannot be answered by the run that started the
-    work - which is exactly the gap this fills. After an interrupted turn the app
-    used to look completely idle while the agent kept working in the background,
-    because nothing re-rendered to say otherwise.
-
-    The fix is a fragment that re-runs on a timer and reads the run registry -
-    the one piece of state that outlives a script run. It is deliberately cheap
-    when idle: a single in-memory lookup, and it renders nothing.
-
-    When a turn finishes while we are watching, one full rerun is triggered so the
-    result is folded into the ordinary history and the strip disappears. That is a
-    one-shot transition, not a loop: the flag that drives it is popped on use.
+    The agent emits a call and its result as two separate events, so a live render
+    has to pair them the same way the persisted transcript does - oldest call still
+    awaiting a result (FIFO, which matches tool-call execution order). Done here so
+    both the live fragment and the persisted history agree on what belongs together.
     """
+    rows: List[Dict[str, Any]] = []
+    for event in events:
+        kind = event.get("type")
+        data = event.get("data") or {}
+        if kind == "tool_call":
+            if not isinstance(data, dict):
+                data = {}
+            rows.append({
+                "name": data.get("name") or "tool",
+                "args": data.get("args", {}),
+                "result": None,
+            })
+        elif kind == "tool_result":
+            if not isinstance(data, dict):
+                data = {}
+            for row in rows:
+                if row["result"] is None:
+                    row["result"] = str(data.get("output", ""))
+                    break
+    return rows
 
-    @st.fragment(run_every=RUN_STATUS_POLL_SECONDS)
-    def _status() -> None:
-        running = service.is_run_active()
+
+def _render_live_turn(events: List[Dict[str, Any]]) -> None:
+    """Render an in-flight turn's events into an assistant bubble.
+
+    This is what the agent's progress actually looks like: each tool call appears
+    as it is made, with its result filling in underneath. It replaces the
+    previous step counter, which could only tell you that *something* happened -
+    useless for deciding whether to stop a turn.
+    """
+    rows = _pair_tool_results(events)
+    if not rows:
+        return
+    with st.chat_message("assistant"):
+        for row in rows:
+            render_tool_call(row["name"], row["args"], row["result"] or None)
+
+
+def render_live_turn(service: PenTestAgentService) -> None:
+    """Render the turn in flight, re-reading the run registry on a timer.
+
+    Streamlit has no push channel: a script run is over the moment it returns, and
+    a widget interaction unwinds one mid-turn. So the turn is rendered by a
+    ``st.fragment`` reading the run registry - the one piece of state that outlives
+    a script run. Two consequences worth stating:
+
+    - Tool calls keep appearing while the user uses the sidebar, and re-attaching
+      after a click is free: the fragment simply picks the run back up.
+    - ``run_every`` is decided when the fragment is created, from whether a run is
+      active. An idle app therefore has no timer running at all. The app forces one
+      rerun after starting a turn precisely so the fragment gets created live.
+
+    On the running -> done edge it forces one full rerun, so the finished turn is
+    folded into the ordinary history by reconciliation and this stops rendering.
+    One-shot, not a loop: the flag driving it is popped on use.
+    """
+    active = service.is_run_active()
+
+    @st.fragment(run_every=LIVE_TURN_POLL_SECONDS if active else None)
+    def _live() -> None:
+        snapshot = service.active_run_snapshot()
+        running = bool(snapshot) and snapshot.get("status") == "running"
+
         if running:
-            snapshot = service.active_run_snapshot() or {}
-            steps = len(snapshot.get("events", []))
-            with st.status("Agent is running…", expanded=True):
+            events = snapshot.get("events", [])
+            _render_live_turn(events)
+            with st.status("Agent is running\u2026", expanded=True):
                 st.caption(
-                    f"{steps} step(s) so far. The sidebar stays usable — this "
-                    "turn keeps going in the background."
+                    f"{len(events)} step(s) so far. The sidebar stays usable \u2014 "
+                    "this turn keeps going in the background."
                 )
-                # An explicit Stop, because the browser's Stop button cannot be
-                # used for this (see PenTestAgentService.cancel_run).
-                if st.button("🛑 Stop this turn", key="stop_active_run"):
+                # An explicit Stop: the browser's own Stop button stops a script
+                # run, which under runner.fastReruns is indistinguishable from a
+                # widget click. See PenTestAgentService.cancel_run.
+                if st.button("\U0001f6d1 Stop this turn", key="stop_active_run"):
                     if service.cancel_run():
                         st.info("Stopping. The turn will not be saved as finished.")
         elif st.session_state.pop("_run_was_active", False):
-            # The turn ended while this fragment was watching. Force one full
-            # rerun: reconciliation picks up the finished transcript, and the strip
-            # stops rendering because the run is no longer active.
+            # The turn ended while this fragment was watching. One full rerun:
+            # reconciliation picks up the finished transcript and the live region
+            # stops rendering, because the run is no longer active.
             st.session_state["_seen_run_revision"] = None
             st.rerun()
         st.session_state["_run_was_active"] = running
 
-    _status()
+    _live()
 
 
 def render_main_chat(service: PenTestAgentService) -> None:
@@ -548,9 +599,9 @@ def render_main_chat(service: PenTestAgentService) -> None:
         _history_from_stored(st.session_state.chat_messages)
     )
 
-    # Live "agent is running" strip. Rendered after the history so the finished
-    # turns stay above it.
-    render_run_status(service)
+    # The turn in flight, rendered from the run registry. Placed after the
+    # history so finished turns stay above it.
+    render_live_turn(service)
     
     # Chat input
     if prompt := st.chat_input("Ask the agent to analyze findings..."):
@@ -597,7 +648,7 @@ def render_main_chat(service: PenTestAgentService) -> None:
 
         # Start the turn and RETURN. The run lives in the run registry and is driven
         # by the runner's own thread; progress is read back from the registry by
-        # render_run_status().
+        # render_live_turn().
         #
         # Deliberately not `for event in service.send_message(prompt)`. Blocking the
         # script run for the whole turn keeps a script run alive long enough for

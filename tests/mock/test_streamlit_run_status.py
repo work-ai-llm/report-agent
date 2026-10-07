@@ -321,16 +321,16 @@ class TestReportsSelectorRefreshesAfterATurn:
 
     @pytest.fixture(autouse=True)
     def _no_status_fragment(self, monkeypatch):
-        """Silence the running-status fragment while counting executions.
+        """Silence the live-turn fragment while counting executions.
 
-        ``render_run_status`` is a ``st.fragment(run_every=1.0)``, so it schedules
-        its own script runs and would make an execution count meaningless. The
-        fragment's behaviour is covered by TestRunStatusStrip; this class is only
-        about the end-of-turn rerun.
+        ``render_live_turn`` is a ``st.fragment(run_every=...)``, so it schedules
+        its own script runs and would make an execution count meaningless. Its
+        behaviour is covered by TestRunStatusStrip; this class is only about the
+        end-of-turn rerun.
         """
         import streamlit_ui.app as app_module
 
-        monkeypatch.setattr(app_module, "render_run_status", lambda service: None)
+        monkeypatch.setattr(app_module, "render_live_turn", lambda service: None)
 
     def test_a_turn_that_writes_a_report_triggers_a_rerun(self):
         from tests.mock.mock_objects_streamlit import HARNESS
@@ -383,6 +383,130 @@ class TestReportsSelectorRefreshesAfterATurn:
             f"reran for a turn that changed nothing in the store "
             f"({HARNESS['executions'] - 1} rerun(s))"
         )
+
+
+def _live_region_harness() -> None:
+    """Script that renders a turn's events through the real live-region code.
+
+    A lambda would not do: ``AppTest.from_function`` writes the function to a temp
+    file and execs it standalone, so the enclosing test's locals are invisible.
+    Events come from the importable HARNESS dict instead.
+    """
+    import streamlit_ui.app as app_module
+    from tests.mock.mock_objects_streamlit import HARNESS
+
+    app_module._render_live_turn(HARNESS["events"])
+
+
+def _render_live(events):
+    from tests.mock.mock_objects_streamlit import HARNESS
+
+    HARNESS.clear()
+    HARNESS["events"] = events
+    return AppTest.from_function(_live_region_harness).run()
+
+
+class TestLiveTurnRendersToolCalls:
+    """The in-flight turn is drawn from the run registry, not from a blocking loop.
+
+    A step counter could only say that *something* happened, which is no help when
+    deciding whether to stop a turn. The live region shows each tool call as it is
+    made, with its result filling in underneath - so "the agent is doing something
+    odd" is visible rather than guessed at.
+    """
+
+    @staticmethod
+    def _pair():
+        from streamlit_ui import app as app_module
+
+        return app_module._pair_tool_results
+
+    def test_tool_results_attach_to_their_call_fifo(self):
+        pair = self._pair()
+        rows = pair([
+            {"type": "tool_call", "data": {"name": "ls", "args": {"path": "/"}}},
+            {"type": "tool_call", "data": {"name": "read_file", "args": {"path": "/a"}}},
+            {"type": "tool_result", "data": {"name": "ls", "output": "/"}},
+            {"type": "tool_result", "data": {"name": "read_file", "output": "contents of a"}},
+        ])
+        assert [r["name"] for r in rows] == ["ls", "read_file"]
+        assert rows[0]["result"] == "/"
+        assert rows[1]["result"] == "contents of a"
+
+    def test_pairing_is_positional_so_live_and_persisted_agree(self):
+        """Pairing is FIFO, not by name - and that is deliberate.
+
+        The events carry no call id, and results for parallel tool calls can arrive
+        out of order. The persisted transcript pairs them the same positional way
+        (``RealAgentRunnerAdapter``'s ``_attach_result``), so the live region and the
+        stored history can never disagree about which result belongs to which call.
+        That matters more than being right in the rare interleaved case, because a
+        disagreement is visible as a result jumping between blocks.
+        """
+        pair = self._pair()
+        # Out-of-order: read_file's result arrives first.
+        rows = pair([
+            {"type": "tool_call", "data": {"name": "ls", "args": {}}},
+            {"type": "tool_call", "data": {"name": "read_file", "args": {}}},
+            {"type": "tool_result", "data": {"name": "read_file", "output": "from read_file"}},
+        ])
+        # FIFO puts the first result on the first call, regardless of its name.
+        assert rows[0]["result"] == "from read_file"
+        assert rows[1]["result"] is None
+
+    def test_a_call_awaiting_a_result_stays_empty(self):
+        pair = self._pair()
+        rows = pair([
+            {"type": "tool_call", "data": {"name": "ls", "args": {}}},
+            {"type": "tool_result", "data": {"name": "ls", "output": "done"}},
+            {"type": "tool_call", "data": {"name": "write_file", "args": {}}},
+        ])
+        assert rows[1]["result"] is None, "a pending call must not borrow another's result"
+
+    def test_message_and_token_events_contribute_no_tool_rows(self):
+        pair = self._pair()
+        rows = pair([
+            {"type": "token", "data": "hel"},
+            {"type": "tool_call", "data": {"name": "ls", "args": {}}},
+            {"type": "message", "data": "the answer"},
+        ])
+        assert len(rows) == 1 and rows[0]["name"] == "ls"
+
+    def test_a_tool_call_with_no_name_still_renders(self):
+        pair = self._pair()
+        rows = pair([{"type": "tool_call", "data": {}}])
+        assert rows[0]["name"] == "tool", "an unnamed call would render as a blank block"
+
+    def test_live_region_draws_the_calls(self):
+        """The rendered region must actually contain the tool calls.
+
+        render_tool_call draws an expander per call, so the names land in expander
+        labels. Asserting on the pairing helper alone would not catch the region
+        rendering nothing.
+        """
+        at = _render_live([
+            {"type": "tool_call", "data": {"name": "ls", "args": {"path": "/"}}},
+            {"type": "tool_result", "data": {"name": "ls", "output": "/a /b"}},
+            {"type": "tool_call", "data": {"name": "read_file", "args": {"path": "/a"}}},
+        ])
+        labels = " ".join(str(e.label) for e in at.expander)
+        assert "ls" in labels, f"the first call was not drawn: {labels!r}"
+        assert "read_file" in labels, f"the second call was not drawn: {labels!r}"
+        # One assistant bubble holds the in-flight turn.
+        assert len(at.chat_message) == 1
+
+    def test_the_result_reaches_the_rendered_block(self):
+        at = _render_live([
+            {"type": "tool_call", "data": {"name": "ls", "args": {"path": "/"}}},
+            {"type": "tool_result", "data": {"name": "ls", "output": "MARKER_OUTPUT"}},
+        ])
+        body = " ".join(str(getattr(b, "value", "")) for b in at.code)
+        assert "MARKER_OUTPUT" in body, f"the result was not drawn: {body!r}"
+
+    def test_nothing_is_drawn_before_the_first_event(self):
+        at = _render_live([])
+        assert len(at.chat_message) == 0
+        assert len(at.expander) == 0
 
 
 class TestReconcileHelper:
