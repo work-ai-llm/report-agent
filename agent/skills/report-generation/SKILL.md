@@ -1,6 +1,6 @@
 ---
 name: report-generation
-description: Builds a complete pentest report from uploaded findings using the Scratchpad Assembly workflow. Use when creating, assembling, or exporting a pentest report.
+description: Builds a pentest report from uploaded findings using the Scratchpad Assembly workflow. USE ONLY for larger reports (many findings, multi-section, needs an executive summary). SKIP for small/quick reports (a few findings, one-off summary) — handle those directly without loading this skill.
 compatibility: Requires the virtual filesystem tools (ls, read_file, write_file) and the /context/ store.
 allowed-tools: ls read_file write_file
 ---
@@ -8,8 +8,13 @@ allowed-tools: ls read_file write_file
 # Report Generation (Scratchpad Assembly)
 
 ## When to Use
-- The user asks to create, assemble, or export a pentest report.
+- The user asks to create, assemble, or export a **larger** pentest report.
+- The report is multi-section (host inventory, AD infrastructure, findings, etc.) and an executive summary is expected.
 - Findings are available under `/context/findings/` and a phase template under `/context/templates/`.
+
+## When NOT to Use (SKIP this skill)
+- **Small/quick reports** — a few findings files, a one-off summary, or a short answer. The scratchpad partitioning buys nothing on a short context; answer directly or assemble a simple single-file report without the multi-phase workflow.
+- A single question about findings, templates, or the store — just answer, do not build a report.
 
 ## Critical Rules
 1. **Static vs dynamic files**:
