@@ -82,6 +82,25 @@ def _strip_prefix(paths: List[str], prefix: str) -> List[str]:
     return stripped
 
 
+_SCRATCHPAD_PREFIX = "scratchpad/"
+_SCRATCHPAD_WRITERS = ("write_file", "edit_file")
+
+
+def _written_content(current: Optional[str], tool: str, args: Dict[str, Any]) -> Optional[str]:
+    """Work out what a filesystem tool call left at a path, or None if unknowable.
+
+    ``write_file`` carries the whole body. ``edit_file`` either carries a full
+    replacement body or a string substitution against what was already there -
+    the substitution form can only be replayed if the previous content is known.
+    """
+    if "content" in args and isinstance(args["content"], str):
+        return args["content"]
+    old, new = args.get("old_string"), args.get("new_string")
+    if isinstance(old, str) and isinstance(new, str) and current is not None:
+        return current.replace(old, new, 1)
+    return None
+
+
 class PenTestAgentService:
     """Service layer connecting Streamlit UI to agent system.
     
@@ -193,20 +212,44 @@ class PenTestAgentService:
         """List the current session's agent working files.
         
         The agent's filesystem is a composite: ``/context/`` is persisted in the
-        store, and everything else - the scratchpad it drafts into - lives in an
-        in-memory backend under a state channel in the agent's own checkpoint
-        namespace. A store listing returns none of it at any prefix, so this
-        reads that channel instead.
+        store, and everything else - the scratchpad it drafts into - is held by an
+        in-memory backend that is never checkpointed. A store listing returns
+        none of it, and neither does the checkpointer: this project builds its
+        graph with langchain's ``create_agent``, so the in-memory backend's state
+        channel is never declared and the scratchpad exists only for the
+        duration of a run. Verified against a real SQLite database - no
+        ``files`` channel is present in any checkpoint or pending write.
         
-        Files persist across turns of a session rather than clearing per run,
-        so this is the whole session's scratchpad unless it is filtered.
+        So the scratchpad is reconstructed by replaying the session's own
+        persisted tool calls, which are stored with the chat history. That makes
+        the panel survive a reload, a session switch and a restart, and it
+        updates live because the history is saved incrementally as the run
+        progresses.
         
         Returns:
-            Mapping of path to text content; empty before the first agent run
+            Mapping of path to the most recently written content, in write order.
+            Empty before the agent has written anything.
         """
-        return self._checkpointer.list_agent_files(
-            self._thread_id, prefix="scratchpad/"
-        )
+        files: Dict[str, str] = {}
+        for entry in self.get_chat_history():
+            if not isinstance(entry, dict) or entry.get("type") != "tool_call":
+                continue
+            # Persisted history flattens the tool call onto the entry
+            # (``name``/``args`` at the top level), where the live event carries
+            # the same fields nested under ``data``. Accept both.
+            data = entry.get("data") if isinstance(entry.get("data"), dict) else entry
+            if data.get("name") not in _SCRATCHPAD_WRITERS:
+                continue
+            args = data.get("args")
+            if not isinstance(args, dict):
+                continue
+            path = str(args.get("file_path") or "")
+            if not path.strip("/").startswith(_SCRATCHPAD_PREFIX):
+                continue
+            content = _written_content(files.get(path), data["name"], args)
+            if content is not None:
+                files[path] = content
+        return files
     
     def start_turn(self, message: str) -> Dict[str, Any]:
         """Begin a turn and return immediately. Never blocks on the agent.

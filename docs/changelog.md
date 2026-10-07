@@ -56,10 +56,11 @@ After the initial agent (2026-08-28 → 2026-10-05).
   carry the `/context/` root that the store strips before writing, so the panel
   matches the paths the agent itself says out loud. (#40)
 - **Scratchpad panel** — the sidebar shows the agent's working files for the
-  current session, which are the drafts it writes while working. These are read
-  from the agent's own checkpoint namespace, because the in-memory backend that
-  holds them is not reachable through the store; the read is strictly read-only.
-  (#41)
+  current session, which are the drafts it writes while working. The scratchpad
+  is not persisted by the agent — it lives in an in-memory backend whose state
+  channel is never declared — so the panel reconstructs it by replaying the
+  session's own persisted tool calls. It therefore survives a reload, a session
+  switch and a restart, and updates live as the run progresses. (#41)
 
 ### Security
 

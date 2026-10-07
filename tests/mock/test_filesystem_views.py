@@ -1,11 +1,11 @@
 """Tests for the two sidebar filesystem panels: the store-backed filesystem
 view and the agent's scratchpad view.
 
-The two read different storage. ``list_filesystem`` goes through the file
+The two read different things. ``list_filesystem`` goes through the file
 store, which holds everything routed through ``/context/``. ``list_scratchpad``
-goes through the checkpointer, because the agent's in-memory backend keeps its
-files in a ``files`` state channel in the agent's own checkpoint namespace and
-they are unreachable from a store listing at any prefix.
+does not read storage at all: the agent's scratchpad is held by an in-memory
+backend that is never checkpointed, so the panel replays the session's own
+persisted tool calls instead. That is why it survives a reload.
 
 ## What these tests verify
 
@@ -13,8 +13,10 @@ they are unreachable from a store listing at any prefix.
   context library shows up alongside findings and reports.
 - Display paths carry the ``/context/`` root the agent itself uses, even though
   the store strips it before writing.
-- The scratchpad reads the agent namespace, is filtered to the scratchpad
-  prefix, and is tolerant of leading slashes.
+- The scratchpad is rebuilt from ``write_file`` / ``edit_file`` tool calls, in
+  order, so the newest content wins for a path that was written twice.
+- Tool calls outside the scratchpad are ignored, and a substitution-style edit
+  that cannot be replayed is dropped rather than shown as wrong content.
 - Only a leading prefix is stripped when listing findings and reports. The
   previous ``str.replace`` also rewrote the same text mid-name, so
   ``findings/findings_summary.txt`` displayed as ``summary.txt`` and a later
@@ -26,15 +28,9 @@ they are unreachable from a store listing at any prefix.
 ```bash
 python -m pytest tests/mock/test_filesystem_views.py -v
 ```
-
-## What These Tests Do and Don't Prove
-
-These use the in-memory mocks, which are permissive dictionaries. They prove the
-service layer's path handling, prefix filtering and thread isolation - not the
-real adapters. ``list_agent_files`` on ``RealCheckpointerAdapter`` reads the
-``files`` channel out of a real checkpoint tuple and is validated separately by
-``test_real_backend.py``; the mocks cannot prove that channel's shape.
 """
+
+from typing import Any, Dict, List
 
 from streamlit_ui.services.agent_service import PenTestAgentService
 from streamlit_ui.components.filesystem_view import _group_by_directory
@@ -56,6 +52,31 @@ def _service(
         file_store=file_store or MockFileStore(),
         agent_runner=MockAgentRunner(),
     )
+
+
+def _write(path: str, content: str) -> Dict[str, Any]:
+    """A persisted ``write_file`` history entry.
+
+    Persisted entries are FLAT - ``name``/``args`` sit at the top level. The
+    live event carries the same fields nested under ``data``; see
+    ``test_accepts_the_nested_live_event_shape``.
+    """
+    return {
+        "type": "tool_call",
+        "name": "write_file",
+        "args": {"file_path": path, "content": content},
+        "result": "ok",
+    }
+
+
+def _edit(path: str, **args: Any) -> Dict[str, Any]:
+    return {"type": "tool_call", "name": "edit_file", "args": {"file_path": path, **args}}
+
+
+def _service_with_history(history: List[Dict[str, Any]]) -> PenTestAgentService:
+    cp = MockCheckpointer()
+    cp.put("session_1", {"messages": history})
+    return _service(checkpointer=cp)
 
 
 class TestListFilesystem:
@@ -99,58 +120,144 @@ class TestListFilesystem:
 
 
 class TestListScratchpad:
-    """The in-memory panel reads the agent namespace, not the store."""
+    """The scratchpad is rebuilt from the session's persisted tool calls."""
 
-    def test_returns_agent_working_files(self):
-        cp = MockCheckpointer()
-        cp.set_agent_files(
-            "session_1",
-            {
-                "/scratchpad/notes.md": "# recon notes",
-                "/scratchpad/outline.md": "## sections",
-            },
+    def test_reconstructs_files_from_write_file_calls(self):
+        service = _service_with_history(
+            [
+                _write("/scratchpad/1_host_inventory.md", "# Host Inventory"),
+                _write("/scratchpad/2_ad_infrastructure.md", "# AD"),
+            ]
         )
 
-        scratchpad = _service(checkpointer=cp).list_scratchpad()
-
-        assert scratchpad == {
-            "/scratchpad/notes.md": "# recon notes",
-            "/scratchpad/outline.md": "## sections",
+        assert service.list_scratchpad() == {
+            "/scratchpad/1_host_inventory.md": "# Host Inventory",
+            "/scratchpad/2_ad_infrastructure.md": "# AD",
         }
 
-    def test_filters_out_files_outside_the_scratchpad(self):
-        cp = MockCheckpointer()
-        cp.set_agent_files(
-            "session_1",
-            {
-                "/scratchpad/keep.md": "keep",
-                "/elsewhere/drop.md": "drop",
-            },
+    def test_empty_before_the_agent_wrote_anything(self):
+        assert _service_with_history([]).list_scratchpad() == {}
+
+    def test_ignores_tool_calls_outside_the_scratchpad(self):
+        service = _service_with_history(
+            [
+                _write("/context/reports/final.md", "a report"),
+                _write("/elsewhere/notes.md", "not scratchpad"),
+            ]
         )
 
-        assert list(_service(checkpointer=cp).list_scratchpad()) == [
-            "/scratchpad/keep.md"
-        ]
+        assert service.list_scratchpad() == {}
 
-    def test_empty_before_the_first_agent_run(self):
-        assert _service().list_scratchpad() == {}
+    def test_ignores_non_write_tools(self):
+        service = _service_with_history(
+            [
+                {
+                    "type": "tool_call",
+                    "name": "read_file",
+                    "args": {"file_path": "/scratchpad/x.md"},
+                },
+                {"type": "message", "data": "done"},
+                {"role": "user", "content": "go"},
+            ]
+        )
+
+        assert service.list_scratchpad() == {}
+
+    def test_latest_write_to_a_path_wins(self):
+        service = _service_with_history(
+            [
+                _write("/scratchpad/draft.md", "first"),
+                _write("/scratchpad/draft.md", "second"),
+            ]
+        )
+
+        assert service.list_scratchpad() == {"/scratchpad/draft.md": "second"}
+
+    def test_edit_with_full_body_replaces_content(self):
+        service = _service_with_history(
+            [
+                _write("/scratchpad/draft.md", "old"),
+                _edit("/scratchpad/draft.md", content="new"),
+            ]
+        )
+
+        assert service.list_scratchpad() == {"/scratchpad/draft.md": "new"}
+
+    def test_edit_with_substitution_is_replayed_against_known_content(self):
+        service = _service_with_history(
+            [
+                _write("/scratchpad/draft.md", "alpha beta"),
+                _edit("/scratchpad/draft.md", old_string="beta", new_string="gamma"),
+            ]
+        )
+
+        assert service.list_scratchpad() == {"/scratchpad/draft.md": "alpha gamma"}
+
+    def test_unreplayable_substitution_is_dropped_not_faked(self):
+        """An edit with no known prior content must not invent a result."""
+        service = _service_with_history(
+            [_edit("/scratchpad/draft.md", old_string="beta", new_string="gamma")]
+        )
+
+        assert service.list_scratchpad() == {}
 
     def test_is_scoped_to_the_current_thread(self):
         cp = MockCheckpointer()
-        cp.set_agent_files("session_1", {"/scratchpad/a.md": "one"})
-        cp.set_agent_files("session_2", {"/scratchpad/b.md": "two"})
+        cp.put("session_1", {"messages": [_write("/scratchpad/a.md", "one")]})
+        cp.put("session_2", {"messages": [_write("/scratchpad/b.md", "two")]})
 
-        assert list(_service("session_2", checkpointer=cp).list_scratchpad()) == [
-            "/scratchpad/b.md"
-        ]
+        service = PenTestAgentService(
+            thread_id="session_2",
+            checkpointer=cp,
+            file_store=MockFileStore(),
+            agent_runner=MockAgentRunner(),
+        )
 
-    def test_prefix_filter_is_slash_insensitive(self):
+        assert service.list_scratchpad() == {"/scratchpad/b.md": "two"}
+
+    def test_survives_a_service_rebuild_from_the_same_history(self):
+        """A reload creates a new service over the same persisted history."""
         cp = MockCheckpointer()
-        cp.set_agent_files("session_1", {"scratchpad/a.md": "no leading slash"})
+        cp.put("session_1", {"messages": [_write("/scratchpad/notes.md", "# notes")]})
 
-        assert _service(checkpointer=cp).list_scratchpad() == {
-            "scratchpad/a.md": "no leading slash"
-        }
+        first = _service(checkpointer=cp).list_scratchpad()
+        second = _service(checkpointer=cp).list_scratchpad()
+
+        assert first == second == {"/scratchpad/notes.md": "# notes"}
+
+    def test_tolerates_malformed_entries(self):
+        service = _service_with_history(
+            [
+                None,
+                "a bare string",
+                {"type": "tool_call"},
+                {"type": "tool_call", "data": None},
+                {"type": "tool_call", "name": "write_file", "args": None},
+                {"type": "tool_call", "name": "write_file", "args": {}},
+            ]
+        )
+
+        assert service.list_scratchpad() == {}
+
+    def test_accepts_the_nested_live_event_shape(self):
+        """The live stream nests name/args under data; persisted history is flat.
+
+        Reading only one of the two shapes is what made this panel render empty
+        against real data, so both are pinned here.
+        """
+        service = _service_with_history(
+            [
+                {
+                    "type": "tool_call",
+                    "data": {
+                        "name": "write_file",
+                        "args": {"file_path": "/scratchpad/n.md", "content": "nested"},
+                    },
+                }
+            ]
+        )
+
+        assert service.list_scratchpad() == {"/scratchpad/n.md": "nested"}
 
 
 class TestPrefixStripping:
@@ -166,9 +273,7 @@ class TestPrefixStripping:
         store = MockFileStore()
         store.write_file("findings/findings_summary.txt", b"x")
 
-        assert _service(file_store=store).list_findings() == [
-            "findings_summary.txt"
-        ]
+        assert _service(file_store=store).list_findings() == ["findings_summary.txt"]
 
     def test_does_not_strip_report_prefix_mid_name(self):
         store = MockFileStore()
@@ -195,10 +300,7 @@ class TestGrouping:
             ]
         )
 
-        assert grouped == {
-            "findings": ["a.txt", "b.txt"],
-            "reports": ["c.md"],
-        }
+        assert grouped == {"findings": ["a.txt", "b.txt"], "reports": ["c.md"]}
 
     def test_nested_paths_keep_their_remaining_shape(self):
         grouped = _group_by_directory(["/context/findings/host1/a.txt"])
