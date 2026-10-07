@@ -1,104 +1,126 @@
-# Project Overview
+# Overview
 
-An AI-powered penetration testing report generation agent built with LangChain, LangGraph, and Mistral AI. This project automates the creation of security assessment reports through intelligent agent orchestration.
+What this project is, what it does, and how to run it. For how it is built, see
+[architecture.md](architecture.md); for what can go wrong, see
+[troubleshooting.md](troubleshooting.md).
 
-## Key Features
+## What it is
 
-- **Virtual Filesystem**: Persistent storage for context files (templates, interpretation guides) and session-specific scratchpad files
-- **Tool Emulation**: Mock tools for testing report export functionality
-- **Rate Limiting**: Built-in rate limiter to respect API quotas (1 request per 20 seconds)
-- **Retry Middleware**: Automatic retry on API failures with exponential backoff
-- **Session Persistence**: PostgreSQL/SQLite checkpointing for multi-turn conversations
-- **Observability**: Full tracing integration with Langfuse
-- **A2A Server**: Agent-to-agent communication capabilities
-- **Concurrent Agent Connection Restriction**: Via asyncio lock for thread-safe operations
+An agent that turns pentest findings into finished reports.
 
-## Tech Stack
+It reads raw evidence — nmap output, BloodHound dumps, uploaded notes — from a
+persistent virtual filesystem, and writes a structured report back to it. The
+report is built section by section into a scratchpad rather than in one pass,
+because tool output and file dumps routinely exceed a single context window.
 
-### Core Technologies
-- **Python 3.11+**: Primary programming language
-- **LangChain/LangGraph**: Agent orchestration framework
-- **Mistral AI** (mistral-large-2512): LLM provider for natural language understanding and report generation
-- **PostgreSQL / SQLite**: Database for persistent storage (PostgreSQL with automatic local SQLite fallback)
-- **Langfuse**: Observability and tracing platform
-- **deepagents**: Virtual filesystem middleware
+The external system prompt lives in `agent/reports.md`. Finding-interpretation
+guides and the report template live in `agent/context/`.
 
-### Architecture Components
+## The surfaces
 
-1. **Agent Core** (`agent/report_agent.py`)
-   - Creates the LangChain agent with Mistral AI
-   - Configures middleware stack
-   - Manages database connections
+One agent, exposed three ways:
 
-2. **Virtual Filesystem**
-   - `/context/` namespace: Persistent, shared across sessions (PostgreSQL-backed)
-   - `/scratchpad/` namespace: Ephemeral, session-specific (in-memory)
+| Surface | Entry point | For |
+|---|---|---|
+| Streamlit chat UI | `python -m streamlit_ui` | Interactive use. Upload findings, watch the agent work, download the report. |
+| A2A server | `python agent/a2a_connector.py` | Another agent driving this one over a protocol. |
+| Dev CLIs | `dev_tools/` | Operating the model server, the store, and the A2A client from a shell. See [dev-tools.md](dev-tools.md). |
 
-3. **Tools**
-   - `export_report_to_local_disk`: Exports reports from virtual FS to local disk
-   - Filesystem tools (ls, read_file, write_file) via middleware
+The two user-facing surfaces share only the agent runtime. They have separate
+state, separate session identity, and separate transports, and either can be
+developed or broken without touching the other.
 
-4. **Middleware Stack**
-   - `FilesystemMiddleware`: Virtual filesystem operations
-   - `LLMToolEmulator`: Mocks specific tools for testing
-   - `ModelRetryMiddleware`: Handles API retries
+## LLM backends
 
-5. **A2A Server**
-   - Enables agent-to-agent communication
-   - Facilitates distributed task execution
+Three, selected by `LLM_BACKEND`:
 
-6. **Asyncio Lock**
-   - Provides concurrent agent connection restriction
-   - Ensures thread-safe access to shared resources
+| Backend | For |
+|---|---|
+| `openai_local` | A local model server (llama.cpp or anything OpenAI-compatible). The default in `.env.example`. |
+| `openrouter` | Hosted free-tier models. No local GPU needed. |
+| `mistral` | The Mistral API. |
 
-## Development Tools
+Only `openai_local` needs no external account. The other two need a key; see
+`.env.example` for which variable each one reads.
 
-### Store CLI (`dev_tools/store_cli.py`)
-Command-line interface for managing the virtual filesystem:
-- Inspect stored files
-- Seed from local directories
-- Wipe namespaces
-- Export/import files
-- Inspect session state
+Model ids default per backend, so switching `LLM_BACKEND` is usually the only
+edit needed. See `AGENTS.md` for the two override variables and the trap around
+leaving a stale one behind.
 
-### Testing Utilities
-- `api_connection_test.py`: Verify Mistral API connectivity
-- `2_check_postgr_quick_test.py`: Debug conversation history and inspect threads
-- `prep.py`: Store seeding utility
+## Storage
 
-### Test Suites
-- `tests/acceptance/`: Agent structure, DB initialization, and A2A connectivity (real runtime)
-- `tests/mock/`: A2A concurrency lock and task cancellation tests (fake agent, no external services)
+Postgres when `POSTGRES_URI` is set and reachable; local SQLite otherwise. The
+fallback is automatic and the timeouts are tuned so an unreachable database
+degrades quickly rather than hanging startup.
 
-## Limitations
+`REPORT_AGENT_FORCE_SQLITE=1`, or `--backend sqlite`, forces the local path when
+you want it deliberately.
 
-### Rate Limiting
-- Currently configured for 1 request per 20 seconds to Mistral API
-- Maximum bucket size: 1 (no bursting)
-- May need adjustment based on your API key's specific limits
+## Observability
 
-### Database Dependencies
-- PostgreSQL is optional — if `POSTGRES_URI` is unset or unreachable, the agent uses a local SQLite backend (`agent/agent_session.db`)
-- TCP keepalives enabled by default to prevent firewall timeouts
-- Connection string must be properly configured in environment variables
+Langfuse, optional. If it is unreachable the agent runs with a no-op handler
+rather than failing.
 
-### API Dependencies
-- Requires valid Mistral AI API key
-- Subject to Mistral API availability and quota limits
-- Langfuse integration is optional but recommended for production use
+A session id is passed on every run so all turns of one thread land in a single
+Langfuse session. Token counts are reported for the `openai_local` backend; see
+[troubleshooting.md](troubleshooting.md) for why, and for what that looks like
+when it is wrong.
 
-### Virtual Filesystem
-- Context files are persistent but require manual seeding
-- Scratchpad files are ephemeral and lost on session end
-- File operations go through middleware which may add latency
+## What it does not do
 
-### Concurrency
-- Asyncio lock restricts concurrent agent connections
-- Designed for single-agent-per-thread scenarios
-- May require tuning for high-concurrency deployments
+Stated plainly, because these are the things that look available and are not.
 
-## Getting Started
+- **No live token streaming in the UI.** Tool calls appear live; the answer
+  arrives whole. The `--streaming` / `--no-streaming` flags are plumbed and
+  currently do nothing.
+- **No authentication on the A2A server.** Loopback-only by default, but
+  `--host all_interfaces` exposes an unauthenticated agent to the network.
+- **No rate limiting is applied.** The limiter is built and deliberately not
+  wired; see [architecture.md](architecture.md#rate-limiting--present-but-not-wired)
+  for why.
 
-For installation and usage instructions, see the [README](../README.md).
-For detailed architecture information, see [architecture.md](./architecture.md).
-For version history, see [changelog.md](./changelog.md).
+## Running it
+
+```bash
+pip install -e .
+
+# UI, offline, nothing else needed
+python -m streamlit_ui --agent mocks
+
+# UI, real agent, local SQLite
+python -m streamlit_ui --agent real --backend sqlite
+
+# UI against OpenRouter
+python -m streamlit_ui --agent real --llm-backend openrouter --backend sqlite --debug
+
+# A2A server, loopback only
+python agent/a2a_connector.py
+```
+
+`--debug` prints a connectivity report before starting. Use it first whenever
+something is not working — it settles which backend and which database are
+actually in use.
+
+## Layout
+
+```
+agent/          the agent runtime, the A2A server, the system prompt
+client/         the A2A client library
+streamlit_ui/   the chat UI
+dev_tools/      operator CLIs
+tests/          mock (fast), acceptance (live), experiments
+docs/           this documentation
+results/        sample findings, and generated reports
+```
+
+Per-file detail is in `AGENTS.md`. Per-layer detail is in
+[architecture.md](architecture.md).
+
+## Update this when
+
+- a surface is added or removed, or its entry point changes
+- the backend set, storage options, or observability behaviour changes
+- a limitation above is fixed or a new one appears
+
+Not for: implementation detail (that is `architecture.md`), env vars (that is
+`.env.example`), or dependency purposes (that is `dependencies.md`).

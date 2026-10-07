@@ -446,7 +446,10 @@ def cmd_endpoint(args):
         print(f"\n# PowerShell / Windows set-env (for report agent tests):")
         print(f'$env:LLM_BASE_URL = "{base_url}"')
         print(f'$env:LLM_API_KEY = "{secret}"')
-        print(f'$env:LLM_MODEL = "{model}"')
+        # AGENT_MODEL, not LLM_MODEL: that variable was deleted. There is no
+        # per-backend model variable any more - AGENT_MODEL is backend-agnostic
+        # and falls back to _BACKEND_MODEL_DEFAULTS when unset.
+        print(f'$env:AGENT_MODEL = "{model}"')
 
 
 def cmd_chat(args):

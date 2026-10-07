@@ -138,16 +138,44 @@ fix the two ways a rewrite heals the prose but damages the content.
 
 ## Draft PR docs
 
-Long-lived draft PRs (work parked for later) keep a short `docs/PR-<name>.md` that
+Long-lived draft PRs (work parked for later) keep a short `docs/history/PR-<name>.md` that
 records intent, current state, remaining work, and dependencies. Mirror its key points
-into the PR description. See `docs/PR-a2a-client.md` for the pattern.
+into the PR description. See `docs/history/PR-a2a-client.md` for the pattern.
+
+That folder is explicitly not current truth — see `docs/history/README.md`.
+
+## Documentation is part of the change
+
+Every doc ends with an **"Update this when"** list, and `AGENTS.md` has a routing
+table mapping change types to the doc they belong to. If your change matches a
+trigger, editing that doc is part of your diff — not a follow-up.
+
+The mechanism exists so that a change touches **one** doc rather than the whole
+set. It works because each doc has exactly one job:
+
+- `.env.example` — the only place the env table exists. Nothing restates it.
+- `docs/overview.md` — what the project is and does not do
+- `docs/architecture.md` — how it is built, invariants, traps
+- `docs/dependencies.md` — what each dependency is for
+- `docs/troubleshooting.md` — symptom → cause
+- `docs/changelog.md` — what changed when
+
+Two rules keep them from rotting:
+
+1. **Cite symbols, not line numbers.** Line numbers were the single largest
+   source of stale documentation in this repo — one citation was 131 lines off.
+2. **Do not restate another doc's content.** Link to it instead. Duplicated
+   tables are duplicated the next time one of them is updated.
 
 ## Checklist before "Ready for review"
 
 - [ ] Branch follows `pr-<feature>`.
 - [ ] Title is descriptive, plain language.
 - [ ] Body reflects the idea, current state, and direction (3-paragraph rhythm).
-- [ ] Body is readable prose — topic sentences, backticks on identifiers, no code-splurge.
+- [ ] Body is readable prose — topic sentences, `backticks` on identifiers, no code-splurge.
 - [ ] Bullets capped (3-5/section); mechanisms preserved in a `Wiring / Key references` block.
-- [ ] Draft status + `docs/PR-*.md` used for parked/large work.
+- [ ] Draft status + `docs/history/PR-*.md` used for parked/large work.
+- [ ] Any doc whose "Update this when" list your change matches has been updated.
+- [ ] Env var added or changed? `.env.example` updated, and **only** `.env.example`.
+- [ ] New symbol cited by name, not by line number.
 - [ ] No secrets committed; `.env` stays out of the repo.

@@ -7,6 +7,11 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
     "a2a-sdk==1.1.0",
+    # Imported directly by agent/report_agent.py for the local SQLite fallback.
+    # It resolves today only because langgraph-checkpoint-sqlite pulls it in
+    # transitively - pinning it here means an upstream change there cannot
+    # silently break the offline path.
+    "aiosqlite==0.22.1",
     "aiologic==0.16.0",
     "annotated-doc==0.0.4",
     "annotated-types==0.7.0",

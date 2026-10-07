@@ -639,8 +639,18 @@ class AgentRuntime:
             }
         )
         
-        # Rate limiter (kept here, NOT wired into the LLM factory for now).
-        # Enforce a maximum of 1 request per 60 seconds
+        # Rate limiter - constructed, deliberately NOT wired into any model.
+        #
+        # This is not dead code and should not be deleted. It exists because the
+        # mistral backend needs request pacing; the local model server and
+        # OpenRouter do not, which is why every branch of _init_llm passes
+        # rate_limiter=None. It is kept here so it can be re-enabled per backend
+        # without re-deriving it.
+        #
+        # If you wire it up, wire it per backend rather than globally: a limiter
+        # that slows the local backend down to one request per 20s would be a
+        # serious regression, and that is exactly the mistake this comment exists
+        # to prevent. docs/architecture.md records the same decision.
         rate_limiter = InMemoryRateLimiter(
             requests_per_second=0.05,  # 1 request every 20 seconds
             check_every_n_seconds=0.5,   # Check twice a second if we are allowed to proceed
