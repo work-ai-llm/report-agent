@@ -324,6 +324,20 @@ class PenTestAgentService:
         """True while an agent turn for this thread is still in flight."""
         return REGISTRY.is_running(self._thread_id)
 
+    def cancel_run(self) -> bool:
+        """Ask this thread's in-flight turn to stop. False if none is running.
+
+        Explicit by necessity, not by preference. Streamlit 1.62 raises the same
+        ``StopException`` for the browser's Stop button and for an ordinary widget
+        click (``runner.fastReruns`` makes a widget click take the
+        ``request_stop`` path), so the script cannot tell "the user stopped this"
+        from "the user clicked something". Inferring cancellation from the
+        consumer going away would kill every turn the moment a sidebar widget was
+        touched. A stopped turn emits no final message and is not persisted as
+        finished.
+        """
+        return REGISTRY.request_cancel(self._thread_id)
+
     def active_run_snapshot(self) -> Optional[Dict[str, Any]]:
         """A consistent copy of this thread's latest run, or ``None``."""
         state = REGISTRY.get(self._thread_id)

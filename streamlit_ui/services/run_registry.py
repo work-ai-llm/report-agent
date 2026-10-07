@@ -55,6 +55,10 @@ from typing import Any, Dict, List, Optional, Tuple
 RUNNING = "running"
 DONE = "done"
 ERROR = "error"
+# Terminal state for a turn the user explicitly stopped. Distinct from ERROR: a
+# stopped turn is not a failure, and treating it as one would show an error the
+# user did not cause and could not act on.
+CANCELLED = "cancelled"
 
 
 class RunBusyError(RuntimeError):
@@ -103,7 +107,43 @@ class RunState:
         self.events: List[Dict[str, Any]] = []
         self.status: str = RUNNING
         self.error: Optional[str] = None
+        # Set by request_cancel(). The producer checks it at its next checkpoint
+        # and unwinds. Cooperative rather than an asyncio task cancellation,
+        # because the producer is mid-`astream` and a bare cancel can leave the
+        # LangGraph checkpointer mid-step.
+        self.cancel_requested: bool = False
         self._revision: int = 0
+        # The Future returned by EventLoopThread.schedule, when there is one.
+        # Cancelling it propagates CancelledError into the coroutine *at its await
+        # point* - which for the real agent is inside its own astream generator,
+        # so the agent's in-flight work actually unwinds. Raising CancelledError
+        # in our own frame would not: it would unwind us and leave the agent's
+        # generator suspended, still holding its model call.
+        self._handle: Any = None
+
+    def attach_handle(self, handle: Any) -> None:
+        """Record the scheduling handle so :meth:`request_cancel` can stop it."""
+        with self._lock:
+            self._handle = handle
+
+    def request_cancel(self) -> bool:
+        """Ask the producer to stop. Returns False if it is already terminal.
+
+        Sets the cooperative flag *and* cancels the scheduling handle. The flag is
+        what the producer checks between graph updates; the handle cancellation is
+        what actually tears down work already in flight.
+        """
+        with self._lock:
+            if self.status != RUNNING:
+                return False
+            self.cancel_requested = True
+            self._revision += 1
+            handle = self._handle
+        if handle is not None:
+            # concurrent.futures.Future.cancel() does propagate to the underlying
+            # asyncio task even after the coroutine has started.
+            handle.cancel()
+        return True
 
     # -- writes (event-loop thread) ----------------------------------------
 
@@ -131,13 +171,19 @@ class RunState:
         """Mark the run terminal. Idempotent - the first call wins.
 
         Called by the producer after its final persist, so a reader that sees a
-        terminal status can trust the persisted list is complete.
+        terminal status can trust the persisted list is complete. A run that was
+        asked to cancel lands on CANCELLED regardless of ``error``, since the
+        user stopping it is not a failure.
         """
         with self._lock:
             if self.status != RUNNING:
                 return
-            self.status = ERROR if error else DONE
-            self.error = error
+            if self.cancel_requested:
+                self.status = CANCELLED
+                self.error = None
+            else:
+                self.status = ERROR if error else DONE
+                self.error = error
             self.finished_at = time.monotonic()
             self._revision += 1
 
@@ -230,6 +276,14 @@ class RunRegistry:
         with self._lock:
             states = list(self._runs.values())
         return sorted(s.thread_id for s in states if s.is_running)
+
+    def request_cancel(self, thread_id: str) -> bool:
+        """Ask the thread's live run to stop. See :meth:`RunState.request_cancel`."""
+        with self._lock:
+            current = self._runs.get(thread_id)
+        if current is None:
+            return False
+        return current.request_cancel()
 
     def drop(self, thread_id: str) -> None:
         """Forget a thread's run (called when the session is deleted)."""

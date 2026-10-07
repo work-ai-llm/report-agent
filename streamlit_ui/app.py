@@ -514,6 +514,11 @@ def render_run_status(service: PenTestAgentService) -> None:
                     f"{steps} step(s) so far. The sidebar stays usable — this "
                     "turn keeps going in the background."
                 )
+                # An explicit Stop, because the browser's Stop button cannot be
+                # used for this (see PenTestAgentService.cancel_run).
+                if st.button("🛑 Stop this turn", key="stop_active_run"):
+                    if service.cancel_run():
+                        st.info("Stopping. The turn will not be saved as finished.")
         elif st.session_state.pop("_run_was_active", False):
             # The turn ended while this fragment was watching. Force one full
             # rerun: reconciliation picks up the finished transcript, and the strip

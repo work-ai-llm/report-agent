@@ -470,6 +470,10 @@ class RealAgentRunnerAdapter:
         """Always True: the registry path works with or without a checkpointer."""
         return True
 
+    def cancel(self, thread_id: str) -> bool:
+        """Ask this thread's in-flight turn to stop. See the real adapter."""
+        return REGISTRY.request_cancel(thread_id)
+
     def start(self, message: str, thread_id: str) -> RunState:
         """Begin a turn and return immediately. Never blocks on the agent.
 
@@ -494,7 +498,7 @@ class RealAgentRunnerAdapter:
         if self._checkpointer is not None:
             self._checkpointer.put(thread_id, {"messages": list(state.messages)})
 
-        self._runner.schedule(self._consume(state, message, thread_id))
+        state.attach_handle(self._runner.schedule(self._consume(state, message, thread_id)))
         return state
 
     def poll(self, thread_id: str, index: int) -> Tuple[List[Dict[str, Any]], int, int]:
@@ -514,6 +518,35 @@ class RealAgentRunnerAdapter:
 
     def is_running(self, thread_id: str) -> bool:
         return REGISTRY.is_running(thread_id)
+
+    def cancel(self, thread_id: str) -> bool:
+        """Ask the thread's in-flight turn to stop.
+
+        ## Why this is explicit rather than tied to the consumer going away
+
+        #39 fixed "pressing Stop does not stop the agent" by cancelling the
+        schedule handle in a ``finally`` around the yield loop. That works, but it
+        is incompatible with #20, and not because of a subtlety in this code -
+        because of what Streamlit 1.62 actually raises.
+
+        With ``runner.fastReruns`` on (the default), a *widget click* does not
+        raise ``RerunException``. ``AppSession.request_rerun`` takes the fast
+        path and calls ``request_stop()`` instead (``app_session.py:503``), so the
+        running script raises ``StopException``. The browser's Stop button calls
+        ``request_script_stop`` (``app_session.py:518-524``), which raises the
+        same ``StopException``.
+
+        So ``StopException`` is ambiguous: it means both "the user stopped this"
+        and "the user clicked something". Re-raise on one and you get the other
+        too - which would reinstate #20 exactly, killing every turn the moment a
+        sidebar widget was touched.
+
+        Cancellation is therefore an explicit call from the UI, and the semantics
+        #39 established are preserved: a cancelled run emits no final message and
+        does not fall back to the checkpointer, so a stopped turn is never written
+        out as a finished one.
+        """
+        return REGISTRY.request_cancel(thread_id)
 
     def run(self, message: str, thread_id: str) -> Iterator[Dict[str, Any]]:
         """Blocking facade over :meth:`start` + :meth:`poll`.
@@ -693,6 +726,7 @@ class RealAgentRunnerAdapter:
             _print(f"[AGENT STREAM]: agent type={type(self._agent).__name__} graph_type={type(getattr(self._agent, 'builder', None)).__name__}")
             _updates = 0
             failure: Optional[str] = None
+            stopped_by_user = False
             try:
                 _print(f"[AGENT STREAM]: calling astream() at t={_ts()}")
                 # NOTE: stream_mode=["messages","updates"] was tried for live
@@ -707,6 +741,17 @@ class RealAgentRunnerAdapter:
                 _print(f"[AGENT STREAM]: astream() returned iterator at t={_ts()}, type={type(astream_iter).__name__}")
                 _print(f"[AGENT STREAM]: entering async for loop at t={_ts()}")
                 async for update in astream_iter:
+                    # Explicit stop. Raising CancelledError rather than just
+                    # `break`ing matters: breaking out of an `async for` does not
+                    # close the generator, so the agent's own astream would keep
+                    # running (and the in-flight model call with it). Raising
+                    # unwinds the whole task, which is what actually stops the
+                    # work - and the existing CancelledError handler below keeps
+                    # this out of the "failed run" path.
+                    if state.cancel_requested:
+                        stopped_by_user = True
+                        _print(f"[AGENT STREAM]: stop requested by the user at t={_ts()}")
+                        raise asyncio.CancelledError()
                     _updates += 1
                     if isinstance(update, tuple) and len(update) == 2:
                         # (AIMessageChunk, metadata) from the "messages" channel.
@@ -730,12 +775,12 @@ class RealAgentRunnerAdapter:
                         await self._persist(state, thread_id)
                 _print(f"[AGENT STREAM]: astream loop finished at t={_ts()} total_updates={_updates}")
             except asyncio.CancelledError:
-                # The consumer went away (Streamlit's Stop closes the generator
-                # this is feeding). Re-raise so the task ends cancelled, and set
-                # the flag so the finally block does not treat an abandoned run
-                # as a completed one.
+                # Either the user pressed Stop, or the task was cancelled from
+                # outside. Re-raise so the task ends cancelled, and set the flag so
+                # the finally block does not treat a stopped run as a completed
+                # one.
                 cancelled = True
-                _print(f"[AGENT STREAM]: cancelled by the consumer at t={_ts()}")
+                _print(f"[AGENT STREAM]: cancelled at t={_ts()}")
                 raise
             except Exception as exc:  # noqa: BLE001 - surface to UI consumer
                 _print(f"[AGENT ERROR]: t={_ts()} {type(exc).__name__}: {exc}")
@@ -745,11 +790,16 @@ class RealAgentRunnerAdapter:
                 _emit({"type": "error", "data": failure})
             finally:
                 _print(f"[AGENT STREAM]: finally block at t={_ts()}")
-                if cancelled:
-                    # An abandoned run must not emit a final answer or fall back
-                    # to the checkpointer. Doing either writes state for a turn
-                    # the user stopped, which then shows up in the session list.
-                    _print("[AGENT STREAM]: skipping final message for a cancelled run")
+                if cancelled or stopped_by_user:
+                    # A stopped turn must not emit a final answer or fall back to
+                    # the checkpointer. Doing either writes state for a turn the
+                    # user stopped, which then shows up in the session list as a
+                    # completed entry.
+                    #
+                    # Two paths reach here: `cancelled` is an asyncio task
+                    # cancellation, `stopped_by_user` is the cooperative break out
+                    # of the astream loop after cancel() was called.
+                    _print("[AGENT STREAM]: skipping final message for a stopped run")
                 elif final_parts:
                     text = "".join(final_parts)
                     _emit({"type": "message", "data": text}, [{"type": "assistant", "content": text}])
@@ -783,7 +833,7 @@ class RealAgentRunnerAdapter:
                     failure = failure or f"persist failed: {exc}"
                 state.finish(error=failure)
 
-return _consume
+        return _consume
 
     def _consume(self, state: RunState, message: str, thread_id: str) -> Any:
         return self._build_consumer(state, message, thread_id)()

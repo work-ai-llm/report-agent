@@ -72,6 +72,24 @@ def _wait_for(predicate, timeout: float = 15.0, interval: float = 0.02) -> bool:
     return False
 
 
+def _service(thread_id: str = "t", delay: float = 0.0):
+    """A service wired to in-memory mocks, with a polling-capable runner.
+
+    The runner and the service share one checkpointer, as they do in the real
+    wiring - otherwise the runner would persist to a store the service never reads.
+    """
+    from streamlit_ui.services.agent_service import PenTestAgentService
+    from tests.mock.mock_objects_streamlit import MockFileStore
+
+    cp = MockCheckpointer()
+    return PenTestAgentService(
+        thread_id=thread_id,
+        checkpointer=cp,
+        file_store=MockFileStore(),
+        agent_runner=MockAgentRunner(delay_seconds=delay, checkpointer=cp),
+    )
+
+
 class _SlowAgent:
     """Fake agent that yields tool calls, then waits, then yields the answer.
 
@@ -336,6 +354,104 @@ class TestOneTurnPerThread:
         adapter.start("second", "th-busy")
         assert _wait_for(lambda: not REGISTRY.is_running("th-busy"))
         assert agent.astream_calls == 2
+
+
+class TestCancellationSemantics:
+    """A stopped turn is terminal, distinct from a failure, and not persisted as done."""
+
+    def test_cancel_marks_the_run_cancelled_not_error(self):
+        from streamlit_ui.services.run_registry import CANCELLED, RunState
+
+        state = RunState("t", "q")
+        assert state.request_cancel() is True
+        state.finish()
+        assert state.status == CANCELLED
+        assert state.error is None, "a user stop is not a failure"
+        assert not state.is_running
+
+    def test_cancel_wins_over_a_later_error(self):
+        """A cancel followed by a teardown error must not read as a failure."""
+        from streamlit_ui.services.run_registry import CANCELLED, RunState
+
+        state = RunState("t", "q")
+        state.request_cancel()
+        state.finish(error="something exploded during teardown")
+        assert state.status == CANCELLED
+
+    def test_cancel_is_refused_once_terminal(self):
+        from streamlit_ui.services.run_registry import RunState
+
+        state = RunState("t", "q")
+        state.finish()
+        assert state.request_cancel() is False
+
+    def test_cancel_bumps_the_revision(self):
+        """The UI polls revision to notice changes; a stop is a change."""
+        from streamlit_ui.services.run_registry import RunState
+
+        state = RunState("t", "q")
+        before = state.revision
+        state.request_cancel()
+        assert state.revision > before
+
+    def test_registry_forwards_cancel(self):
+        reg = RunRegistry()
+        assert reg.request_cancel("never-ran") is False
+        reg.start("t", "q")
+        assert reg.request_cancel("t") is True
+
+    def test_service_cancel_run_targets_its_own_thread(self):
+        svc = _service("cancel-thread", delay=1.5)
+        svc._agent_runner.start("q", "cancel-thread")
+        assert svc.is_run_active() is True
+        assert svc.cancel_run() is True
+        assert REGISTRY.get("cancel-thread").cancel_requested is True
+
+    def test_service_cancel_run_is_false_when_idle(self):
+        assert _service("idle-thread").cancel_run() is False
+
+    def test_real_adapter_stop_persists_no_assistant_reply(self, backend):
+        """The #39 guarantee, end to end against the real checkpointer.
+
+        A stopped turn must not leave a half-finished entry in the transcript that
+        looks like a completed one.
+        """
+        runner, runtime = backend
+        cp = rb.RealCheckpointerAdapter(runner, runtime.checkpointer, checkpoint_ns=rb._UI_CHECKPOINT_NS)
+        agent = _SlowAgent(gap_seconds=2.0)
+        adapter = rb.RealAgentRunnerAdapter(runner, agent, checkpointer=cp)
+
+        adapter.start("stop me", "th-stop")
+        assert _wait_for(lambda: REGISTRY.get("th-stop") is not None)
+        time.sleep(0.3)
+        adapter.cancel("th-stop")
+
+        assert _wait_for(lambda: not REGISTRY.is_running("th-stop")), "run never stopped"
+        rows = cp.get("th-stop")["messages"]
+        types = [m.get("type") for m in rows]
+        assert "assistant" not in types, f"a stopped turn was written as finished: {types}"
+        # The user prompt is still there - it was durable from the start.
+        assert types[0] == "user"
+
+    def test_run_is_reusable_after_a_stop(self, backend):
+        runner, runtime = backend
+        cp = rb.RealCheckpointerAdapter(runner, runtime.checkpointer, checkpoint_ns=rb._UI_CHECKPOINT_NS)
+        adapter = rb.RealAgentRunnerAdapter(runner, _SlowAgent(gap_seconds=2.0), checkpointer=cp)
+
+        adapter.start("first", "th-reuse")
+        time.sleep(0.3)
+        adapter.cancel("th-reuse")
+        assert _wait_for(lambda: not REGISTRY.is_running("th-reuse"))
+
+        # The thread must not stay wedged: a later turn has to be accepted.
+        adapter._agent = _SlowAgent(tool_names=("ls",), gap_seconds=0.0)
+        adapter.start("second", "th-reuse")
+        assert _wait_for(lambda: not REGISTRY.is_running("th-reuse"))
+        rows = cp.get("th-reuse")["messages"]
+        assert [m.get("content") for m in rows if m.get("type") == "user"] == [
+            "first",
+            "second",
+        ]
 
 
 class TestRunStateAndRegistry:

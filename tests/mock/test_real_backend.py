@@ -286,13 +286,48 @@ class TestRealAgentRunnerAdapter:
         assert "[AGENT RESPONSE]: Done here." in out
 
 
-class TestRunCancellation:
-    """Abandoning the run must stop the agent stream (issue #39).
+def _wait_for_run(registry, thread_id, timeout=5.0):
+    """Wait for a registered run to exist and be in flight."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if registry.get(thread_id) is not None and registry.is_running(thread_id):
+            return True
+        time.sleep(0.02)
+    return False
 
-    Streamlit's Stop button ends the script run, which closes this generator.
-    Before the fix the `Future` from `schedule()` was discarded, so nothing
-    cancelled the coroutine: the agent kept streaming to completion on the event
-    loop after the UI had moved on.
+
+def _wait_until_idle(registry, thread_id, timeout=5.0):
+    """Wait for a run to reach a terminal state."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not registry.is_running(thread_id):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+class TestRunCancellation:
+    """Stopping a turn must actually stop the agent stream (issue #39).
+
+    ## Why these tests changed shape
+
+    This originally asserted that *closing the generator* stops the agent - the
+    `Future` from `schedule()` was discarded, so nothing cancelled the coroutine
+    and the agent kept streaming to completion after the UI moved on. That fix is
+    incompatible with #20, and not because of a subtlety in this code: because of
+    what Streamlit 1.62 actually raises.
+
+    With ``runner.fastReruns`` on (the default), a widget click does not raise
+    ``RerunException``. ``AppSession.request_rerun`` takes the fast path and calls
+    ``request_stop()`` (``app_session.py:503``), so the running script raises
+    ``StopException`` - the same exception the browser's Stop button produces via
+    ``request_script_stop`` (``app_session.py:518-524``).
+
+    So closing the generator cannot mean "cancel": doing so would kill every turn
+    the instant a sidebar widget was touched, which is #20 all over again.
+    Cancellation is now explicit (``adapter.cancel(thread_id)``), and the UI calls
+    it from a button. The semantics #39 established are preserved - a stopped
+    turn emits no final message - and that is what these tests now pin.
     """
 
     class _EndlessAgent:
@@ -321,6 +356,10 @@ class TestRunCancellation:
                 yield {"messages": [self._chunk]}
                 while True:
                     await asyncio.sleep(0.01)
+                    # Keep emitting, so a cooperative stop at the top of the
+                    # consumer's update loop has updates to notice. A generator
+                    # that yields once and then blocks would never be re-entered.
+                    yield {"messages": [self._chunk]}
             except asyncio.CancelledError:
                 self.stopped = True
                 raise
@@ -331,43 +370,90 @@ class TestRunCancellation:
             time.sleep(0.02)
         return agent.stopped
 
-    def test_closing_the_generator_stops_the_agent_stream(self, backend, monkeypatch):
+    def test_cancel_stops_the_agent_stream(self, backend, monkeypatch):
         monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
         runner, _runtime = backend
         agent = self._EndlessAgent()
         adapter = rb.RealAgentRunnerAdapter(runner, agent)
+        from streamlit_ui.services.run_registry import REGISTRY
 
-        stream = adapter.run("long turn", "th-cancel")
-        assert next(stream)["type"] == "tool_call"
+        REGISTRY.clear()
+        adapter.start("long turn", "th-cancel")
+        assert _wait_for_run(REGISTRY, "th-cancel")
         assert agent.started.wait(5)
 
-        # This is what Streamlit does when the user presses Stop.
-        stream.close()
+        assert adapter.cancel("th-cancel") is True
 
         assert self._drain_until_stopped(agent), (
-            "the agent stream kept running after the consumer went away"
+            "the agent stream kept running after cancel()"
         )
+        assert _wait_until_idle(REGISTRY, "th-cancel")
+
+    def test_abandoning_the_consumer_does_not_stop_the_run(self, backend, monkeypatch):
+        """The #20 guarantee, pinned directly.
+
+        Closing the consumer is what a widget click does to the script run. If that
+        stopped the agent, every interrupted turn would be lost again - so this is
+        the test that would catch a regression back toward #39's original approach.
+        """
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        runner, _runtime = backend
+        agent = self._EndlessAgent()
+        adapter = rb.RealAgentRunnerAdapter(runner, agent)
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        REGISTRY.clear()
+        adapter.start("long turn", "th-abandon")
+        assert _wait_for_run(REGISTRY, "th-abandon")
+        assert agent.started.wait(5)
+
+        # No consumer was ever attached - the run is entirely unattended.
+        time.sleep(0.2)
+
+        assert not agent.stopped, "an unattended run was cancelled"
+        assert REGISTRY.is_running("th-abandon"), "an unattended run was cancelled"
+        adapter.cancel("th-abandon")  # tidy up
+        assert self._drain_until_stopped(agent)
 
     def test_cancelled_run_emits_no_final_message(self, backend, monkeypatch, capsys):
-        # A stopped turn must not be reported as a finished one. The finally
-        # block previously emitted whatever text had accumulated and could fall
-        # back to the checkpointer, which wrote state for an abandoned turn.
+        """A stopped turn must not be reported as a finished one.
+
+        The finally block emits whatever text had accumulated and can fall back to
+        the checkpointer. Doing either writes state for a turn the user stopped,
+        which then appears in the session list as a completed entry.
+        """
         monkeypatch.setenv("STREAMLIT_AGENT_PRINT", "1")
         runner, _runtime = backend
         agent = self._EndlessAgent()
         adapter = rb.RealAgentRunnerAdapter(runner, agent)
+        from streamlit_ui.services.run_registry import REGISTRY
 
-        stream = adapter.run("long turn", "th-cancel2")
-        next(stream)
+        REGISTRY.clear()
+        adapter.start("long turn", "th-cancel2")
+        assert _wait_for_run(REGISTRY, "th-cancel2")
         assert agent.started.wait(5)
-        stream.close()
+
+        adapter.cancel("th-cancel2")
         assert self._drain_until_stopped(agent)
+        assert _wait_until_idle(REGISTRY, "th-cancel2")
 
         out = capsys.readouterr().out
-        assert "cancelled by the consumer" in out
-        assert "skipping final message for a cancelled run" in out
+        # The handle cancellation arrives as CancelledError at the agent's own
+        # await point, so "cancelled" is what gets logged - the cooperative
+        # "stop requested by the user" check only fires when the cancel happens to
+        # land on a graph-update boundary instead.
+        assert "cancelled at" in out
+        assert "skipping final message for a stopped run" in out
         assert "[AGENT RESPONSE]" not in out
         assert "AGENT RESPONSE (checkpointer)" not in out
+
+    def test_cancel_is_refused_when_nothing_is_running(self, backend):
+        runner, _runtime = backend
+        adapter = rb.RealAgentRunnerAdapter(runner, self._EndlessAgent())
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        REGISTRY.clear()
+        assert adapter.cancel("never-started") is False
 
     def test_normal_completion_is_unaffected(self, backend, monkeypatch):
         monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
