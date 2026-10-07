@@ -31,3 +31,7 @@ Do not use them to learn how the system works. Use:
 - **`PR-a2a-acceptance.md`** — the journal for the A2A acceptance campaign.
   Superseded in practice by `tests/acceptance/7_a2a_client_acceptance.py`, which
   covers the same lifecycle more cleanly.
+- **`PR-better-sidebar.md`** — the journal for the sidebar filesystem and
+  scratchpad panels. Records why the agent's scratchpad had to be reconstructed
+  from persisted tool calls rather than read from storage: the in-memory backend
+  is never checkpointed in this project.
