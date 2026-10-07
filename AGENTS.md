@@ -24,6 +24,7 @@ current truth.
 | `AGENTS.md` (this) | How to run it, what breaks, what not to touch |
 | `docs/overview.md` | What the project is, what it does not do, how to run it |
 | `docs/architecture.md` | How it is built: the core, the two consumers, invariants, traps |
+| `docs/dev-tools.md` | The operator CLIs: what each does, and their traps |
 | `docs/dependencies.md` | What each dependency is for, and the known packaging problems |
 | `docs/troubleshooting.md` | Symptom → cause, seeded from real incidents |
 | `docs/changelog.md` | What changed when, and what is still known-broken |
@@ -40,6 +41,7 @@ find your change, edit the doc it maps to, and nothing else:
 |---|---|
 | New/removed env var, or a changed default | `.env.example` only |
 | New dependency, or one whose role changed | `docs/dependencies.md` |
+| A CLI gained/lost a subcommand or flag, or its traps changed | `docs/dev-tools.md` |
 | New failure mode diagnosed | `docs/troubleshooting.md` |
 | A surface, entry point, or subprocess | `docs/overview.md` + `docs/architecture.md` |
 | Model factory, middleware, storage layout, bind model, streaming approach | `docs/architecture.md` |

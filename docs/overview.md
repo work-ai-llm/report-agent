@@ -24,7 +24,7 @@ One agent, exposed three ways:
 |---|---|---|
 | Streamlit chat UI | `python -m streamlit_ui` | Interactive use. Upload findings, watch the agent work, download the report. |
 | A2A server | `python agent/a2a_connector.py` | Another agent driving this one over a protocol. |
-| Dev CLIs | `dev_tools/` | Operating the model server, the database, and the A2A client from a shell. |
+| Dev CLIs | `dev_tools/` | Operating the model server, the store, and the A2A client from a shell. See [dev-tools.md](dev-tools.md). |
 
 The two user-facing surfaces share only the agent runtime. They have separate
 state, separate session identity, and separate transports, and either can be
