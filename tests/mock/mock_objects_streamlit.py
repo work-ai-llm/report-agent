@@ -80,6 +80,10 @@ class MockCheckpointer:
     def __init__(self):
         """Initialize empty in-memory storage."""
         self._storage: Dict[str, Dict[str, Any]] = {}
+        # The agent's own files (e.g. /scratchpad/) live in a different
+        # checkpoint namespace from the UI conversation, so they get their own
+        # store. See list_agent_files.
+        self._agent_files: Dict[str, Dict[str, str]] = {}
     
     def get(self, thread_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve conversation state for a given thread.
@@ -123,9 +127,42 @@ class MockCheckpointer:
             return True
         return False
     
+    def list_agent_files(
+        self, thread_id: str, prefix: str = ""
+    ) -> Dict[str, str]:
+        """Read the agent's in-memory working files for a thread.
+        
+        Mirrors the real adapter: the agent's scratchpad lives in the agent's
+        own checkpoint namespace, not the UI's, and is therefore stored here
+        separately from the UI conversation state.
+        
+        Args:
+            thread_id: Unique identifier for the session/thread
+            prefix: Optional path prefix filter, slash-insensitive
+            
+        Returns:
+            Mapping of file path to text content, empty if nothing was seeded
+        """
+        wanted = prefix.strip("/")
+        return {
+            path: text
+            for path, text in self._agent_files.get(thread_id, {}).items()
+            if not wanted or path.strip("/").startswith(wanted)
+        }
+    
+    def set_agent_files(self, thread_id: str, files: Dict[str, str]) -> None:
+        """Seed the agent's working files for a thread, as if a run had happened.
+        
+        Args:
+            thread_id: Unique identifier for the session/thread
+            files: Mapping of file path to text content
+        """
+        self._agent_files[thread_id] = dict(files)
+    
     def clear(self) -> None:
         """Clear all stored threads (useful for test cleanup)."""
         self._storage.clear()
+        self._agent_files.clear()
 
 
 class MockFileStore:

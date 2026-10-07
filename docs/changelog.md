@@ -46,10 +46,20 @@ After the initial agent (2026-08-28 → 2026-10-05).
   `reconcile-files` command that normalises store keys to the agent's slash form.
   (2026-09-16, `0ed358f`)
 - **Docs** — PR conventions and a three-paragraph PR template (`CONTRIBUTING.md`,
-  2026-09-08); `AGENTS.md` as the orientation and trap reference for agents
+  2026-10-08); `AGENTS.md` as the orientation and trap reference for agents
   (2026-10-03); a reorganised `docs/` with one job per document, a routing table
   from change type to document, and a troubleshooting section seeded from real
   incidents (2026-10-05).
+- **Agent filesystem panel** — the sidebar lists everything the agent can read,
+  grouped by directory, instead of only uploaded findings and finished reports.
+  The context library the agent is told to read is now visible, and display paths
+  carry the `/context/` root that the store strips before writing, so the panel
+  matches the paths the agent itself says out loud. (#40)
+- **Scratchpad panel** — the sidebar shows the agent's working files for the
+  current session, which are the drafts it writes while working. These are read
+  from the agent's own checkpoint namespace, because the in-memory backend that
+  holds them is not reachable through the store; the read is strictly read-only.
+  (#41)
 
 ### Security
 
@@ -76,6 +86,11 @@ After the initial agent (2026-08-28 → 2026-10-05).
 
 ### Fixed
 
+- **Listing findings or reports rewrote matching text anywhere in a filename.**
+  The prefix was removed with `str.replace`, so
+  `findings/findings_summary.txt` displayed as `summary.txt` — and any later write
+  using that displayed name targeted a different key. Only a leading prefix is
+  stripped now. (#40)
 - **Stopping a Streamlit run did not cancel the in-flight agent stream.** The
   handle from `schedule()` was discarded and the consumer blocked on
   `events.get()` with no cleanup, so pressing Stop — which closes the generator —

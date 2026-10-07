@@ -66,6 +66,22 @@ from streamlit_ui.services.run_registry import REGISTRY, RunBusyError
 _RUN_POLL_INTERVAL = 0.02
 
 
+def _strip_prefix(paths: List[str], prefix: str) -> List[str]:
+    """Drop a leading path prefix from each entry - and only a leading one.
+
+    These two methods used ``str.replace``, which also rewrote the same text
+    anywhere else in the name: ``findings/findings_summary.txt`` displayed as
+    ``summary.txt``, and a later write using that displayed name targeted a
+    different key. Leading slashes are dropped too, because store keys are
+    slash-prefixed while the caller passes a bare prefix.
+    """
+    stripped = []
+    for path in paths:
+        bare = path.lstrip("/")
+        stripped.append(bare[len(prefix):] if bare.startswith(prefix) else bare)
+    return stripped
+
+
 class PenTestAgentService:
     """Service layer connecting Streamlit UI to agent system.
     
@@ -149,9 +165,48 @@ class PenTestAgentService:
         Data Flow:
             UI sidebar → list_findings() → file_store.list_files() → UI display
         """
-        files = self._file_store.list_files(prefix="findings/")
-        # Strip prefix for cleaner display
-        return [f.replace("findings/", "") for f in files]
+        return _strip_prefix(
+            self._file_store.list_files(prefix="findings/"), "findings/"
+        )
+    
+    def list_filesystem(self) -> List[str]:
+        """List every file the agent can read, grouped-ready display paths.
+        
+        This is the whole of the virtual filesystem, not just findings and
+        reports: the context library the agent is told to read lives under
+        the same prefix as everything else. The store keys arrive without the
+        ``/context/`` root that the routing layer strips before storing, so it
+        is put back here - the agent says ``/context/findings/nmap.txt`` when it
+        lists that directory, and the sidebar should not disagree with it.
+        
+        Does NOT include ``/scratchpad/``. That half is held by an in-memory
+        backend in the agent's checkpoint namespace and is unreachable from a
+        store listing; see list_scratchpad().
+        
+        Returns:
+            Sorted display paths, e.g. ``/context/findings/nmap.txt``
+        """
+        paths = self._file_store.list_files()
+        return sorted(f"/context/{p.lstrip('/')}" for p in paths)
+    
+    def list_scratchpad(self) -> Dict[str, str]:
+        """List the current session's agent working files.
+        
+        The agent's filesystem is a composite: ``/context/`` is persisted in the
+        store, and everything else - the scratchpad it drafts into - lives in an
+        in-memory backend under a state channel in the agent's own checkpoint
+        namespace. A store listing returns none of it at any prefix, so this
+        reads that channel instead.
+        
+        Files persist across turns of a session rather than clearing per run,
+        so this is the whole session's scratchpad unless it is filtered.
+        
+        Returns:
+            Mapping of path to text content; empty before the first agent run
+        """
+        return self._checkpointer.list_agent_files(
+            self._thread_id, prefix="scratchpad/"
+        )
     
     def start_turn(self, message: str) -> Dict[str, Any]:
         """Begin a turn and return immediately. Never blocks on the agent.
@@ -279,8 +334,7 @@ class PenTestAgentService:
             UI download dropdown → list_reports() → file_store.list_files() → UI options
         """
         files = self._file_store.list_files(prefix="reports/")
-        # Strip prefix for cleaner display
-        return [f.replace("reports/", "") for f in files]
+        return _strip_prefix(files, "reports/")
     
     def get_chat_history(self) -> List[Dict[str, Any]]:
         """Retrieve conversation history for current thread.

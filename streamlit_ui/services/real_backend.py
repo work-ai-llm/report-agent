@@ -265,6 +265,64 @@ class RealCheckpointerAdapter:
             }
         }
 
+    @staticmethod
+    def _file_text(file_data: Any) -> str:
+        """Pull display text out of one entry in the ``files`` channel.
+
+        The in-memory backend stores a file-descriptor dict, not a bare string:
+        ``{"content": str, "encoding": "utf-8"}``, with an optional
+        ``created_at``. An older format stored content as a list of lines, so
+        both shapes are accepted here.
+        """
+        if isinstance(file_data, str):
+            return file_data
+        if isinstance(file_data, list):
+            return "\n".join(str(line) for line in file_data)
+        if isinstance(file_data, dict):
+            content = file_data.get("content", "")
+            if isinstance(content, list):
+                return "\n".join(str(line) for line in content)
+            return str(content)
+        return str(file_data)
+
+    def list_agent_files(self, thread_id: str, prefix: str = "") -> Dict[str, str]:
+        """Read the agent's ``files`` state channel for a thread.
+
+        Read-only, and deliberately crosses into the agent's own checkpoint
+        namespace (``""``) rather than this adapter's UI namespace - the
+        in-memory backend keeps its files there, so the UI namespace has no
+        equivalent data to read. Nothing is ever written back: the agent owns
+        that namespace and writing into it would clobber its state.
+
+        A thread that has not run yet, or a checkpoint written before the
+        ``files`` channel existed, simply yields an empty mapping. A failure
+        here degrades the sidebar panel rather than taking the app down.
+        """
+        wanted = prefix.strip("/")
+
+        async def _read() -> Dict[str, str]:
+            config = {
+                "configurable": {"thread_id": thread_id, "checkpoint_ns": ""}
+            }
+            tup = await self._saver.aget_tuple(config)
+            if tup is None or tup.checkpoint is None:
+                return {}
+            files = (tup.checkpoint.get("channel_values") or {}).get("files") or {}
+            if not isinstance(files, dict):
+                return {}
+            return {
+                path: self._file_text(data)
+                for path, data in files.items()
+                if isinstance(path, str)
+                and (not wanted or path.strip("/").startswith(wanted))
+            }
+
+        try:
+            return self._runner.run(_read())
+        except Exception as exc:  # noqa: BLE001 - a sidebar panel must not kill the app
+            _print(f"scratchpad read failed: {exc}")
+            return {}
+
     def get(self, thread_id: str) -> Optional[Dict[str, Any]]:
         async def _get() -> Optional[Dict[str, Any]]:
             tup = await self._saver.aget_tuple(self._config(thread_id))

@@ -110,6 +110,13 @@ Break one of these and you lose data silently, not loudly.
   `("filesystem",)` with keys like `/findings/nmap.txt` and values shaped
   `{"content": str, "encoding": "utf-8"}`. The UI and the agent must agree exactly
   or uploads become invisible to the agent.
+- **The agent's filesystem is two backends, not one.** The filesystem is a
+  composite: `/context/` is routed to the store, and every other path — the
+  `/scratchpad/` the agent drafts into — goes to an in-memory backend that keeps
+  its files in a `files` state channel in the agent's checkpoint namespace `""`.
+  A store listing returns the first half only, at every prefix; the second half is
+  read via `CheckpointerProtocol.list_agent_files`, which crosses namespaces and
+  is **read-only**. The UI must never write into `""`.
 - **Sync UI, async agent.** Streamlit runs synchronous scripts; LangGraph is async.
   Every async call crosses the process-wide `EventLoopThread`. Never call an
   awaitable directly from UI code.

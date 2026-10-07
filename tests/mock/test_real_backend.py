@@ -89,6 +89,118 @@ class TestRealCheckpointerAdapter:
         assert cp.get("t") == {"messages": [{"role": "user", "content": "v2"}]}
 
 
+class TestListAgentFiles:
+    """Read the agent's in-memory working files out of a real checkpoint.
+
+    The mocks in mock_objects_streamlit.py are permissive dictionaries and
+    cannot prove the ``files`` channel's shape. These seed an actual
+    checkpoint row instead, which is the only thing that validates the read.
+    """
+
+    @staticmethod
+    def _seed_agent_files(runner, runtime, thread_id, files):
+        config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+
+        async def _put():
+            await runtime.checkpointer.aput(
+                config,
+                {
+                    "v": 1,
+                    "ts": "2026-01-01T00:00:00",
+                    "id": "agent-1",
+                    "channel_values": {"files": files},
+                    "channel_versions": {"files": 1},
+                    "versions_seen": {},
+                    "pending_sends": [],
+                },
+                {"source": "agent"},
+                new_versions={"files": 1},
+            )
+
+        runner.run(_put())
+
+    @staticmethod
+    def _ui_adapter(runner, runtime):
+        # Constructed with the UI namespace on purpose: the read must still
+        # cross into the agent's own namespace, where the files channel lives.
+        return rb.RealCheckpointerAdapter(
+            runner, runtime.checkpointer, checkpoint_ns=rb._UI_CHECKPOINT_NS
+        )
+
+    def test_reads_files_channel_from_the_agent_namespace(self, backend):
+        runner, runtime = backend
+        self._seed_agent_files(
+            runner,
+            runtime,
+            "t1",
+            {
+                "/scratchpad/notes.md": {"content": "# notes", "encoding": "utf-8"},
+                "/scratchpad/outline.md": {"content": "## s", "encoding": "utf-8"},
+            },
+        )
+
+        found = self._ui_adapter(runner, runtime).list_agent_files("t1")
+
+        assert found == {
+            "/scratchpad/notes.md": "# notes",
+            "/scratchpad/outline.md": "## s",
+        }
+
+    def test_prefix_filter_excludes_other_agent_files(self, backend):
+        runner, runtime = backend
+        self._seed_agent_files(
+            runner,
+            runtime,
+            "t1",
+            {
+                "/scratchpad/keep.md": {"content": "keep", "encoding": "utf-8"},
+                "/elsewhere/drop.md": {"content": "drop", "encoding": "utf-8"},
+            },
+        )
+
+        cp = self._ui_adapter(runner, runtime)
+
+        assert list(cp.list_agent_files("t1", prefix="scratchpad/")) == [
+            "/scratchpad/keep.md"
+        ]
+        assert len(cp.list_agent_files("t1")) == 2
+
+    def test_legacy_list_content_is_joined(self, backend):
+        runner, runtime = backend
+        self._seed_agent_files(
+            runner, runtime, "t1", {"/scratchpad/old.md": ["line one", "line two"]}
+        )
+
+        assert self._ui_adapter(runner, runtime).list_agent_files("t1") == {
+            "/scratchpad/old.md": "line one\nline two"
+        }
+
+    def test_unknown_thread_yields_empty(self, backend):
+        runner, runtime = backend
+
+        assert self._ui_adapter(runner, runtime).list_agent_files("missing") == {}
+
+    def test_ui_history_does_not_leak_into_agent_files(self, backend):
+        """The UI namespace holds the transcript, never the files channel."""
+        runner, runtime = backend
+        ui_cp = self._ui_adapter(runner, runtime)
+        ui_cp.put("t1", {"messages": [{"role": "user", "content": "hi"}]})
+
+        assert ui_cp.list_agent_files("t1") == {}
+
+    def test_ui_read_is_not_destroyed_by_an_agent_files_read(self, backend):
+        runner, runtime = backend
+        self._seed_agent_files(
+            runner, runtime, "t1", {"/scratchpad/n.md": {"content": "n"}}
+        )
+        cp = self._ui_adapter(runner, runtime)
+        cp.put("t1", {"messages": [{"role": "user", "content": "hi"}]})
+
+        cp.list_agent_files("t1")
+
+        assert cp.get("t1") == {"messages": [{"role": "user", "content": "hi"}]}
+
+
 class TestRealFileStoreAdapter:
     def test_write_read_roundtrip(self, backend):
         runner, runtime = backend

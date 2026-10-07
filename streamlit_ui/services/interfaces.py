@@ -73,6 +73,30 @@ class CheckpointerProtocol(Protocol):
             True if the thread existed and was deleted, False otherwise
         """
         ...
+    
+    def list_agent_files(self, thread_id: str, prefix: str = "") -> Dict[str, str]:
+        """Read the agent's in-memory working files for a thread.
+        
+        The agent's filesystem is split across two backends. Files under
+        ``/context/`` are persisted in the store and reached through
+        ``FileStoreProtocol``. Everything else - notably ``/scratchpad/`` - is
+        held by an in-memory backend in the agent's own checkpoint namespace,
+        under a ``files`` state channel, and is invisible to a store listing at
+        any prefix.
+        
+        This method is the only way to see that second half. It is strictly
+        read-only: the UI must not write into the agent's namespace.
+        
+        Args:
+            thread_id: Unique identifier for the session/thread
+            prefix: Optional path prefix filter, slash-insensitive
+                (e.g. "/scratchpad/")
+                
+        Returns:
+            Mapping of file path to text content. Empty if the thread has no
+            agent state yet.
+        """
+        ...
 
 
 class FileStoreProtocol(Protocol):
