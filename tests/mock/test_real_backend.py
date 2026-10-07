@@ -261,6 +261,63 @@ class TestRealAgentRunnerAdapter:
         assert [e["type"] for e in events] == ["message"]
         assert events[0]["data"] == "Recon complete."
 
+    def test_assistant_text_before_a_tool_call_is_not_deferred(self, backend, monkeypatch):
+        """A preamble before a tool call is emitted when the tool call happens,
+        not merged into one trailing block at the end of the turn.
+
+        This is the shape of a real turn: the model says what it is about to do,
+        calls a tool, says something else, calls another tool, then answers. The
+        pre-fix runner accumulated all three prose segments and emitted a single
+        "message" event after the stream ended, so the chat read as silent until
+        the last second.
+        """
+        from langchain_core.messages import AIMessageChunk, ToolMessage
+
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            {"agent": {"messages": [AIMessageChunk(
+                content="The file appears to be cut off. Let me read the rest.",
+                tool_calls=[{"name": "read_file",
+                             "args": {"file_path": "/context/findings/nmap_scans.txt",
+                                      "offset": 15},
+                             "id": "c2", "type": "tool_call"}])]}},
+            {"agent": {"messages": [ToolMessage(
+                content="Error: Line offset 15 exceeds file length (15 lines)",
+                tool_call_id="c2", name="read_file")]}},
+            {"agent": {"messages": [AIMessageChunk(content="Here's the full contents.")]}},
+        ])
+        events = self._events(backend, agent, "and what is in nmap file?", "th1")
+
+        assert [e["type"] for e in events] == [
+            "assistant_text", "tool_call", "tool_result", "message",
+        ]
+        # The preamble precedes its own tool call in the rendered order, and the
+        # answer is only the trailing segment.
+        assert events[0]["data"] == "The file appears to be cut off. Let me read the rest."
+        assert events[-1]["data"] == "Here's the full contents."
+        # Nothing was concatenated across the tool boundary.
+        assert events[-1]["data"] != "The file appears to be cut off. Let me read the rest.Here's the full contents."
+
+    def test_text_on_a_tool_calling_message_emits_before_its_own_tool_call(self, backend, monkeypatch):
+        """Text and tool calls on the same message must reach the UI in the order
+        the model produced them: prose first, then the call it announced."""
+        from langchain_core.messages import AIMessageChunk
+
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            {"messages": [AIMessageChunk(
+                content="Scanning now.",
+                tool_calls=[{"name": "nmap_scan", "args": {"target": "10.0.0.1"},
+                             "id": "c1", "type": "tool_call"}])]},
+            {"messages": [AIMessageChunk(content="All clear.")]},
+        ])
+        events = self._events(backend, agent)
+        assert [e["type"] for e in events] == [
+            "assistant_text", "tool_call", "message",
+        ]
+        assert events[0]["data"] == "Scanning now."
+        assert events[-1]["data"] == "All clear."
+
     def test_stream_error_surfaces_error_event(self, backend, monkeypatch):
         monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
         agent = self._FakeAsyncAgent([], exc=ValueError("llm exploded"))

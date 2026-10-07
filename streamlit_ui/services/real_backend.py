@@ -3,9 +3,9 @@
 This module contains the "real" implementations of the UI's three protocols,
 built on ``agent.report_agent.AgentRuntime``:
 
-- ``RealCheckpointerAdapter`` → LangGraph async checkpointer (SQLite/Postgres)
-- ``RealFileStoreAdapter``    → LangGraph async store (the virtual filesystem)
-- ``RealAgentRunnerAdapter``  → the real LangGraph agent, streaming events
+- ``RealCheckpointerAdapter`` â†’ LangGraph async checkpointer (SQLite/Postgres)
+- ``RealFileStoreAdapter``    â†’ LangGraph async store (the virtual filesystem)
+- ``RealAgentRunnerAdapter``  â†’ the real LangGraph agent, streaming events
 
 ## Modes
 
@@ -587,7 +587,13 @@ class RealAgentRunnerAdapter:
 
         emit_print = is_agent_output_print_enabled()
         trace_path = os.environ.get("STREAMLIT_AGENT_LOG")
-        final_parts: List[str] = []
+# Whether any assistant prose arrived on the stream at all. Distinguishes
+        # "the agent said nothing" (fall back to the checkpointer) from "the agent
+        # said something, possibly already flushed as assistant_text".
+        saw_text = False
+        # Assistant prose seen since the last tool call or tool result. Held back
+        # only until we know whether more work follows it, then flushed in order.
+        pending_parts: List[str] = []
         # Set when the consumer abandons this run, so the finally block can tell
         # "stopped by the user" apart from "finished".
         cancelled = False
@@ -637,11 +643,42 @@ class RealAgentRunnerAdapter:
                     break
             return []
 
+        def _queue_text(text: str) -> None:
+            """Buffer one assistant segment until we know it is not the last."""
+            nonlocal saw_text
+            if text.strip():
+                saw_text = True
+                pending_parts.append(text)
+                _print(f"[CNK]: {text}")
+
+        def _flush_text(*, final: bool) -> None:
+            """Publish the buffered segment(s) as a row the renderer can draw.
+
+            ``state.messages`` is what the live renderer reads, so a segment only
+            counts as shown once it is appended there in order. The agent
+            interleaves prose with tool calls ("I'll read the rest" -> read_file
+            -> the answer), so each segment is flushed as soon as the next tool
+            call or tool result proves something else follows it. Whatever is
+            still buffered when the stream ends is the answer.
+            """
+            nonlocal pending_parts
+            if not pending_parts:
+                return
+            text = "".join(pending_parts)
+            pending_parts = []
+            row = {"type": "assistant", "content": text}
+            if final:
+                _emit({"type": "message", "data": text}, [row])
+                _print(f"[AGENT RESPONSE]: {text}")
+            else:
+                _emit({"type": "assistant_text", "data": text}, [row])
+
         def _handle_chunk(chunk: Any) -> None:
             if isinstance(chunk, dict):
                 _handle_dict_chunk(chunk)
                 return
             if isinstance(chunk, ToolMessage):
+                _flush_text(final=False)
                 name = getattr(chunk, "name", "") or ""
                 output = getattr(chunk, "content", "")
                 _emit(
@@ -653,7 +690,16 @@ class RealAgentRunnerAdapter:
                 return
 
             if isinstance(chunk, (AIMessage, AIMessageChunk)):
+                # Text first, then the tool calls it announced. The model emits
+                # them in that order in one message and the UI must not reorder
+                # them, so queue the prose before the loop that flushes it.
+                content = getattr(chunk, "content", "")
+                if content:
+                    text = content if isinstance(content, str) else str(content)
+                    _queue_text(text)
+
                 for tc in getattr(chunk, "tool_calls", []) or []:
+                    _flush_text(final=False)
                     data = {"name": tc.get("name"), "args": tc.get("args", {})}
                     _emit(
                         {"type": "tool_call", "data": data},
@@ -661,17 +707,11 @@ class RealAgentRunnerAdapter:
                     )
                     _print(f"[TOOL CALL]: {data['name']} args={data['args']}")
 
-                content = getattr(chunk, "content", "")
-                if content:
-                    text = content if isinstance(content, str) else str(content)
-                    if text.strip():
-                        final_parts.append(text)
-                        _print(f"[CNK]: {text}")
-
         def _handle_dict_chunk(chunk: Dict[str, Any]) -> None:
             # Serialized message form (some graph updates yield dicts).
             if chunk.get("tool_calls"):
                 for tc in chunk["tool_calls"]:
+                    _flush_text(final=False)
                     data = {"name": tc.get("name") or tc.get("function", {}).get("name"),
                             "args": tc.get("args") or tc.get("function", {}).get("arguments", {})}
                     _emit(
@@ -680,6 +720,7 @@ class RealAgentRunnerAdapter:
                     )
                     _print(f"[TOOL CALL]: {data['name']} args={data['args']}")
             if chunk.get("role") == "tool":
+                _flush_text(final=False)
                 name = chunk.get("name") or ""
                 output = chunk.get("content", "")
                 _emit(
@@ -691,9 +732,7 @@ class RealAgentRunnerAdapter:
             content = chunk.get("content") or ""
             if chunk.get("role") not in ("tool",) and not chunk.get("tool_calls") and content:
                 text = content if isinstance(content, str) else str(content)
-                if text.strip():
-                    final_parts.append(text)
-                    _print(f"[CNK]: {text}")
+                _queue_text(text)
 
         def _iter_messages(update: Any) -> Iterator[Any]:
             """Extract message-like items from a langchain Agent astream update.
@@ -800,10 +839,9 @@ class RealAgentRunnerAdapter:
                     # cancellation, `stopped_by_user` is the cooperative break out
                     # of the astream loop after cancel() was called.
                     _print("[AGENT STREAM]: skipping final message for a stopped run")
-                elif final_parts:
-                    text = "".join(final_parts)
-                    _emit({"type": "message", "data": text}, [{"type": "assistant", "content": text}])
-                    _print(f"[AGENT RESPONSE]: {text}")
+                elif saw_text:
+                    # Whatever is still buffered is the turn's answer.
+                    _flush_text(final=True)
                 else:
                     # Safety net: if the stream produced no structured dict
                     # updates (e.g. a middleware that only emits raw strings on
