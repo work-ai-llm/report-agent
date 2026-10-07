@@ -15,20 +15,45 @@ three ways: a Streamlit chat UI, an A2A server, and a set of dev CLIs. Python
 
 ## Where things are documented
 
-Read the right one; several of these are history, not truth.
+Read the right one. Each has exactly one job; `docs/history/` is explicitly not
+current truth.
 
 | File | Answers |
 |---|---|
+| **`.env.example`** | Every env var and its default. **Single source of truth** — nothing else restates the table |
 | `AGENTS.md` (this) | How to run it, what breaks, what not to touch |
-| `.env.example` | Every env var name and its default. **Single source of truth** |
+| `docs/overview.md` | What the project is, what it does not do, how to run it |
+| `docs/architecture.md` | How it is built: the core, the two consumers, invariants, traps |
+| `docs/dependencies.md` | What each dependency is for, and the known packaging problems |
+| `docs/troubleshooting.md` | Symptom → cause, seeded from real incidents |
+| `docs/changelog.md` | What changed when, and what is still known-broken |
+| `tests/tests.md` | Why the suite is split |
 | `CONTRIBUTING.md` | Branch naming, PR shape, prose rules |
-| `docs/overview.md` | Feature tour and limitations (still Mistral-centric) |
-| `docs/architecture.md` | Component sketch (stale — predates the UI and multi-backend) |
-| `tests/tests.md` | Why the suite is split in two |
-| `docs/PR-a2a-client.md`, `docs/PR-a2a-acceptance.md` | **History.** Parked-work notes, not current design |
+| `docs/history/` | Parked PR journals. Provenance, not truth |
 
-Do not restate the env-var table anywhere. Link to `.env.example` instead, so
-there is exactly one place to update.
+### Which doc does my change touch?
+
+Every doc ends with an "Update this when" list. This is the routing table —
+find your change, edit the doc it maps to, and nothing else:
+
+| Change | Doc |
+|---|---|
+| New/removed env var, or a changed default | `.env.example` only |
+| New dependency, or one whose role changed | `docs/dependencies.md` |
+| New failure mode diagnosed | `docs/troubleshooting.md` |
+| A surface, entry point, or subprocess | `docs/overview.md` + `docs/architecture.md` |
+| Model factory, middleware, storage layout, bind model, streaming approach | `docs/architecture.md` |
+| A "what it does not do" limitation is fixed | `docs/overview.md` + `docs/troubleshooting.md` |
+| New invariant, or a new trap discovered | `AGENTS.md` |
+| Anything user-visible or behavioural | `docs/changelog.md` |
+
+The point of the table is that a change usually touches **one** doc. If a change
+seems to require rewriting everything, that is usually a sign the change is
+broader than it looks.
+
+Cite **symbols, not line numbers**, in prose. Line numbers rot on every edit
+above them and were the single largest source of stale documentation in this
+repo.
 
 ## Commands
 
@@ -39,6 +64,7 @@ python -m streamlit_ui                                  # UI: real agent, Postgr
 python -m streamlit_ui --backend sqlite                 # UI: real agent, local SQLite
 python -m streamlit_ui --agent mock --backend sqlite    # real persistence, mock agent
 python -m streamlit_ui --agent mocks                    # full in-memory sandbox
+python -m streamlit_ui --llm-backend openrouter         # pick the chat backend
 python -m streamlit_ui --debug                          # print connectivity report first
 
 python agent/a2a_connector.py                           # A2A server, loopback only
@@ -103,8 +129,11 @@ Each of these cost real debugging time. They are not obvious from the code.
   `alist(None)` on Postgres de-blobs every checkpoint in every namespace and
   exceeded the 60s bridge timeout, crashing the app at boot.
 - The SQLite backend opens **two** aiosqlite connections to one file with WAL and
-  `busy_timeout=30000`, and those values must stay in sync with
-  `dev_tools/store_cli.py`. Diverge and the sync CLI hits "database is locked".
+  `busy_timeout=30000`. The synchronisation traps are set once, in
+  `AgentRuntime._init_pool`, and `dev_tools/store_cli.py` calls that same method
+  rather than opening its own connections — so the two cannot drift, and there is
+  nothing to keep in sync. If you ever add a SQLite access path that bypasses
+  `_init_pool`, it must set the same PRAGMAs or it will hit "database is locked".
 - To force local SQLite use `REPORT_AGENT_FORCE_SQLITE=1`. Unsetting
   `POSTGRES_URI` in the shell does not work — `load_dotenv` puts it right back.
 - Postgres connect timeouts are deliberately tiny (`connect_timeout=3`, and the pool
@@ -116,9 +145,12 @@ Each of these cost real debugging time. They are not obvious from the code.
   middleware stack: the messages channel yields only `(chunk, metadata)` tuples, so
   structured `tool_call` / `tool_result` events never arrive. The UI depends on plain
   node-diff streaming. Tracked in #17 and #19 — do not retry it blind.
-- Langfuse groups a turn into one trace only when `session_id` is present in
-  `config["configurable"]`. Without it every model call becomes its own root trace.
-  Tracked in #22; the A2A server already solved this by threading context id through.
+- Langfuse groups a turn into one trace only when
+  `metadata["langfuse_session_id"]` is present in the run config — **not** in
+  `config["configurable"]`, and the key is not `session.id`. The handler reads
+  `metadata` at the chain root and propagates it; `configurable.session_id` is
+  ignored entirely, and `"session.id"` looks plausible and does nothing, which is
+  what made this look broken for so long. Both surfaces pass it.
 - `STREAMLIT_STREAM` / `--no-streaming` is plumbed but **inert** — live token
   streaming is not implemented. Tool calls appear live; the answer arrives whole.
 
@@ -161,8 +193,8 @@ Two things that will waste your time otherwise:
   `CONTRIBUTING.md` for the prose rules and the pre-review checklist.
 - Never commit `.env` or any key. `.env.example` carries placeholders only.
 - Keep this file to orientation and traps. Feature descriptions belong in `docs/`,
-  and the docs that freeze current truth (README, architecture) are written **after**
-  the program settles — tracked in #26 and #27.
+  and the docs that freeze current truth (README) are written **after** the
+  program settles — tracked in #26.
 
 ## When to update this file
 
