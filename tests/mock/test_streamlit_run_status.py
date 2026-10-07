@@ -28,7 +28,7 @@ import pytest
 import streamlit as st
 from streamlit.testing.v1 import AppTest
 
-from tests.mock.mock_objects_streamlit import MockCheckpointer
+from tests.mock.mock_objects_streamlit import MockAgentRunner, MockCheckpointer
 
 os.environ["STREAMLIT_USE_MOCKS"] = "1"
 
@@ -259,6 +259,130 @@ class TestSecondMessageIsRefusedWhileRunning:
         users = [m.get("content") for m in at.session_state["chat_messages"]
                  if m.get("type") == "user"]
         assert "accepted" in users
+
+
+class _ReportWritingRunner(MockAgentRunner):
+    """A mock runner whose turn writes a report into the file store.
+
+    The shared app runner has no ``write_file`` call, so a plain turn changes
+    nothing in the store and the #30 rerun is (correctly) not triggered. This
+    exists to exercise the branch where a turn *does* produce a report.
+    """
+
+    def _produce(self, message, thread_id):
+        self._store.write_file("reports/turn_report.md", b"# generated during the turn")
+        yield from super()._produce(message, thread_id)
+
+
+def _reports_harness() -> None:
+    """Script that calls render_main_chat once; counts its executions."""
+    import streamlit as st
+    from tests.mock.mock_objects_streamlit import HARNESS
+
+    HARNESS["executions"] = HARNESS.get("executions", 0) + 1
+    st.session_state.current_thread_id = "th-reports"
+    st.session_state.chat_messages = []
+    import streamlit_ui.app as app_module
+
+    app_module.render_main_chat(HARNESS["service"])
+    # Rendered after the turn, so the last value the AppTest sees is the one a
+    # rerun produced.
+    st.text(f"reports={HARNESS['service'].list_reports()}")
+
+
+class TestReportsSelectorRefreshesAfterATurn:
+    """#30: the Reports selector must not be stale once a turn has finished.
+
+    The sidebar renders before the chat input is handled, so it reads the reports
+    list from before the turn ran. A report the agent writes during the turn
+    therefore cannot appear in the selector unless the script runs again - which
+    previously happened only for a brand-new session. The effect was the agent
+    narrating "report saved" while the UI still read "No reports available yet",
+    with Download disabled at exactly the moment the report existed.
+    """
+
+    @staticmethod
+    def _build_service():
+        from streamlit_ui.services.agent_service import PenTestAgentService
+        from tests.mock.mock_objects_streamlit import MockCheckpointer, MockFileStore
+
+        store = MockFileStore()
+        store.write_file("reports/pre_existing.md", b"# before")
+        cp = MockCheckpointer()
+        runner = _ReportWritingRunner(delay_seconds=0.0, checkpointer=cp)
+        runner._store = store
+        runner.set_final_message("Report saved to /reports/turn_report.md")
+        return PenTestAgentService(
+            thread_id="th-reports",
+            checkpointer=cp,
+            file_store=store,
+            agent_runner=runner,
+        )
+
+    @pytest.fixture(autouse=True)
+    def _no_status_fragment(self, monkeypatch):
+        """Silence the running-status fragment while counting executions.
+
+        ``render_run_status`` is a ``st.fragment(run_every=1.0)``, so it schedules
+        its own script runs and would make an execution count meaningless. The
+        fragment's behaviour is covered by TestRunStatusStrip; this class is only
+        about the end-of-turn rerun.
+        """
+        import streamlit_ui.app as app_module
+
+        monkeypatch.setattr(app_module, "render_run_status", lambda service: None)
+
+    def test_a_turn_that_writes_a_report_triggers_a_rerun(self):
+        from tests.mock.mock_objects_streamlit import HARNESS
+
+        HARNESS.clear()
+        service = self._build_service()
+        HARNESS["service"] = service
+
+        at = AppTest.from_function(_reports_harness).run()
+        assert HARNESS["executions"] == 1, "harness did not boot"
+
+        at.chat_input[0].set_value("write the report").run()
+
+        # boot + turn + one rerun. The rerun is what re-reads the store, so the
+        # Reports selector stops being stale (#30).
+        assert HARNESS["executions"] == 3, (
+            f"expected exactly one rerun after the turn, got "
+            f"{HARNESS['executions'] - 2} rerun(s)"
+        )
+        reports = service.list_reports()
+        assert "turn_report.md" in reports, f"the turn wrote no report: {reports}"
+        # And the rerun re-read the store, which is the actual #30 symptom.
+        assert any("turn_report.md" in t.value for t in at.text)
+
+    def test_a_turn_that_writes_no_report_does_not_rerun(self):
+        """The rerun costs a full script pass (incl. list_threads), so it is gated."""
+        from tests.mock.mock_objects_streamlit import HARNESS
+        from streamlit_ui.services.agent_service import PenTestAgentService
+        from tests.mock.mock_objects_streamlit import MockCheckpointer, MockFileStore
+
+        HARNESS.clear()
+        store = MockFileStore()
+        store.write_file("reports/pre_existing.md", b"# before")
+        cp = MockCheckpointer()
+        service = PenTestAgentService(
+            thread_id="th-reports",
+            checkpointer=cp,
+            file_store=store,
+            agent_runner=MockAgentRunner(delay_seconds=0.0, checkpointer=cp),
+        )
+        HARNESS["service"] = service
+
+        at = AppTest.from_function(_reports_harness).run()
+        at.chat_input[0].set_value("just answer, write nothing").run()
+
+        # boot + turn, and no third execution: the rerun costs a full script pass
+        # (including list_threads, ~0.5s on Postgres) so it is gated on the reports
+        # list actually changing.
+        assert HARNESS["executions"] == 2, (
+            f"reran for a turn that changed nothing in the store "
+            f"({HARNESS['executions'] - 1} rerun(s))"
+        )
 
 
 class TestReconcileHelper:

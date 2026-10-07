@@ -555,6 +555,14 @@ def render_main_chat(service: PenTestAgentService) -> None:
     if prompt := st.chat_input("Ask the agent to analyze findings..."):
         # Create session on first message (not on page load)
         created_session = False
+        # Snapshot the reports list *before* the turn. The sidebar was rendered
+        # above, from a store scan taken before this turn ran, so a report the
+        # agent writes during the turn cannot appear in its selector until the
+        # script runs again (#30). Comparing before/after lets us rerun only when
+        # the turn actually changed something, instead of unconditionally - an
+        # unconditional rerun costs a list_threads scan per turn, which is
+        # ~0.5s on Postgres.
+        reports_before = service.list_reports() if service is not None else []
         if st.session_state.current_thread_id is None:
             import uuid
             st.session_state.current_thread_id = f"session_{uuid.uuid4().hex[:8]}"
@@ -683,10 +691,20 @@ def render_main_chat(service: PenTestAgentService) -> None:
             finally:
                 _save_chat()
 
-        # If this was the first message of a brand-new session, rerun once so the
-        # sidebar (which renders before the chat input handler runs) picks up the
-        # newly created session immediately, without requiring a browser reload.
-        if created_session:
+        # Rerun once at the end of a turn so the sidebar - which rendered before this
+        # turn ran - reflects it. Two reasons, both requiring the rerun:
+        #
+        # - a brand-new session must show up in the selector immediately, and
+        # - a report the agent wrote during the turn must appear in the Reports
+        #   selector (#30). Without this the agent narrates "report saved" while the
+        #   UI still reads "No reports available yet", and Download stays disabled
+        #   at exactly the moment the report exists.
+        #
+        # Gated on the reports list actually changing, because the rerun re-runs
+        # the whole script including list_threads (~0.5s on Postgres) and most
+        # turns write no report.
+        reports_after = service.list_reports() if service is not None else []
+        if created_session or reports_after != reports_before:
             st.rerun()
 
 
