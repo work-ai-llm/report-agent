@@ -57,6 +57,29 @@ DONE = "done"
 ERROR = "error"
 
 
+class RunBusyError(RuntimeError):
+    """A turn for this thread is already in flight.
+
+    Raised by :meth:`RunRegistry.start`. Two concurrent turns on one thread are
+    not merely confusing, they corrupt state:
+
+    - The registry holds one entry per thread, so a second ``start`` would evict
+      the first run's :class:`RunState` while it is still streaming. The UI would
+      then track the newer run and lose sight of the older one.
+    - Both runs persist to the SAME UI-namespace checkpoint row (a fixed
+      checkpoint id, upserted in place). Their writes interleave, so the stored
+      transcript ends up with duplicated or missing tool calls and whichever reply
+      happened to write last.
+    - Both call ``agent.astream`` on the same LangGraph thread with no
+      ``checkpoint_id``, so the graph interleaves two turns' worth of messages.
+
+    All three were observed in the wild: two overlapping Langfuse traces on one
+    session, seven seconds apart, with tool calls from each landing between the
+    other's. Refusing the second turn is the only safe answer - queueing it is a
+    separate feature (see the opencode-style session UX issue).
+    """
+
+
 class RunState:
     """One agent turn: its events and the UI message list built from them.
 
@@ -169,11 +192,26 @@ class RunRegistry:
         message: str,
         messages: Optional[List[Dict[str, Any]]] = None,
     ) -> RunState:
-        """Register a new run for ``thread_id``, replacing any previous one."""
+        """Register a new run for ``thread_id``, replacing any previous one.
+
+        Raises:
+            RunBusyError: if the thread already has a turn in flight. See that
+                exception for why two concurrent turns on one thread corrupt the
+                transcript rather than merely confusing the UI.
+        """
         state = RunState(thread_id, message, messages)
         with self._lock:
+            current = self._runs.get(thread_id)
+            if current is not None and current.is_running:
+                raise RunBusyError(
+                    f"a turn for thread {thread_id!r} is already running"
+                )
             self._runs[thread_id] = state
         return state
+
+    def is_busy(self, thread_id: str) -> bool:
+        """True when a turn for ``thread_id`` is in flight."""
+        return self.is_running(thread_id)
 
     def get(self, thread_id: str) -> Optional[RunState]:
         with self._lock:

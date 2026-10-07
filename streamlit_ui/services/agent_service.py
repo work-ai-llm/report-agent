@@ -59,6 +59,7 @@ from streamlit_ui.services.interfaces import (
     FileStoreProtocol,
     AgentRunnerProtocol,
 )
+from streamlit_ui.services.run_registry import REGISTRY, RunBusyError
 
 # How often send_message() checks the run registry for new events while a turn
 # is in flight. Small enough to feel live, large enough not to spin a core.
@@ -185,7 +186,16 @@ class PenTestAgentService:
         # generator is only a *reader*. A runner without it (a bare two-arg
         # MockAgentRunner, say) falls back to its plain generator.
         if getattr(self._agent_runner, "supports_polling", None) and self._agent_runner.supports_polling():
-            self._agent_runner.start(message, self._thread_id)
+            try:
+                self._agent_runner.start(message, self._thread_id)
+            except RunBusyError as busy:
+                # One turn per thread. Two would interleave their writes to the
+                # same UI-namespace checkpoint row and their astream calls on the
+                # same LangGraph thread - see RunBusyError. Surfaced as an event
+                # rather than raised, because the caller is a UI render loop and a
+                # second turn should read as "busy", not as a crash.
+                yield {"type": "busy", "data": str(busy)}
+                return
             index = 0
             while True:
                 events, index, _revision = self._agent_runner.poll(self._thread_id, index)
@@ -290,8 +300,6 @@ class PenTestAgentService:
             # Drop the run entry too, so a deleted session cannot still report
             # "running" in the UI.
             try:
-                from streamlit_ui.services.run_registry import REGISTRY
-
                 REGISTRY.drop(thread_id)
             except Exception:  # noqa: BLE001 - never fail a delete over bookkeeping
                 pass
@@ -310,20 +318,14 @@ class PenTestAgentService:
         Cheap: an in-memory read. The UI compares it against the value it last
         rendered and re-reads history only when it moved.
         """
-        from streamlit_ui.services.run_registry import REGISTRY
-
         return REGISTRY.revision(self._thread_id)
 
     def is_run_active(self) -> bool:
         """True while an agent turn for this thread is still in flight."""
-        from streamlit_ui.services.run_registry import REGISTRY
-
         return REGISTRY.is_running(self._thread_id)
 
     def active_run_snapshot(self) -> Optional[Dict[str, Any]]:
         """A consistent copy of this thread's latest run, or ``None``."""
-        from streamlit_ui.services.run_registry import REGISTRY
-
         state = REGISTRY.get(self._thread_id)
         return state.snapshot() if state is not None else None
 

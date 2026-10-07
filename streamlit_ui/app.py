@@ -559,6 +559,23 @@ def render_main_chat(service: PenTestAgentService) -> None:
             # new session on the rerun below.
             created_session = True
 
+        # One turn per thread. A second prompt sent while a turn is still running
+        # would start a concurrent agent run on the same LangGraph thread, and
+        # both runs would write the same UI-namespace checkpoint row - their
+        # writes interleave and the stored transcript ends up with duplicated or
+        # missing tool calls. Observed live: two overlapping Langfuse traces seven
+        # seconds apart on one session. So refuse early, before the user bubble is
+        # appended, since the refused turn is never persisted and appending it
+        # here would put the session ahead of the checkpointer again.
+        # services/run_registry.RunBusyError is the real guard; this is just the
+        # clear UX for it.
+        if service.is_run_active():
+            st.warning(
+                "The agent is still working on this session. Wait for it to "
+                "finish, or switch to another session - the turn keeps running."
+            )
+            return
+
         # Add user message
         st.session_state.chat_messages.append({"type": "user", "content": prompt})
         render_message("user", prompt)
@@ -641,6 +658,15 @@ def render_main_chat(service: PenTestAgentService) -> None:
                         else:
                             st.write(full_response)
                         _save_chat()
+                    elif event["type"] in ("busy", "error"):
+                        # Previously these were dropped on the floor. A refused
+                        # turn and a failed run are both things the user needs to
+                        # see, and neither is persisted into the transcript.
+                        note = str(event.get("data", "Agent run failed."))
+                        icon = "⏳" if event["type"] == "busy" else "⚠️"
+                        if stream_ph is not None:
+                            stream_ph.empty()
+                        st.warning(f"{icon} {note}")
             except Exception as exc:
                 # Surface run failures instead of silently freezing the chat.
                 note = f"⚠️ Agent run failed: {exc}"

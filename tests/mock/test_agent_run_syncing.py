@@ -31,8 +31,16 @@ import pytest
 
 from streamlit_ui.services import real_backend as rb
 from streamlit_ui.services.agent_service import PenTestAgentService
-from streamlit_ui.services.run_registry import DONE, ERROR, RUNNING, REGISTRY, RunRegistry, RunState
-from tests.mock.mock_objects_streamlit import MockAgentRunner, MockCheckpointer
+from streamlit_ui.services.run_registry import (
+    DONE,
+    ERROR,
+    RUNNING,
+    REGISTRY,
+    RunBusyError,
+    RunRegistry,
+    RunState,
+)
+from tests.mock.mock_objects_streamlit import MockAgentRunner, MockCheckpointer, MockFileStore
 
 
 @pytest.fixture(autouse=True)
@@ -233,6 +241,103 @@ class TestPersistenceHappensOnTheLoopThread:
         assert cp.get("t-ver")["messages"] == [{"type": "user", "content": "c"}]
 
 
+class TestOneTurnPerThread:
+    """The concurrency guard, end to end.
+
+    Regression cover for a live bug: two prompts sent seconds apart on one session
+    started two overlapping agent runs. Both called ``astream`` on the same
+    LangGraph thread with no ``checkpoint_id``, and both persisted to the same
+    fixed-id UI-namespace row, so their writes interleaved - duplicated tool calls,
+    whichever reply wrote last winning. Langfuse showed the two traces with tool
+    calls from each landing between the other's.
+    """
+
+    def test_send_message_reports_busy_instead_of_starting_a_second_run(self):
+        cp = MockCheckpointer()
+        runner = MockAgentRunner(delay_seconds=1.5, checkpointer=cp)
+        runner.set_tool_calls([{"name": "ls", "args": {"path": "/"}}])
+        service = PenTestAgentService(
+            thread_id="busy",
+            checkpointer=cp,
+            file_store=MockFileStore(),
+            agent_runner=runner,
+        )
+
+        # First turn, left running (simulate: consumer never drains it).
+        service._agent_runner.start("first question", "busy")
+        assert REGISTRY.is_running("busy")
+
+        events = list(service.send_message("second question"))
+
+        assert [e["type"] for e in events] == ["busy"], (
+            f"expected a busy refusal, got {[e['type'] for e in events]}"
+        )
+        assert "already running" in events[0]["data"]
+
+    def test_refused_turn_is_not_persisted(self):
+        """The refused prompt must not reach the transcript.
+
+        If it did, the stored row would contain a user message with no reply -
+        exactly the kind of half-written history #20 is about.
+        """
+        cp = MockCheckpointer()
+        runner = MockAgentRunner(delay_seconds=1.5, checkpointer=cp)
+        service = PenTestAgentService(
+            thread_id="busy2",
+            checkpointer=cp,
+            file_store=MockFileStore(),
+            agent_runner=runner,
+        )
+        service._agent_runner.start("first question", "busy2")
+        list(service.send_message("second question"))
+
+        users = [
+            m.get("content")
+            for m in (cp.get("busy2") or {}).get("messages", [])
+            if m.get("type") == "user"
+        ]
+        assert "second question" not in users
+        assert users == ["first question"]
+
+    def test_thread_frees_up_once_the_run_finishes(self):
+        cp = MockCheckpointer()
+        runner = MockAgentRunner(delay_seconds=0.0, checkpointer=cp)
+        service = PenTestAgentService(
+            thread_id="seq",
+            checkpointer=cp,
+            file_store=MockFileStore(),
+            agent_runner=runner,
+        )
+        list(service.send_message("one"))
+        assert not service.is_run_active()
+        events = list(service.send_message("two"))
+        assert [e["type"] for e in events] == ["message"]
+        users = [
+            m.get("content")
+            for m in (cp.get("seq") or {}).get("messages", [])
+            if m.get("type") == "user"
+        ]
+        assert users == ["one", "two"]
+
+    def test_real_adapter_refuses_a_second_astream(self, backend):
+        """The real runner must not schedule a second astream on one thread."""
+        runner, runtime = backend
+        cp = rb.RealCheckpointerAdapter(runner, runtime.checkpointer, checkpoint_ns=rb._UI_CHECKPOINT_NS)
+        agent = _SlowAgent(gap_seconds=1.0)
+        adapter = rb.RealAgentRunnerAdapter(runner, agent, checkpointer=cp)
+
+        adapter.start("first", "th-busy")
+        with pytest.raises(RunBusyError):
+            adapter.start("second", "th-busy")
+        assert agent.astream_calls == 1
+
+        assert _wait_for(lambda: not REGISTRY.is_running("th-busy"))
+        # Free again afterwards.
+        adapter.start("second", "th-busy")
+        assert _wait_for(lambda: not REGISTRY.is_running("th-busy"))
+        assert agent.astream_calls == 2
+
+
 class TestRunStateAndRegistry:
     def test_revision_is_monotonic_and_bumps_on_finish(self):
         reg = RunRegistry()
@@ -268,12 +373,41 @@ class TestRunStateAndRegistry:
         events, nxt = state.events_since(1)
         assert [e["type"] for e in events] == ["b"]
 
-    def test_latest_run_per_thread_replaces_previous(self):
+    def test_second_run_on_a_running_thread_is_refused(self):
+        """One turn per thread. See RunBusyError for what two concurrent turns do.
+
+        This was a live bug: two overlapping Langfuse traces on one session,
+        seven seconds apart, with each turn's tool calls landing between the
+        other's. The second start used to evict the first run's RunState and both
+        runs would write the same fixed-id checkpoint row.
+        """
         reg = RunRegistry()
         first = reg.start("t", "one")
+        with pytest.raises(RunBusyError):
+            reg.start("t", "two")
+        # The in-flight run is untouched - not evicted, not reset.
+        assert reg.get("t") is first
+        assert reg.is_running("t")
+
+        # Once it finishes, the thread is free again.
+        first.finish()
         second = reg.start("t", "two")
         assert reg.get("t") is second
-        assert first is not second
+        assert second is not first
+
+    def test_a_finished_run_does_not_block_the_next_turn(self):
+        reg = RunRegistry()
+        reg.start("t", "one").finish()
+        assert reg.revision("t") > 0
+        reg.start("t", "two")  # must not raise
+
+    def test_different_threads_run_concurrently(self):
+        """The guard is per thread - two sessions must not block each other."""
+        reg = RunRegistry()
+        a = reg.start("a", "one")
+        b = reg.start("b", "two")
+        assert reg.running_threads() == ["a", "b"]
+        assert reg.get("a") is a and reg.get("b") is b
 
     def test_registry_reports_running_threads_and_drops(self):
         reg = RunRegistry()

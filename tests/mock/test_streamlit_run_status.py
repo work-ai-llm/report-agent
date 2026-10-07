@@ -193,6 +193,74 @@ class TestRunStatusStrip:
         assert at.session_state["_run_was_active"] is False
 
 
+class TestSecondMessageIsRefusedWhileRunning:
+    """Submitting a second prompt mid-turn must not start a second run.
+
+    Regression cover for a live bug: two prompts seven seconds apart on one
+    session produced two overlapping agent runs - two Langfuse traces on the same
+    session, with each turn's tool calls interleaved between the other's. Both
+    wrote the same fixed-id UI-namespace row, so the transcript ended up with
+    duplicated tool calls and whichever reply wrote last.
+    """
+
+    def test_warning_is_shown_and_no_bubble_is_appended(self):
+        at = AppTest.from_file(APP_PATH).run()
+        at.chat_input[0].set_value("first question").run()
+        thread_id = at.session_state["current_thread_id"]
+        before = list(at.session_state["chat_messages"])
+
+        # A turn is in flight for this thread (what an interrupted turn looks like).
+        _active_run(thread_id)
+
+        at.chat_input[0].set_value("second question").run()
+
+        warnings = " ".join(el.value for el in at.warning)
+        assert "still working" in warnings, f"no busy warning rendered: {warnings!r}"
+        # The refused prompt must not appear in the view either: it was never
+        # persisted, so showing it would put the session ahead of the checkpointer.
+        users = [m.get("content") for m in at.session_state["chat_messages"]
+                 if m.get("type") == "user"]
+        assert "second question" not in users
+        assert [m.get("type") for m in at.session_state["chat_messages"]] == [
+            m.get("type") for m in before
+        ]
+
+    def test_no_extra_assistant_reply_is_produced(self):
+        at = AppTest.from_file(APP_PATH).run()
+        at.chat_input[0].set_value("first question").run()
+        thread_id = at.session_state["current_thread_id"]
+        assistants_before = sum(
+            1 for m in at.session_state["chat_messages"] if m.get("type") == "assistant"
+        )
+
+        _active_run(thread_id)
+        at.chat_input[0].set_value("second question").run()
+
+        assistants_after = sum(
+            1 for m in at.session_state["chat_messages"] if m.get("type") == "assistant"
+        )
+        assert assistants_after == assistants_before
+
+    def test_a_turn_is_accepted_again_once_idle(self):
+        """The guard must not turn into a permanent lock."""
+        at = AppTest.from_file(APP_PATH).run()
+        at.chat_input[0].set_value("first question").run()
+        thread_id = at.session_state["current_thread_id"]
+
+        _active_run(thread_id)
+        at.chat_input[0].set_value("refused").run()
+
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        REGISTRY.get(thread_id).finish()
+        at.run()
+        at.chat_input[0].set_value("accepted").run()
+
+        users = [m.get("content") for m in at.session_state["chat_messages"]
+                 if m.get("type") == "user"]
+        assert "accepted" in users
+
+
 class TestReconcileHelper:
     """``_reconcile_with_persisted`` is extracted so it can be tested directly.
 
