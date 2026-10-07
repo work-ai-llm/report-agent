@@ -107,6 +107,16 @@ After the initial agent (2026-08-28 → 2026-10-05).
   `findings/findings_summary.txt` displayed as `summary.txt` — and any later write
   using that displayed name targeted a different key. Only a leading prefix is
   stripped now. (#40)
+- **Assistant text was batched into one block at the end of the turn.** The agent
+  interleaves prose with tool calls - it says what it is about to do, calls a
+  tool, says something else, calls another tool, then answers - but the UI
+  runner accumulated every segment in `final_parts` and appended a single
+  assistant row to the run only once the stream ended. Tool call and tool
+  result rows were appended as they arrived, which is why the run looked active
+  while the prose looked silent. A segment is now appended as soon as the
+  following tool call or tool result proves more work is coming, and only the
+  trailing segment becomes the final answer. Text and tool calls on one message
+  keep the model's own order. (#51)
 - **Stopping a Streamlit run did not cancel the in-flight agent stream.** The
   handle from `schedule()` was discarded and the consumer blocked on
   `events.get()` with no cleanup, so pressing Stop — which closes the generator —
