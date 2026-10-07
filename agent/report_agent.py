@@ -31,6 +31,50 @@ from langchain_mistralai import ChatMistralAI # Required to attach rate limiter 
 from langchain_openai import ChatOpenAI   # OpenAI-compatible servers (llama.cpp, model server proxy)
 from langchain_openrouter import ChatOpenRouter  # OpenAI-compatible gateway (free-tier models)
 
+
+class ReasoningChatOpenAI(ChatOpenAI):
+    """``ChatOpenAI`` that also keeps ``reasoning_content``.
+
+    Why this subclass exists rather than a constructor flag: there isn't one.
+    ``langchain_openai`` parses the SSE delta against the OpenAI API spec, and
+    that spec has no ``reasoning_content``. Its delta reader
+    (``_convert_delta_to_message_chunk``) picks out exactly five keys - ``id``,
+    ``role``, ``content``, ``function_call``, ``tool_calls`` - so a
+    llama.cpp/OpenRouter-style ``reasoning_content`` delta arrives at the
+    client and is dropped on the floor. The class says so itself:
+    ``BaseChatOpenAI`` documents that "non-standard response fields added by
+    third-party providers (e.g. ``reasoning_content``) are not extracted".
+
+    Measured on the local model: 36 reasoning deltas for the single visible
+    token in "What is 2+2?", all discarded, leaving 40 of 41 chunks empty.
+
+    ``ChatOpenRouter`` is the counter-example: it does NOT subclass
+    ``ChatOpenAI`` (it derives from ``BaseChatModel`` and ships its own delta
+    reader) and already maps the field into ``additional_kwargs``. Two classes
+    with the same name and different behaviour - which is why this one exists
+    only for the local backend.
+    """
+
+    def _convert_chunk_to_generation_chunk(self, chunk, default_chunk_class, base_generation_info):
+        generation_chunk = super()._convert_chunk_to_generation_chunk(
+            chunk, default_chunk_class, base_generation_info
+        )
+        if generation_chunk is None:
+            return generation_chunk
+        message = getattr(generation_chunk, "message", None)
+        if message is None:
+            return generation_chunk
+        choices = chunk.get("choices") or chunk.get("chunk", {}).get("choices") or []
+        if not choices:
+            return generation_chunk
+        delta = choices[0].get("delta") or {}
+        # Some servers spell it `reasoning`; OpenRouter sends both spellings.
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+        if reasoning:
+            message.additional_kwargs["reasoning_content"] = reasoning
+            message.response_metadata["has_reasoning"] = True
+        return generation_chunk
+
 # --- NEW: LANGFUSE INITIALIZATION ---
 from langfuse.langchain import CallbackHandler
 from langfuse import get_client
@@ -521,7 +565,9 @@ class AgentRuntime:
         # --- Build one model instance ---
         def _build(model: str, timeout: float, max_retries: int):
             if backend == "openai_local":
-                return ChatOpenAI(
+                # ReasoningChatOpenAI, not ChatOpenAI: llama.cpp emits
+                # reasoning_content and the stock class discards it (#18).
+                return ReasoningChatOpenAI(
                     model=model,
                     base_url=os.getenv("LLM_BASE_URL") or "http://localhost:1234/v1",
                     api_key=os.getenv("LLM_API_KEY", "").strip() or "none",

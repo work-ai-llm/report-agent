@@ -65,8 +65,8 @@ asserts that.
 
 | Backend | Class | Notes |
 |---|---|---|
-| `openai_local` | `ChatOpenAI` | Any OpenAI-compatible server. `stream_usage=True` is required here — see Traps. |
-| `openrouter` | `ChatOpenRouter` | **Timeout is milliseconds**, not seconds. |
+| `openai_local` | `ReasoningChatOpenAI` | Subclasses `ChatOpenAI` to keep `reasoning_content`, which the stock class drops — see Traps. `stream_usage=True` is required here. |
+| `openrouter` | `ChatOpenRouter` | **Timeout is milliseconds**, not seconds. Already extracts reasoning itself; it does **not** subclass `ChatOpenAI`. |
 | `mistral` | `ChatMistralAI` | Self-reads `MISTRAL_API_KEY`. |
 
 Left unset, the backend is inferred: `LLM_BASE_URL` → `openai_local`,
@@ -334,6 +334,14 @@ Each of these cost real debugging time and is not obvious from the code.
 
 - **`ChatOpenRouter` takes its timeout in milliseconds**; `_init_llm` multiplies
   by 1000. That looks like a bug and is not.
+- **`ChatOpenAI` silently discards `reasoning_content`**, so the local backend
+  uses `ReasoningChatOpenAI`. Its SSE delta reader is written against the OpenAI
+  API spec and picks out five keys — `id`, `role`, `content`, `function_call`,
+  `tool_calls` — and a llama.cpp `reasoning_content` delta is none of them.
+  `ChatOpenRouter` is the counter-example that makes this confusing: it is *not*
+  a `ChatOpenAI` subclass (it derives from `BaseChatModel` and has its own delta
+  reader) and already extracts the field. Two classes, same name, different
+  behaviour. There is no constructor flag for this — it has to be a subclass.
 - **`stream_usage` must be explicit on `ChatOpenAI`.** `langchain-openai` only
   auto-enables it for the default OpenAI base URL. Because this repo always passes
   an explicit `base_url`, the flag stays off, no `stream_options` is sent, and

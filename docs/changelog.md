@@ -102,6 +102,16 @@ After the initial agent (2026-08-28 → 2026-10-05).
 
 ### Fixed
 
+- **Model reasoning was discarded before anything could display it.** The local
+  backend's chat model was `langchain_openai`'s `ChatOpenAI`, whose SSE parser
+  is written against the OpenAI API spec and reads five delta keys - `id`,
+  `role`, `content`, `function_call`, `tool_calls`. llama.cpp puts reasoning in
+  `reasoning_content`, which is not one of them, so it was dropped at the client.
+  Measured on the local model: 36 reasoning deltas for the one visible token in
+  "What is 2+2?", 40 of 41 chunks empty. `ReasoningChatOpenAI` now keeps the
+  field in `additional_kwargs`, and the chat renders it collapsed per message.
+  Reasoning reaches the UI only where the backend surfaces it - the local
+  backend previously did not. (#18, #51)
 - **Listing findings or reports rewrote matching text anywhere in a filename.**
   The prefix was removed with `str.replace`, so
   `findings/findings_summary.txt` displayed as `summary.txt` — and any later write

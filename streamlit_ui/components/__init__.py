@@ -7,7 +7,7 @@ This package provides reusable UI building blocks for the Streamlit pen-test UI:
 - filesystem_view.py: Show the agent's store-backed files and its scratchpad
 """
 
-from streamlit_ui.components.chat_display import render_message, render_tool_call
+from streamlit_ui.components.chat_display import render_message, render_tool_call, render_reasoning
 from streamlit_ui.components.file_uploader import render_file_uploader
 from streamlit_ui.components.report_downloader import (
     render_report_downloader,
@@ -21,6 +21,7 @@ from streamlit_ui.components.filesystem_view import (
 __all__ = [
     "render_message",
     "render_tool_call",
+    "render_reasoning",
     "render_file_uploader",
     "render_report_downloader",
     "render_report_selector",

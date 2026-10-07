@@ -594,6 +594,9 @@ class RealAgentRunnerAdapter:
         # Assistant prose seen since the last tool call or tool result. Held back
         # only until we know whether more work follows it, then flushed in order.
         pending_parts: List[str] = []
+        # Reasoning for that same span. May be non-empty while pending_parts is
+        # empty - a model can think and then call a tool without saying anything.
+        pending_reasoning: List[str] = []
         # Set when the consumer abandons this run, so the finally block can tell
         # "stopped by the user" apart from "finished".
         cancelled = False
@@ -661,17 +664,40 @@ class RealAgentRunnerAdapter:
             call or tool result proves something else follows it. Whatever is
             still buffered when the stream ends is the answer.
             """
-            nonlocal pending_parts
-            if not pending_parts:
+            nonlocal pending_parts, pending_reasoning
+            reasoning = "".join(pending_reasoning).strip()
+            if not pending_parts and not reasoning:
                 return
             text = "".join(pending_parts)
             pending_parts = []
+            pending_reasoning = []
             row = {"type": "assistant", "content": text}
+            if reasoning:
+                # Attached to the row rather than emitted as its own, so the
+                # transcript keeps one entry per assistant message and the
+                # renderer can show the thinking above the answer it produced.
+                row["reasoning"] = reasoning
             if final:
                 _emit({"type": "message", "data": text}, [row])
                 _print(f"[AGENT RESPONSE]: {text}")
             else:
                 _emit({"type": "assistant_text", "data": text}, [row])
+
+        def _queue_reasoning(chunk: Any) -> None:
+            """Collect a message's reasoning, if the backend surfaced any.
+
+            ``reasoning_content`` is where the provider-specific chat classes
+            put it - ``ReasoningChatOpenAI`` for the local backend,
+            ``ChatOpenRouter`` for OpenRouter. It is read here rather than in
+            the app because the run registry owns the rows the renderer draws.
+            """
+            nonlocal pending_reasoning
+            kwargs = getattr(chunk, "additional_kwargs", None) or {}
+            part = kwargs.get("reasoning_content") or ""
+            if not part:
+                return
+            pending_reasoning.append(part if isinstance(part, str) else str(part))
+            _print(f"[REASONING]: {len(part)} chars")
 
         def _handle_chunk(chunk: Any) -> None:
             if isinstance(chunk, dict):
@@ -694,6 +720,7 @@ class RealAgentRunnerAdapter:
                 # them in that order in one message and the UI must not reorder
                 # them, so queue the prose before the loop that flushes it.
                 content = getattr(chunk, "content", "")
+                _queue_reasoning(chunk)
                 if content:
                     text = content if isinstance(content, str) else str(content)
                     _queue_text(text)

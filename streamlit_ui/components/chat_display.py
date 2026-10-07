@@ -79,6 +79,24 @@ def render_tool_call(tool_name: str, tool_args: Dict[str, Any], tool_result: Opt
             st.code(str(tool_result), language=None)
 
 
+def render_reasoning(reasoning: Optional[str]) -> None:
+    """Render a model's reasoning, collapsed so it never competes with the answer.
+
+    Collapsed by default on purpose: this is the agent's own working commentary
+    over the operator's findings, and it is frequently longer than the answer it
+    produced. It is also only present when the backend surfaced it - the local
+    model needs ``ReasoningChatOpenAI`` to keep the field at all (#18).
+
+    Args:
+        reasoning: Reasoning text, or None/empty when the model did not expose
+            any.
+    """
+    if not reasoning or not reasoning.strip():
+        return
+    with st.expander("Reasoning", expanded=False):
+        st.markdown(reasoning)
+
+
 def render_chat_history(messages: List[Dict[str, Any]]) -> None:
     """Render a full conversation from persisted history entries.
 
@@ -115,6 +133,7 @@ def render_chat_history(messages: List[Dict[str, Any]]) -> None:
                     )
                     i += 1
                 if i < len(messages) and messages[i].get("type") == "assistant":
+                    render_reasoning(messages[i].get("reasoning"))
                     st.write(messages[i]["content"])
                     i += 1
 

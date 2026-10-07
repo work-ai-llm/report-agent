@@ -318,6 +318,84 @@ class TestRealAgentRunnerAdapter:
         assert events[0]["data"] == "Scanning now."
         assert events[-1]["data"] == "All clear."
 
+    def test_reasoning_reaches_the_row_without_an_answer_of_its_own(self, backend, monkeypatch):
+        """A model can reason and then call a tool without saying anything.
+
+        That span still has to surface: the reasoning is attached to the row the
+        renderer draws, even though there is no prose to put beside it. Before
+        the fix the run flushed nothing at all for it, because the flush was
+        triggered by prose reaching a tool call.
+        """
+        from langchain_core.messages import AIMessageChunk
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            {"messages": [AIMessageChunk(
+                content="",
+                additional_kwargs={"reasoning_content": "The scan was truncated."},
+                tool_calls=[{"name": "read_file",
+                             "args": {"file_path": "/context/findings/nmap_scans.txt",
+                                      "offset": 15},
+                             "id": "c1", "type": "tool_call"}])]},
+            {"messages": [AIMessageChunk(
+                content="Full contents above.",
+                additional_kwargs={"reasoning_content": "That was the whole file."})]},
+        ])
+        adapter = rb.RealAgentRunnerAdapter(backend[0], agent)
+        state = adapter.start("read the rest", "th-reason")
+        assert _wait_until_idle(REGISTRY, "th-reason")
+
+        rows = [r for r in state.messages if r.get("type") == "assistant"]
+        assert [r.get("reasoning") for r in rows] == [
+            "The scan was truncated.", "That was the whole file.",
+        ]
+        assert [r.get("content") for r in rows] == ["", "Full contents above."]
+
+    def test_reasoning_deltas_are_concatenated(self, backend, monkeypatch):
+        """Streamed reasoning arrives one delta per chunk and must be joined.
+
+        This is the shape the local backend actually produces - 36 separate
+        reasoning deltas for a single visible token.
+        """
+        from langchain_core.messages import AIMessageChunk
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            {"messages": [AIMessageChunk(
+                content="", additional_kwargs={"reasoning_content": "First "})]},
+            {"messages": [AIMessageChunk(
+                content="", additional_kwargs={"reasoning_content": "second "})]},
+            {"messages": [AIMessageChunk(
+                content="4.",
+                additional_kwargs={"reasoning_content": "third."})]},
+        ])
+        adapter = rb.RealAgentRunnerAdapter(backend[0], agent)
+        state = adapter.start("2+2?", "th-reason2")
+        assert _wait_until_idle(REGISTRY, "th-reason2")
+
+        rows = [r for r in state.messages if r.get("type") == "assistant"]
+        assert len(rows) == 1
+        assert rows[0]["reasoning"] == "First second third."
+        assert rows[0]["content"] == "4."
+
+    def test_no_reasoning_key_when_the_backend_surfaces_none(self, backend, monkeypatch):
+        """Rows must not grow an empty reasoning field on backends that have none."""
+        from langchain_core.messages import AIMessageChunk
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            {"messages": [AIMessageChunk(content="No thinking here.")]},
+        ])
+        adapter = rb.RealAgentRunnerAdapter(backend[0], agent)
+        state = adapter.start("hi", "th-reason3")
+        assert _wait_until_idle(REGISTRY, "th-reason3")
+
+        rows = [r for r in state.messages if r.get("type") == "assistant"]
+        assert rows and all("reasoning" not in r for r in rows)
+
     def test_stream_error_surfaces_error_event(self, backend, monkeypatch):
         monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
         agent = self._FakeAsyncAgent([], exc=ValueError("llm exploded"))
