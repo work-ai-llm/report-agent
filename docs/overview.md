@@ -78,8 +78,6 @@ Stated plainly, because these are the things that look available and are not.
 - **No rate limiting is applied.** The limiter is built and deliberately not
   wired; see [architecture.md](architecture.md#rate-limiting--present-but-not-wired)
   for why.
-- **Stopping a UI run does not cancel the agent.** The stream continues to
-  completion. Tracked in #39.
 
 ## Running it
 

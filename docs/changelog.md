@@ -76,6 +76,13 @@ After the initial agent (2026-08-28 → 2026-10-05).
 
 ### Fixed
 
+- **Stopping a Streamlit run did not cancel the in-flight agent stream.** The
+  handle from `schedule()` was discarded and the consumer blocked on
+  `events.get()` with no cleanup, so pressing Stop — which closes the generator —
+  left the agent streaming to completion on the event loop. The handle is now
+  cancelled in a `finally`, and a cancelled run deliberately emits no final
+  message rather than writing state for a turn the user stopped.
+  (2026-10-07, #39)
 - **Every Langfuse generation reported zero tokens.** `langchain-openai` only
   auto-enables `stream_usage` for the default OpenAI base URL, and this project
   always passes an explicit `base_url`, so the server was never asked for a usage
@@ -116,9 +123,6 @@ Open and documented; see the milestone board for the full picture.
 
 - Live token streaming is not implemented; the `--streaming` flag is inert and the
   answer arrives whole. (#17, #19)
-- Stopping a Streamlit run does not cancel the in-flight agent stream — the
-  `Future` from `schedule()` is discarded, so the work runs to completion.
-  (`docs/troubleshooting.md`, #39)
 - Interacting with the UI mid-stream can drop the in-flight turn. (#20)
 - A sidebar selector for the LLM backend is not built. Switching backend is now a
   `--llm-backend` flag rather than an `.env` edit, so this is convenience rather

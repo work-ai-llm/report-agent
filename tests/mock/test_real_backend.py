@@ -5,8 +5,11 @@ real LangGraph SQLite checkpointer + store, using a temporary DB file per test
 so the developer's ``agent/agent_session.db`` is never touched.
 """
 
+import asyncio
 import os
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -281,6 +284,103 @@ class TestRealAgentRunnerAdapter:
         assert "[TOOL RESULT]: read_file" in out
         assert "[CNK]: Done here." in out
         assert "[AGENT RESPONSE]: Done here." in out
+
+
+class TestRunCancellation:
+    """Abandoning the run must stop the agent stream (issue #39).
+
+    Streamlit's Stop button ends the script run, which closes this generator.
+    Before the fix the `Future` from `schedule()` was discarded, so nothing
+    cancelled the coroutine: the agent kept streaming to completion on the event
+    loop after the UI had moved on.
+    """
+
+    class _EndlessAgent:
+        """Emits one tool call, then blocks forever - like a long agent turn.
+
+        The first update is a tool call rather than plain text because plain
+        content only accumulates into final_parts and emits no event, so a
+        consumer waiting on the generator would block before reaching the part
+        of the stream this test is about.
+        """
+
+        def __init__(self):
+            from langchain_core.messages import AIMessageChunk
+
+            self._chunk = AIMessageChunk(
+                content="",
+                tool_calls=[{"name": "ls", "args": {"path": "/context"}, "id": "c1",
+                             "type": "tool_call"}],
+            )
+            self.started = threading.Event()
+            self.stopped = False
+
+        async def astream(self, stream_input, config=None, stream_mode=None):
+            self.started.set()
+            try:
+                yield {"messages": [self._chunk]}
+                while True:
+                    await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                self.stopped = True
+                raise
+
+    def _drain_until_stopped(self, agent, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while not agent.stopped and time.monotonic() < deadline:
+            time.sleep(0.02)
+        return agent.stopped
+
+    def test_closing_the_generator_stops_the_agent_stream(self, backend, monkeypatch):
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        runner, _runtime = backend
+        agent = self._EndlessAgent()
+        adapter = rb.RealAgentRunnerAdapter(runner, agent)
+
+        stream = adapter.run("long turn", "th-cancel")
+        assert next(stream)["type"] == "tool_call"
+        assert agent.started.wait(5)
+
+        # This is what Streamlit does when the user presses Stop.
+        stream.close()
+
+        assert self._drain_until_stopped(agent), (
+            "the agent stream kept running after the consumer went away"
+        )
+
+    def test_cancelled_run_emits_no_final_message(self, backend, monkeypatch, capsys):
+        # A stopped turn must not be reported as a finished one. The finally
+        # block previously emitted whatever text had accumulated and could fall
+        # back to the checkpointer, which wrote state for an abandoned turn.
+        monkeypatch.setenv("STREAMLIT_AGENT_PRINT", "1")
+        runner, _runtime = backend
+        agent = self._EndlessAgent()
+        adapter = rb.RealAgentRunnerAdapter(runner, agent)
+
+        stream = adapter.run("long turn", "th-cancel2")
+        next(stream)
+        assert agent.started.wait(5)
+        stream.close()
+        assert self._drain_until_stopped(agent)
+
+        out = capsys.readouterr().out
+        assert "cancelled by the consumer" in out
+        assert "skipping final message for a cancelled run" in out
+        assert "[AGENT RESPONSE]" not in out
+        assert "AGENT RESPONSE (checkpointer)" not in out
+
+    def test_normal_completion_is_unaffected(self, backend, monkeypatch):
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        from langchain_core.messages import AIMessageChunk
+
+        agent = TestRealAgentRunnerAdapter._FakeAsyncAgent([
+            {"messages": [AIMessageChunk(content="all done")]},
+        ])
+        runner, _runtime = backend
+        adapter = rb.RealAgentRunnerAdapter(runner, agent)
+        events = list(adapter.run("quick", "th-ok"))
+        assert [e["type"] for e in events] == ["message"]
+        assert events[0]["data"] == "all done"
 
 
 class TestRealBackendStatus:

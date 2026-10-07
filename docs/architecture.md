@@ -256,10 +256,15 @@ every async call crosses it. Never await directly from UI code.
 the event loop, pushes parsed events into a queue, and yields them to the
 synchronous caller.
 
-It is currently **not cancellable**: the `Future` returned by `schedule()` is
-discarded, and the consumer blocks on `events.get()` with no timeout. Abandoning
-the generator — which is what Streamlit's Stop does — leaves the agent stream
-running to completion. Tracked in #39.
+It cancels the agent stream when the generator is abandoned, which is what
+Streamlit's Stop button does. Cancelling the `concurrent.futures.Future` returned
+by `schedule()` propagates to the underlying `asyncio` task even after the
+coroutine has started (verified on 3.11), so a `try/finally` around the yield loop
+is enough to stop work in flight.
+
+A cancelled run deliberately does **not** emit a final message or fall back to
+the checkpointer. Doing either would write state for a turn the user stopped,
+which then appears in the session list as a half-finished entry.
 
 ### Three agent modes
 

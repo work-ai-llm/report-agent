@@ -145,16 +145,17 @@ above, every logger in the process reports.
 
 ## Stopping the UI does not stop the agent
 
-**Symptom.** Clicking Stop, or interrupting the process, leaves the agent running.
-Langfuse warnings about scheduling futures after shutdown appear at exit.
+**Should not happen.** Closing the generator cancels the agent stream, and a
+cancelled run emits no final message.
 
-**Cause.** `RealAgentRunnerAdapter.run` discards the `Future` returned by
-`schedule()`, and the consumer blocks on `events.get()` with no timeout.
-Abandoning the generator — which is what Stop does — never cancels the work on
-the event loop. It runs to completion.
+If you see requests continuing after Stop, the cancellation is not reaching the
+task. Check that `RealAgentRunnerAdapter.run` still holds the handle from
+`schedule()` inside a `try/finally` around the yield loop — an abandoned
+generator is what Streamlit's Stop produces, and without a `finally` nothing
+cancels the coroutine.
 
-Tracked in #39. The shutdown warnings are a symptom of the same thing, not a
-separate fault.
+`tests/mock/test_real_backend.py::TestRunCancellation` covers this, including
+that a stopped turn writes no final message.
 
 ---
 

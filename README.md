@@ -164,7 +164,6 @@ Stated plainly, because these look available and are not.
   exposes an unauthenticated agent.
 - **No rate limiting applied.** See
   [architecture.md](docs/architecture.md#rate-limiting--present-but-not-wired).
-- **Stopping a UI run does not cancel the agent** — the stream runs to completion.
 
 ## Architecture in one diagram
 
