@@ -136,6 +136,10 @@ from streamlit_ui.components.chat_display import (
     render_tool_call,
 )
 from streamlit_ui.components.file_uploader import render_file_uploader
+from streamlit_ui.components.filesystem_view import (
+    render_filesystem_view,
+    render_scratchpad_view,
+)
 from streamlit_ui.components.report_downloader import (
     render_report_downloader,
     render_report_selector,
@@ -435,18 +439,33 @@ def render_sidebar(service: PenTestAgentService) -> None:
         
         render_file_uploader(handle_upload)
         
-        # Display uploaded findings
         st.divider()
-        st.markdown("### 📁 Uploaded Findings")
-        st.session_state.findings = service.list_findings()
         
+        # Uploaded findings, as a count only - the files themselves are listed
+        # by the filesystem panel below, which shows everything the agent can
+        # read rather than just this slice.
+        st.session_state.findings = service.list_findings()
+        st.markdown("### 📁 Uploaded Findings")
         if st.session_state.findings:
-            for finding in st.session_state.findings:
-                st.text(f"• {finding}")
+            st.caption(
+                f"{len(st.session_state.findings)} file(s) — see Agent Filesystem"
+            )
         else:
             st.info("No findings uploaded")
         
         st.divider()
+        
+        # Whole virtual filesystem: findings, reports, and the context library.
+        render_filesystem_view(service.list_filesystem())
+        
+        st.divider()
+        
+        # Agent working files. Only meaningful once a session exists, since the
+        # scratchpad belongs to a thread.
+        if service.thread_id:
+            render_scratchpad_view(service.list_scratchpad())
+            
+            st.divider()
         
         # Reports section
         st.markdown("### 📄 Reports")

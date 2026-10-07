@@ -180,3 +180,76 @@ class TestReportSelector:
         at = AppTest.from_function(app).run()
         assert len(at.selectbox) == 1
         assert at.selectbox[0].options == ["a.md", "b.md"]
+
+class TestFilesystemView:
+    """Tests for the whole-filesystem panel."""
+
+    def test_shows_info_when_store_is_empty(self) -> None:
+        def app() -> None:
+            from streamlit_ui.components.filesystem_view import (
+                render_filesystem_view,
+            )
+            render_filesystem_view([])
+
+        at = AppTest.from_function(app).run()
+        assert len(at.info) == 1
+
+    def test_renders_every_group_when_files_exist(self) -> None:
+        def app() -> None:
+            from streamlit_ui.components.filesystem_view import (
+                render_filesystem_view,
+            )
+            render_filesystem_view(
+                [
+                    "/context/findings/nmap.txt",
+                    "/context/findings/bloodhound.txt",
+                    "/context/reports/final.md",
+                    "/context/templates/recon_report_template.md",
+                ]
+            )
+
+        at = AppTest.from_function(app).run()
+        assert len(at.info) == 0
+        rendered = "\n".join(m.value for m in at.markdown)
+        # Context library is listed, not just findings and reports.
+        assert "templates" in rendered
+        assert "recon_report_template.md" in "\n".join(t.value for t in at.text)
+
+
+class TestScratchpadView:
+    """Tests for the agent working-files panel."""
+
+    def test_shows_caption_when_empty(self) -> None:
+        def app() -> None:
+            from streamlit_ui.components.filesystem_view import (
+                render_scratchpad_view,
+            )
+            render_scratchpad_view({})
+
+        at = AppTest.from_function(app).run()
+        assert len(at.caption) == 1
+
+    def test_renders_one_expander_per_file(self) -> None:
+        def app() -> None:
+            from streamlit_ui.components.filesystem_view import (
+                render_scratchpad_view,
+            )
+            render_scratchpad_view(
+                {
+                    "/scratchpad/notes.md": "# recon notes",
+                    "/scratchpad/outline.md": "## sections",
+                }
+            )
+
+        at = AppTest.from_function(app).run()
+        assert len(at.expander) == 2
+
+    def test_truncates_long_content(self) -> None:
+        def app() -> None:
+            from streamlit_ui.components.filesystem_view import (
+                render_scratchpad_view,
+            )
+            render_scratchpad_view({"/scratchpad/big.md": "x" * 1000})
+
+        at = AppTest.from_function(app).run()
+        assert any("more characters" in c.value for c in at.caption)

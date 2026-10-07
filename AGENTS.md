@@ -110,6 +110,17 @@ Break one of these and you lose data silently, not loudly.
   `("filesystem",)` with keys like `/findings/nmap.txt` and values shaped
   `{"content": str, "encoding": "utf-8"}`. The UI and the agent must agree exactly
   or uploads become invisible to the agent.
+- **The agent's filesystem is two backends, and the second one is not
+  persisted.** The filesystem is a composite: `/context/` is routed to the store,
+  and every other path — the `/scratchpad/` the agent drafts into — goes to an
+  in-memory backend. That in-memory backend is *not* checkpointed here: this
+  project builds its graph with langchain's `create_agent`, so its state channel
+  is never declared, and no `files` channel appears in any checkpoint or pending
+  write. Verified against a real SQLite database. The scratchpad therefore
+  exists only for the duration of a run, and cannot be read back from the store
+  or the checkpointer at any prefix. The UI reconstructs it by replaying the
+  session's persisted tool calls instead — see `list_scratchpad`. If the graph is
+  ever rebuilt with an explicit state schema declaring `files`, that changes.
 - **Sync UI, async agent.** Streamlit runs synchronous scripts; LangGraph is async.
   Every async call crosses the process-wide `EventLoopThread`. Never call an
   awaitable directly from UI code.

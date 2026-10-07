@@ -66,6 +66,41 @@ from streamlit_ui.services.run_registry import REGISTRY, RunBusyError
 _RUN_POLL_INTERVAL = 0.02
 
 
+def _strip_prefix(paths: List[str], prefix: str) -> List[str]:
+    """Drop a leading path prefix from each entry - and only a leading one.
+
+    These two methods used ``str.replace``, which also rewrote the same text
+    anywhere else in the name: ``findings/findings_summary.txt`` displayed as
+    ``summary.txt``, and a later write using that displayed name targeted a
+    different key. Leading slashes are dropped too, because store keys are
+    slash-prefixed while the caller passes a bare prefix.
+    """
+    stripped = []
+    for path in paths:
+        bare = path.lstrip("/")
+        stripped.append(bare[len(prefix):] if bare.startswith(prefix) else bare)
+    return stripped
+
+
+_SCRATCHPAD_PREFIX = "scratchpad/"
+_SCRATCHPAD_WRITERS = ("write_file", "edit_file")
+
+
+def _written_content(current: Optional[str], tool: str, args: Dict[str, Any]) -> Optional[str]:
+    """Work out what a filesystem tool call left at a path, or None if unknowable.
+
+    ``write_file`` carries the whole body. ``edit_file`` either carries a full
+    replacement body or a string substitution against what was already there -
+    the substitution form can only be replayed if the previous content is known.
+    """
+    if "content" in args and isinstance(args["content"], str):
+        return args["content"]
+    old, new = args.get("old_string"), args.get("new_string")
+    if isinstance(old, str) and isinstance(new, str) and current is not None:
+        return current.replace(old, new, 1)
+    return None
+
+
 class PenTestAgentService:
     """Service layer connecting Streamlit UI to agent system.
     
@@ -149,9 +184,72 @@ class PenTestAgentService:
         Data Flow:
             UI sidebar → list_findings() → file_store.list_files() → UI display
         """
-        files = self._file_store.list_files(prefix="findings/")
-        # Strip prefix for cleaner display
-        return [f.replace("findings/", "") for f in files]
+        return _strip_prefix(
+            self._file_store.list_files(prefix="findings/"), "findings/"
+        )
+    
+    def list_filesystem(self) -> List[str]:
+        """List every file the agent can read, grouped-ready display paths.
+        
+        This is the whole of the virtual filesystem, not just findings and
+        reports: the context library the agent is told to read lives under
+        the same prefix as everything else. The store keys arrive without the
+        ``/context/`` root that the routing layer strips before storing, so it
+        is put back here - the agent says ``/context/findings/nmap.txt`` when it
+        lists that directory, and the sidebar should not disagree with it.
+        
+        Does NOT include ``/scratchpad/``. That half is held by an in-memory
+        backend in the agent's checkpoint namespace and is unreachable from a
+        store listing; see list_scratchpad().
+        
+        Returns:
+            Sorted display paths, e.g. ``/context/findings/nmap.txt``
+        """
+        paths = self._file_store.list_files()
+        return sorted(f"/context/{p.lstrip('/')}" for p in paths)
+    
+    def list_scratchpad(self) -> Dict[str, str]:
+        """List the current session's agent working files.
+        
+        The agent's filesystem is a composite: ``/context/`` is persisted in the
+        store, and everything else - the scratchpad it drafts into - is held by an
+        in-memory backend that is never checkpointed. A store listing returns
+        none of it, and neither does the checkpointer: this project builds its
+        graph with langchain's ``create_agent``, so the in-memory backend's state
+        channel is never declared and the scratchpad exists only for the
+        duration of a run. Verified against a real SQLite database - no
+        ``files`` channel is present in any checkpoint or pending write.
+        
+        So the scratchpad is reconstructed by replaying the session's own
+        persisted tool calls, which are stored with the chat history. That makes
+        the panel survive a reload, a session switch and a restart, and it
+        updates live because the history is saved incrementally as the run
+        progresses.
+        
+        Returns:
+            Mapping of path to the most recently written content, in write order.
+            Empty before the agent has written anything.
+        """
+        files: Dict[str, str] = {}
+        for entry in self.get_chat_history():
+            if not isinstance(entry, dict) or entry.get("type") != "tool_call":
+                continue
+            # Persisted history flattens the tool call onto the entry
+            # (``name``/``args`` at the top level), where the live event carries
+            # the same fields nested under ``data``. Accept both.
+            data = entry.get("data") if isinstance(entry.get("data"), dict) else entry
+            if data.get("name") not in _SCRATCHPAD_WRITERS:
+                continue
+            args = data.get("args")
+            if not isinstance(args, dict):
+                continue
+            path = str(args.get("file_path") or "")
+            if not path.strip("/").startswith(_SCRATCHPAD_PREFIX):
+                continue
+            content = _written_content(files.get(path), data["name"], args)
+            if content is not None:
+                files[path] = content
+        return files
     
     def start_turn(self, message: str) -> Dict[str, Any]:
         """Begin a turn and return immediately. Never blocks on the agent.
@@ -279,8 +377,7 @@ class PenTestAgentService:
             UI download dropdown → list_reports() → file_store.list_files() → UI options
         """
         files = self._file_store.list_files(prefix="reports/")
-        # Strip prefix for cleaner display
-        return [f.replace("reports/", "") for f in files]
+        return _strip_prefix(files, "reports/")
     
     def get_chat_history(self) -> List[Dict[str, Any]]:
         """Retrieve conversation history for current thread.
