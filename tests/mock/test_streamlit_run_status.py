@@ -385,128 +385,188 @@ class TestReportsSelectorRefreshesAfterATurn:
         )
 
 
-def _live_region_harness() -> None:
-    """Script that renders a turn's events through the real live-region code.
+class TestNoDuplicateToolCallsWhileStreaming:
+    """A tool call must be drawn once, not once per renderer.
 
-    A lambda would not do: ``AppTest.from_function`` writes the function to a temp
-    file and execs it standalone, so the enclosing test's locals are invisible.
-    Events come from the importable HARNESS dict instead.
+    Observed live: clicking anything mid-turn produced two identical
+    ``Calling tool: read_file`` blocks, which corrected themselves when the turn
+    finished. Not a checkpointer problem - the stored row had the call exactly once.
+    It was two renderers drawing the same rows:
+
+    - the run persists its rows as events arrive, so a widget interaction made
+      reconciliation pull the turn's *partial* rows into ``chat_messages``;
+    - the normal history render drew them, and the live fragment drew them again.
+
+    So while a run is live the live fragment owns the whole conversation and the
+    normal history render is suppressed.
+
+    Reproduced through a harness with a real checkpointer rather than through the
+    app's own cached mocks, because the duplication needs the partial rows to be
+    *persisted* - reconciliation reads them back from the checkpointer, and an empty
+    one would make the test pass whether or not the bug exists. (An earlier version
+    of this test passed with the fix disabled, which is how that was found.)
     """
-    import streamlit_ui.app as app_module
-    from tests.mock.mock_objects_streamlit import HARNESS
 
-    app_module._render_live_turn(HARNESS["events"])
-
-
-def _render_live(events):
-    from tests.mock.mock_objects_streamlit import HARNESS
-
-    HARNESS.clear()
-    HARNESS["events"] = events
-    return AppTest.from_function(_live_region_harness).run()
-
-
-class TestLiveTurnRendersToolCalls:
-    """The in-flight turn is drawn from the run registry, not from a blocking loop.
-
-    A step counter could only say that *something* happened, which is no help when
-    deciding whether to stop a turn. The live region shows each tool call as it is
-    made, with its result filling in underneath - so "the agent is doing something
-    odd" is visible rather than guessed at.
-    """
+    ROWS = [
+        {"type": "user", "content": "read test 2"},
+        {"type": "tool_call", "name": "read_file",
+         "args": {"file_path": "/context/findings/test_2.txt"},
+         "result": "small test file"},
+    ]
 
     @staticmethod
-    def _pair():
+    def _harness():
+        """Script: a live run whose rows are already persisted, then the chat area."""
+        import streamlit as st
+
+        from tests.mock.mock_objects_streamlit import HARNESS
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        service = HARNESS["service"]
+        thread_id = HARNESS["thread_id"]
+
+        # The in-flight turn, already persisted - this is what a widget click
+        # mid-turn leaves behind.
+        service._checkpointer.put(thread_id, {"messages": HARNESS["rows"]})
+
+        st.session_state.current_thread_id = thread_id
+        st.session_state._service_thread = thread_id
+        if HARNESS["active"]:
+            # A stale revision, so reconciliation rehydrates chat_messages from the
+            # persisted rows - the exact state a mid-turn interaction creates.
+            st.session_state._seen_run_revision = None
+            st.session_state.chat_messages = []
+        else:
+            # Idle: the normal history render owns the transcript, so the rows have
+            # to be in chat_messages for it to draw anything.
+            st.session_state._seen_run_revision = REGISTRY.revision(thread_id)
+            st.session_state.chat_messages = list(HARNESS["rows"])
+
+        import streamlit_ui.app as app_module
+
+        # main()'s order: reconcile first, then render the chat area. The
+        # reconciliation is the step that creates the duplication - without it the
+        # history render has nothing to draw and the test passes whether or not the
+        # bug exists.
+        app_module._reconcile_with_persisted(service)
+        app_module.render_main_chat(service)
+
+    def _drive(self, run_active: bool):
+        from streamlit_ui.services.agent_service import PenTestAgentService
+        from streamlit_ui.services.run_registry import REGISTRY
+        from tests.mock.mock_objects_streamlit import (
+            HARNESS,
+            MockAgentRunner,
+            MockCheckpointer,
+            MockFileStore,
+        )
+
+        cp = MockCheckpointer()
+        runner = MockAgentRunner(delay_seconds=0.0, checkpointer=cp)
+        service = PenTestAgentService(
+            thread_id="th-dup",
+            checkpointer=cp,
+            file_store=MockFileStore(),
+            agent_runner=runner,
+        )
+
+        # Register the run the fragment will read, sharing the same message list
+        # the harness persists.
+        state = REGISTRY.start("th-dup", "read test 2", list(self.ROWS))
+        state.record_event({"type": "tool_call",
+                            "data": {"name": "read_file", "args": {}}})
+        if not run_active:
+            state.finish()
+
+        HARNESS.clear()
+        HARNESS.update({
+            "service": service,
+            "thread_id": "th-dup",
+            "rows": list(self.ROWS),
+            "active": run_active,
+        })
+        return AppTest.from_function(self._harness).run()
+
+    def test_a_mid_turn_interaction_does_not_double_render(self):
+        at = self._drive(run_active=True)
+        labels = " ".join(str(e.label) for e in at.expander)
+        assert labels.count("read_file") == 1, (
+            f"the tool call was rendered more than once: {labels!r}"
+        )
+
+    def test_history_renders_once_when_idle(self):
+        at = self._drive(run_active=False)
+        labels = " ".join(str(e.label) for e in at.expander)
+        assert labels.count("read_file") == 1, (
+            f"rendered {labels.count('read_file')} times when idle: {labels!r}"
+        )
+
+    def test_finished_history_is_not_hidden_while_a_run_is_live(self):
+        """Suppressing the history render must not hide the earlier turns."""
+        from streamlit_ui.services.run_registry import REGISTRY, RunState
+
+        at = AppTest.from_file(APP_PATH).run()
+        thread_id = "th-earlier"
+        at.session_state["current_thread_id"] = thread_id
+
+        rows = [
+            {"type": "user", "content": "first question"},
+            {"type": "assistant", "content": "first answer"},
+            {"type": "user", "content": "second question"},
+        ]
+        state = RunState(thread_id, "second question", rows)
+        state.record_event({"type": "tool_call", "data": {"name": "ls", "args": {}}})
+        REGISTRY.start(thread_id, "second question", rows)
+        REGISTRY.get(thread_id).record_event({"type": "tool_call",
+                                             "data": {"name": "ls", "args": {}}})
+
+        at.session_state["_seen_run_revision"] = None
+        at.session_state["chat_messages"] = []
+        at.run()
+
+        text = " ".join(str(getattr(m, "value", m)) for m in at.markdown)
+        assert "first answer" in text, (
+            f"the earlier turn vanished while a run was live: {text!r}"
+        )
+
+
+class TestStoredHistoryNormalisation:
+    """Partial mode stores tool calls in a role-shaped row; they must still render."""
+
+    def test_role_shaped_tool_call_becomes_a_tool_call_entry(self):
         from streamlit_ui import app as app_module
 
-        return app_module._pair_tool_results
-
-    def test_tool_results_attach_to_their_call_fifo(self):
-        pair = self._pair()
-        rows = pair([
-            {"type": "tool_call", "data": {"name": "ls", "args": {"path": "/"}}},
-            {"type": "tool_call", "data": {"name": "read_file", "args": {"path": "/a"}}},
-            {"type": "tool_result", "data": {"name": "ls", "output": "/"}},
-            {"type": "tool_result", "data": {"name": "read_file", "output": "contents of a"}},
+        out = app_module._history_from_stored([
+            {"role": "user", "content": "read it"},
+            {"role": "assistant", "content": None,
+             "tool_calls": [{"name": "read_file", "args": {"path": "/a"}}]},
         ])
-        assert [r["name"] for r in rows] == ["ls", "read_file"]
-        assert rows[0]["result"] == "/"
-        assert rows[1]["result"] == "contents of a"
+        assert out == [
+            {"type": "user", "content": "read it"},
+            {"type": "tool_call", "name": "read_file", "args": {"path": "/a"}},
+        ], out
 
-    def test_pairing_is_positional_so_live_and_persisted_agree(self):
-        """Pairing is FIFO, not by name - and that is deliberate.
+    def test_a_tool_call_row_keeps_a_following_text_answer(self):
+        from streamlit_ui import app as app_module
 
-        The events carry no call id, and results for parallel tool calls can arrive
-        out of order. The persisted transcript pairs them the same positional way
-        (``RealAgentRunnerAdapter``'s ``_attach_result``), so the live region and the
-        stored history can never disagree about which result belongs to which call.
-        That matters more than being right in the rare interleaved case, because a
-        disagreement is visible as a result jumping between blocks.
-        """
-        pair = self._pair()
-        # Out-of-order: read_file's result arrives first.
-        rows = pair([
-            {"type": "tool_call", "data": {"name": "ls", "args": {}}},
-            {"type": "tool_call", "data": {"name": "read_file", "args": {}}},
-            {"type": "tool_result", "data": {"name": "read_file", "output": "from read_file"}},
+        out = app_module._history_from_stored([
+            {"role": "assistant", "content": "here it is",
+             "tool_calls": [{"name": "read_file", "args": {}}]},
         ])
-        # FIFO puts the first result on the first call, regardless of its name.
-        assert rows[0]["result"] == "from read_file"
-        assert rows[1]["result"] is None
+        assert [e["type"] for e in out] == ["tool_call", "assistant"]
 
-    def test_a_call_awaiting_a_result_stays_empty(self):
-        pair = self._pair()
-        rows = pair([
-            {"type": "tool_call", "data": {"name": "ls", "args": {}}},
-            {"type": "tool_result", "data": {"name": "ls", "output": "done"}},
-            {"type": "tool_call", "data": {"name": "write_file", "args": {}}},
-        ])
-        assert rows[1]["result"] is None, "a pending call must not borrow another's result"
+    def test_a_plain_assistant_row_is_unchanged(self):
+        from streamlit_ui import app as app_module
 
-    def test_message_and_token_events_contribute_no_tool_rows(self):
-        pair = self._pair()
-        rows = pair([
-            {"type": "token", "data": "hel"},
-            {"type": "tool_call", "data": {"name": "ls", "args": {}}},
-            {"type": "message", "data": "the answer"},
-        ])
-        assert len(rows) == 1 and rows[0]["name"] == "ls"
+        out = app_module._history_from_stored([{"role": "assistant", "content": "hi"}])
+        assert out == [{"type": "assistant", "content": "hi"}]
 
-    def test_a_tool_call_with_no_name_still_renders(self):
-        pair = self._pair()
-        rows = pair([{"type": "tool_call", "data": {}}])
-        assert rows[0]["name"] == "tool", "an unnamed call would render as a blank block"
+    def test_structured_rows_pass_through_untouched(self):
+        from streamlit_ui import app as app_module
 
-    def test_live_region_draws_the_calls(self):
-        """The rendered region must actually contain the tool calls.
-
-        render_tool_call draws an expander per call, so the names land in expander
-        labels. Asserting on the pairing helper alone would not catch the region
-        rendering nothing.
-        """
-        at = _render_live([
-            {"type": "tool_call", "data": {"name": "ls", "args": {"path": "/"}}},
-            {"type": "tool_result", "data": {"name": "ls", "output": "/a /b"}},
-            {"type": "tool_call", "data": {"name": "read_file", "args": {"path": "/a"}}},
-        ])
-        labels = " ".join(str(e.label) for e in at.expander)
-        assert "ls" in labels, f"the first call was not drawn: {labels!r}"
-        assert "read_file" in labels, f"the second call was not drawn: {labels!r}"
-        # One assistant bubble holds the in-flight turn.
-        assert len(at.chat_message) == 1
-
-    def test_the_result_reaches_the_rendered_block(self):
-        at = _render_live([
-            {"type": "tool_call", "data": {"name": "ls", "args": {"path": "/"}}},
-            {"type": "tool_result", "data": {"name": "ls", "output": "MARKER_OUTPUT"}},
-        ])
-        body = " ".join(str(getattr(b, "value", "")) for b in at.code)
-        assert "MARKER_OUTPUT" in body, f"the result was not drawn: {body!r}"
-
-    def test_nothing_is_drawn_before_the_first_event(self):
-        at = _render_live([])
-        assert len(at.chat_message) == 0
-        assert len(at.expander) == 0
+        rows = [{"type": "user", "content": "x"},
+                {"type": "tool_call", "name": "ls", "args": {}, "result": "y"}]
+        assert app_module._history_from_stored(rows) == rows
 
 
 class TestReconcileHelper:

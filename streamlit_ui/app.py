@@ -477,7 +477,22 @@ def _history_from_stored(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
         elif m.get("role") == "user":
             normalised.append({"type": "user", "content": m["content"]})
         elif m.get("role") == "assistant":
-            normalised.append({"type": "assistant", "content": m["content"]})
+            # Partial mode records a tool call as an assistant row carrying
+            # `tool_calls`. Without this branch it normalises to an assistant
+            # message with content None, and the call is dropped from the
+            # rendered transcript entirely.
+            calls = m.get("tool_calls") or []
+            if calls:
+                for tc in calls:
+                    normalised.append({
+                        "type": "tool_call",
+                        "name": tc.get("name") or "tool",
+                        "args": tc.get("args", {}),
+                    })
+                if m.get("content"):
+                    normalised.append({"type": "assistant", "content": m["content"]})
+            else:
+                normalised.append({"type": "assistant", "content": m["content"]})
         else:
             normalised.append({"type": "assistant", "content": str(m)})
     return normalised
@@ -486,69 +501,36 @@ def _history_from_stored(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 LIVE_TURN_POLL_SECONDS = 0.4
 
 
-def _pair_tool_results(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Fold ``tool_result`` events onto the tool calls they belong to.
-
-    The agent emits a call and its result as two separate events, so a live render
-    has to pair them the same way the persisted transcript does - oldest call still
-    awaiting a result (FIFO, which matches tool-call execution order). Done here so
-    both the live fragment and the persisted history agree on what belongs together.
-    """
-    rows: List[Dict[str, Any]] = []
-    for event in events:
-        kind = event.get("type")
-        data = event.get("data") or {}
-        if kind == "tool_call":
-            if not isinstance(data, dict):
-                data = {}
-            rows.append({
-                "name": data.get("name") or "tool",
-                "args": data.get("args", {}),
-                "result": None,
-            })
-        elif kind == "tool_result":
-            if not isinstance(data, dict):
-                data = {}
-            for row in rows:
-                if row["result"] is None:
-                    row["result"] = str(data.get("output", ""))
-                    break
-    return rows
-
-
-def _render_live_turn(events: List[Dict[str, Any]]) -> None:
-    """Render an in-flight turn's events into an assistant bubble.
-
-    This is what the agent's progress actually looks like: each tool call appears
-    as it is made, with its result filling in underneath. It replaces the
-    previous step counter, which could only tell you that *something* happened -
-    useless for deciding whether to stop a turn.
-    """
-    rows = _pair_tool_results(events)
-    if not rows:
-        return
-    with st.chat_message("assistant"):
-        for row in rows:
-            render_tool_call(row["name"], row["args"], row["result"] or None)
-
-
 def render_live_turn(service: PenTestAgentService) -> None:
-    """Render the turn in flight, re-reading the run registry on a timer.
+    """Render the conversation while a turn is in flight, re-reading on a timer.
 
     Streamlit has no push channel: a script run is over the moment it returns, and
-    a widget interaction unwinds one mid-turn. So the turn is rendered by a
+    a widget interaction unwinds one mid-turn. So the conversation is drawn by a
     ``st.fragment`` reading the run registry - the one piece of state that outlives
-    a script run. Two consequences worth stating:
+    a script run.
 
-    - Tool calls keep appearing while the user uses the sidebar, and re-attaching
-      after a click is free: the fragment simply picks the run back up.
-    - ``run_every`` is decided when the fragment is created, from whether a run is
-      active. An idle app therefore has no timer running at all. The app forces one
-      rerun after starting a turn precisely so the fragment gets created live.
+    ## One renderer owns the conversation
 
-    On the running -> done edge it forces one full rerun, so the finished turn is
-    folded into the ordinary history by reconciliation and this stops rendering.
-    One-shot, not a loop: the flag driving it is popped on use.
+    While a turn is live, this renders the *whole* transcript - finished turns and
+    the turn in flight - and ``render_main_chat`` suppresses its normal history
+    render. That split is load-bearing. The run persists its rows as events arrive,
+    so a widget interaction mid-turn makes reconciliation pull the turn's partial
+    rows into ``chat_messages``; if the normal history render also ran, those rows
+    would be drawn twice, once from history and once from here. Observed live as a
+    duplicated ``read_file`` block that corrected itself when the turn finished.
+
+    Rendering everything from ``RunState.messages`` rather than from session state
+    also means one source of truth: the same list the run is persisting.
+
+    Tool calls appear as they are made, with their result filling in underneath, so
+    "the agent is doing something odd" is visible rather than inferred.
+
+    ``run_every`` is decided when the fragment is created, from whether a run is
+    active, so an idle app has no timer running at all. The app forces one rerun
+    after starting a turn precisely so the fragment gets created live.
+
+    On the running -> done edge it forces one full rerun, handing rendering back to
+    the normal path. One-shot, not a loop: the flag driving it is popped on use.
     """
     active = service.is_run_active()
 
@@ -559,7 +541,7 @@ def render_live_turn(service: PenTestAgentService) -> None:
 
         if running:
             events = snapshot.get("events", [])
-            _render_live_turn(events)
+            render_chat_history(_history_from_stored(snapshot.get("messages", [])))
             with st.status("Agent is running\u2026", expanded=True):
                 st.caption(
                     f"{len(events)} step(s) so far. The sidebar stays usable \u2014 "
@@ -573,8 +555,8 @@ def render_live_turn(service: PenTestAgentService) -> None:
                         st.info("Stopping. The turn will not be saved as finished.")
         elif st.session_state.pop("_run_was_active", False):
             # The turn ended while this fragment was watching. One full rerun:
-            # reconciliation picks up the finished transcript and the live region
-            # stops rendering, because the run is no longer active.
+            # reconciliation picks up the finished transcript and the normal
+            # history render takes over.
             st.session_state["_seen_run_revision"] = None
             st.rerun()
         st.session_state["_run_was_active"] = running
@@ -593,14 +575,16 @@ def render_main_chat(service: PenTestAgentService) -> None:
         → Render streaming events → Save history
     """
     st.title("💬 Chat with Pen-Test Agent")
-    
-    # Display chat history from the structured event list
-    render_chat_history(
-        _history_from_stored(st.session_state.chat_messages)
-    )
 
-    # The turn in flight, rendered from the run registry. Placed after the
-    # history so finished turns stay above it.
+    # Finished history is rendered here only when nothing is in flight. While a turn
+    # is live, render_live_turn draws the whole conversation instead - including the
+    # finished turns - so the two can never render the same rows and duplicate them.
+    if not service.is_run_active():
+        render_chat_history(
+            _history_from_stored(st.session_state.chat_messages)
+        )
+
+    # The conversation, re-read from the run registry on a timer while a turn runs.
     render_live_turn(service)
     
     # Chat input
