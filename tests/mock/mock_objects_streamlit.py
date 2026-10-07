@@ -46,6 +46,14 @@ these mocks.
 """
 
 from typing import Optional, List, Dict, Any, Iterator, Tuple
+
+# Scratch space for tests that must drive the app through a Streamlit script.
+#
+# ``AppTest.from_function`` writes the function to a temporary file and execs it
+# standalone, so closures and module globals of the *test* module are not visible
+# inside it. The harness imports this module instead, which is importable from
+# anywhere ``pythonpath = ["."]`` applies.
+HARNESS: Dict[str, Any] = {}
 import time
 from streamlit_ui.services.interfaces import (
     CheckpointerProtocol,

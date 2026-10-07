@@ -482,6 +482,49 @@ def _history_from_stored(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return normalised
 
 
+RUN_STATUS_POLL_SECONDS = 1.0
+
+
+def render_run_status(service: PenTestAgentService) -> None:
+    """A live strip that keeps reporting while a turn is in flight.
+
+    Streamlit has no push channel. A script run is over the moment it returns, so
+    "is the agent still working?" cannot be answered by the run that started the
+    work - which is exactly the gap this fills. After an interrupted turn the app
+    used to look completely idle while the agent kept working in the background,
+    because nothing re-rendered to say otherwise.
+
+    The fix is a fragment that re-runs on a timer and reads the run registry -
+    the one piece of state that outlives a script run. It is deliberately cheap
+    when idle: a single in-memory lookup, and it renders nothing.
+
+    When a turn finishes while we are watching, one full rerun is triggered so the
+    result is folded into the ordinary history and the strip disappears. That is a
+    one-shot transition, not a loop: the flag that drives it is popped on use.
+    """
+
+    @st.fragment(run_every=RUN_STATUS_POLL_SECONDS)
+    def _status() -> None:
+        running = service.is_run_active()
+        if running:
+            snapshot = service.active_run_snapshot() or {}
+            steps = len(snapshot.get("events", []))
+            with st.status("Agent is running…", expanded=True):
+                st.caption(
+                    f"{steps} step(s) so far. The sidebar stays usable — this "
+                    "turn keeps going in the background."
+                )
+        elif st.session_state.pop("_run_was_active", False):
+            # The turn ended while this fragment was watching. Force one full
+            # rerun: reconciliation picks up the finished transcript, and the strip
+            # stops rendering because the run is no longer active.
+            st.session_state["_seen_run_revision"] = None
+            st.rerun()
+        st.session_state["_run_was_active"] = running
+
+    _status()
+
+
 def render_main_chat(service: PenTestAgentService) -> None:
     """Render main chat area with message history and input.
     
@@ -498,6 +541,10 @@ def render_main_chat(service: PenTestAgentService) -> None:
     render_chat_history(
         _history_from_stored(st.session_state.chat_messages)
     )
+
+    # Live "agent is running" strip. Rendered after the history so the finished
+    # turns stay above it.
+    render_run_status(service)
     
     # Chat input
     if prompt := st.chat_input("Ask the agent to analyze findings..."):
@@ -612,6 +659,32 @@ def render_main_chat(service: PenTestAgentService) -> None:
             st.rerun()
 
 
+def _reconcile_with_persisted(service: PenTestAgentService) -> None:
+    """Bring ``chat_messages`` up to date with what the agent actually recorded.
+
+    A widget click mid-stream aborts THIS script run, but not the agent turn: the
+    runner keeps streaming on the event-loop thread and keeps persisting. So on
+    the next rerun the persisted conversation is ahead of what this session is
+    holding. The run registry's revision counter says whether that happened,
+    cheaply, without a checkpointer round-trip on every rerun.
+
+    Rehydrating from the checkpointer (rather than patching the in-memory list) is
+    what makes the UI converge on the same transcript the agent recorded, instead
+    of accumulating a second, drifting copy.
+
+    ``main()`` calls this BEFORE ``render_sidebar``. A successful file upload ends
+    in ``st.rerun()`` from inside the sidebar, which unwinds the script before
+    anything placed after the sidebar is reached - so reconciliation placed there
+    would be skipped, and an upload could leave the chat area blank.
+    """
+    if st.session_state.current_thread_id is None:
+        return
+    revision = service.run_revision()
+    if revision != st.session_state.get("_seen_run_revision"):
+        st.session_state.chat_messages = service.get_chat_history()
+        st.session_state._seen_run_revision = revision
+
+
 def main() -> None:
     """Main application entry point.
     
@@ -661,6 +734,10 @@ def main() -> None:
             st.session_state["_session_load_error"] = str(exc)
         service = get_or_create_service(tmp_id)
 
+    # Reconcile against the run that owns the turn, BEFORE the sidebar - see
+    # _reconcile_with_persisted for why the ordering matters.
+    _reconcile_with_persisted(service)
+
     # Render sidebar — its handlers may change the active thread
     render_sidebar(service)
 
@@ -674,23 +751,6 @@ def main() -> None:
         st.session_state.chat_messages = service.get_chat_history()
         st.session_state._service_thread = st.session_state.current_thread_id
         st.session_state._seen_run_revision = service.run_revision()
-
-    # Reconcile against the run that owns the turn.
-    #
-    # A widget click mid-stream aborts THIS script run, but not the agent turn:
-    # the runner keeps streaming on the event-loop thread and keeps persisting.
-    # So on the next rerun the persisted conversation is ahead of what this
-    # session is holding. The registry's revision counter says whether that
-    # happened, cheaply, without a checkpointer round-trip on every rerun.
-    #
-    # Rehydrating from the checkpointer (rather than patching the in-memory list)
-    # is what makes the UI converge on the same transcript the agent recorded,
-    # instead of accumulating a second, drifting copy.
-    if st.session_state.current_thread_id is not None:
-        revision = service.run_revision()
-        if revision != st.session_state.get("_seen_run_revision"):
-            st.session_state.chat_messages = service.get_chat_history()
-            st.session_state._seen_run_revision = revision
 
     # Render UI
     render_main_chat(service)
