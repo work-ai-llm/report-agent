@@ -209,12 +209,20 @@ class TestInterruptedTurnIsNotLost:
 
     def test_second_message_appends_rather_than_replaces(self, writes, monkeypatch):
         """History accumulates across turns in one thread."""
+        from streamlit_ui.services.run_registry import REGISTRY
+
         _slow_runner(0.0, monkeypatch)
         at = AppTest.from_file(APP_PATH).run()
 
         at.chat_input[0].set_value("one").run()
-        at.chat_input[0].set_value("two").run()
         thread_id = at.session_state["current_thread_id"]
+        # Turns are started, not awaited: the script run returns while the agent
+        # keeps going on the registry's thread. Wait for it before asserting on the
+        # transcript, or this reads the seed write only.
+        assert _wait_until(lambda: not REGISTRY.is_running(thread_id))
+
+        at.chat_input[0].set_value("two").run()
+        assert _wait_until(lambda: not REGISTRY.is_running(thread_id))
 
         rows = _persisted_rows(thread_id, writes)
         users = [r["content"] for r in rows if r.get("type") == "user"]
@@ -226,10 +234,13 @@ class TestInterruptedTurnIsNotLost:
 
     def test_tool_results_are_attached_to_their_tool_call(self, writes, monkeypatch):
         """The transcript keeps args + result together (store_cli reads these)."""
-        at = AppTest.from_file(APP_PATH).run()
+        from streamlit_ui.services.run_registry import REGISTRY
+
         _slow_runner(0.0, monkeypatch)
+        at = AppTest.from_file(APP_PATH).run()
         at.chat_input[0].set_value("scan").run()
         thread_id = at.session_state["current_thread_id"]
+        assert _wait_until(lambda: not REGISTRY.is_running(thread_id))
 
         rows = _persisted_rows(thread_id, writes)
         tool_calls = [r for r in rows if r.get("type") == "tool_call"]

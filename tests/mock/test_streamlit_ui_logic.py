@@ -37,17 +37,26 @@ def _isolate_mock_cache():
     Mock dependencies are cached via st.cache_resource and would otherwise
     leak (sessions, uploaded files, seeded report) across AppTest instances
     within the same pytest process.
+
+    The run registry is cleared too. It is a process-wide singleton by design -
+    that is what lets a turn outlive a script run - which means a run left in
+    flight by one test is still "active" for the next one, and the app then
+    refuses the next turn as busy.
     """
+    from streamlit_ui.services.run_registry import REGISTRY
+
     try:
         st.cache_resource.clear()
     except Exception:
         pass
+    REGISTRY.clear()
     os.environ["STREAMLIT_USE_MOCKS"] = "1"
     yield
     try:
         st.cache_resource.clear()
     except Exception:
         pass
+    REGISTRY.clear()
 
 
 class TestAppInitialization:
@@ -285,12 +294,35 @@ class TestIssue2ToolCallsPersist:
 
     def test_tool_calls_remain_after_second_message(self):
         """After a second message, the first assistant turn still has tool calls."""
+        import time
+
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        def _settle(at):
+            """Wait for the started turn to reach a terminal state.
+
+            A turn is now *started*, not awaited: the script run returns while the
+            agent keeps going on the registry's thread, so asserting straight after
+            ``.run()`` would read the transcript before the turn produced anything.
+            """
+            thread_id = at.session_state["current_thread_id"]
+            deadline = time.monotonic() + 15.0
+            while time.monotonic() < deadline:
+                if not REGISTRY.is_running(thread_id):
+                    break
+                time.sleep(0.02)
+            assert not REGISTRY.is_running(thread_id), "turn never finished"
+            at.run()  # reconcile the session against the persisted transcript
+
         at = AppTest.from_file(APP_PATH).run()
         at.chat_input[0].set_value("first").run()
+        _settle(at)
 
         # Send a second message; the first turn must keep its tool calls, and
         # the second turn also emits tool calls (mock always emits them).
         at.chat_input[0].set_value("second").run()
+        _settle(at)
+
         messages = at.session_state["chat_messages"]
         types = [m["type"] for m in messages]
         # First turn: user, tool_call, tool_call, assistant

@@ -129,6 +129,7 @@ import time
 import streamlit as st
 from typing import Optional, Callable, List, Dict, Any
 from streamlit_ui.services.agent_service import PenTestAgentService
+from streamlit_ui.services.run_registry import RunBusyError
 from streamlit_ui.components.chat_display import (
     render_chat_history,
     render_message,
@@ -589,123 +590,47 @@ def render_main_chat(service: PenTestAgentService) -> None:
             )
             return
 
-        # Add user message
+        # Add user message. It is persisted by the runner as part of starting the
+        # turn, so it is durable from this instant rather than from the first event.
         st.session_state.chat_messages.append({"type": "user", "content": prompt})
         render_message("user", prompt)
-        
-        # Stream agent response
-        with st.chat_message("assistant"):
-            # Render tool-call blocks first, then accumulate the final text
-            # below them so the answer text appears underneath the expanders.
-            tool_events: List[Dict[str, Any]] = []
-            full_response = ""
-            # Live token streaming: "token" events arrive per model delta; we
-            # render them into a placeholder with light throttling so long
-            # replies don't re-render Streamlit on every single token.
-            stream_ph: Optional[Any] = None
-            stream_acc = ""
-            flushed_len = 0
-            last_flush = 0.0
 
-            def _flush_stream() -> None:
-                nonlocal flushed_len, last_flush
-                now = time.monotonic()
-                if now - last_flush >= 0.12 or (len(stream_acc) - flushed_len) >= 24:
-                    stream_ph.markdown(f"{stream_acc}▌")
-                    flushed_len = len(stream_acc)
-                    last_flush = now
+        # Start the turn and RETURN. The run lives in the run registry and is driven
+        # by the runner's own thread; progress is read back from the registry by
+        # render_run_status().
+        #
+        # Deliberately not `for event in service.send_message(prompt)`. Blocking the
+        # script run for the whole turn keeps a script run alive long enough for
+        # Streamlit to show its global "app running" widget with a Stop button
+        # (armed after 500ms), and that widget's Stop calls request_script_stop -
+        # the same call a widget click makes internally under runner.fastReruns. A
+        # long-lived script run therefore makes "the user stopped this"
+        # indistinguishable from "the user clicked something", which is why
+        # cancellation has to be an explicit call. It also means any widget
+        # interaction interrupts the display until something else re-renders.
+        try:
+            service.start_turn(prompt)
+        except RunBusyError as busy:
+            st.warning(f"\u23f3 {busy}")
 
-            # Persisting is NOT done here. The agent runner owns the UI-namespace
-            # conversation and writes it from the event-loop thread as events
-            # arrive, so an interrupted script run (a queued rerun unwinds this
-            # stack without warning) costs the rendering of an event but never
-            # the event itself. See services/run_registry.py.
-            # Rows appended below are display-only, for the in-progress turn; a
-            # later rerun reconciles them against the persisted truth.
-            def _save_chat() -> None:
-                """No-op shim retained so the event loop below reads unchanged.
-
-                Deliberately does not persist. The runner already has.
-                """
-                return None
-
-            try:
-                # Process streaming events
-                for event in service.send_message(prompt):
-                    if event["type"] == "tool_call":
-                        name = event["data"]["name"]
-                        args = event["data"]["args"]
-                        entry = {"type": "tool_call", "name": name, "args": args}
-                        tool_events.append(entry)
-                        st.session_state.chat_messages.append(entry)
-                        render_tool_call(name, args)
-                        _save_chat()
-                    elif event["type"] == "tool_result":
-                        name = event["data"].get("name", "")
-                        output = event["data"].get("output", "")
-                        # Attach the result to the oldest tool_call still
-                        # awaiting one (FIFO, matches tool-call execution
-                        # order), so the persisted history keeps args +
-                        # results (store_cli reads them) without breaking
-                        # chat rendering.
-                        for te in tool_events:
-                            if te.get("type") == "tool_call" and "result" not in te:
-                                te["result"] = str(output)
-                                break
-                        if output:
-                            st.caption(f"✅ {name} → {str(output)[:120]}")
-                        _save_chat()
-                    elif event["type"] == "token":
-                        stream_acc += event["data"]
-                        if stream_ph is None:
-                            stream_ph = st.empty()
-                        _flush_stream()
-                    elif event["type"] == "message":
-                        full_response = event["data"]
-                        st.session_state.chat_messages.append({
-                            "type": "assistant",
-                            "content": full_response,
-                        })
-                        if stream_ph is not None:
-                            stream_ph.markdown(full_response or stream_acc)
-                        else:
-                            st.write(full_response)
-                        _save_chat()
-                    elif event["type"] in ("busy", "error"):
-                        # Previously these were dropped on the floor. A refused
-                        # turn and a failed run are both things the user needs to
-                        # see, and neither is persisted into the transcript.
-                        note = str(event.get("data", "Agent run failed."))
-                        icon = "⏳" if event["type"] == "busy" else "⚠️"
-                        if stream_ph is not None:
-                            stream_ph.empty()
-                        st.warning(f"{icon} {note}")
-            except Exception as exc:
-                # Surface run failures instead of silently freezing the chat.
-                note = f"⚠️ Agent run failed: {exc}"
-                st.session_state.chat_messages.append({"type": "assistant", "content": note})
-                if stream_ph is not None:
-                    stream_ph.markdown(note)
-                else:
-                    st.write(note)
-            finally:
-                _save_chat()
-
-        # Rerun once at the end of a turn so the sidebar - which rendered before this
-        # turn ran - reflects it. Two reasons, both requiring the rerun:
+        # Rerun so the sidebar - which rendered before this turn ran - reflects it,
+        # and so reconciliation picks up the user message the runner just persisted.
+        # Two reasons, both needing the rerun:
         #
         # - a brand-new session must show up in the selector immediately, and
         # - a report the agent wrote during the turn must appear in the Reports
         #   selector (#30). Without this the agent narrates "report saved" while the
-        #   UI still reads "No reports available yet", and Download stays disabled
-        #   at exactly the moment the report exists.
+        #   UI still reads "No reports available yet", with Download disabled at
+        #   exactly the moment the report exists.
         #
-        # Gated on the reports list actually changing, because the rerun re-runs
-        # the whole script including list_threads (~0.5s on Postgres) and most
-        # turns write no report.
+        # The reports comparison is a gate, not the whole condition: a turn that
+        # writes no report still needs one rerun, because the status fragment is
+        # created with run_every decided by whether a run is active and would
+        # otherwise be created frozen.
         reports_after = service.list_reports() if service is not None else []
-        if created_session or reports_after != reports_before:
+        if created_session or reports_after != reports_before or service.is_run_active():
             st.rerun()
+
 
 
 def _reconcile_with_persisted(service: PenTestAgentService) -> None:

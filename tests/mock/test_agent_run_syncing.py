@@ -454,6 +454,44 @@ class TestCancellationSemantics:
         ]
 
 
+class TestRevisionMonotonicity:
+    def test_revision_increases_monotonically_across_runs(self):
+        """A thread's revision must never go backwards or repeat.
+
+        This is what the UI's staleness check rests on. It restarted at 0 for every
+        run, so a thread's second turn ended on the same number as its first: the UI
+        compared against the value it had already rendered, saw "nothing changed",
+        and kept a one-turn-stale transcript. Found by a UI test asserting two turns
+        in a row, and only intermittently - it depended on which side of the turn's
+        completion the reconciliation landed.
+        """
+        reg = RunRegistry()
+        assert reg.revision("t") == 0
+
+        first = reg.start("t", "one")
+        first.record_event({"type": "message", "data": "a"})
+        first.finish()
+        after_first = reg.revision("t")
+        assert after_first > 0
+
+        second = reg.start("t", "two")
+        assert reg.revision("t") > after_first, "revision restarted for a new run"
+        second.record_event({"type": "message", "data": "b"})
+        second.finish()
+        assert reg.revision("t") > after_first + 1
+
+    def test_third_run_keeps_climbing(self):
+        reg = RunRegistry()
+        seen = []
+        for i in range(3):
+            state = reg.start("t", f"turn {i}")
+            state.record_event({"type": "message", "data": str(i)})
+            state.finish()
+            seen.append(reg.revision("t"))
+        assert seen == sorted(seen), f"revision went backwards: {seen}"
+        assert len(set(seen)) == 3, f"revision repeated across runs: {seen}"
+
+
 class TestRunStateAndRegistry:
     def test_revision_is_monotonic_and_bumps_on_finish(self):
         reg = RunRegistry()

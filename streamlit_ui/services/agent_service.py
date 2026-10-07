@@ -153,6 +153,46 @@ class PenTestAgentService:
         # Strip prefix for cleaner display
         return [f.replace("findings/", "") for f in files]
     
+    def start_turn(self, message: str) -> Dict[str, Any]:
+        """Begin a turn and return immediately. Never blocks on the agent.
+
+        This is what the UI uses. The alternative - iterating
+        :meth:`send_message` inside the Streamlit script run - keeps a script run
+        alive for the whole turn, which has two costs that only became visible
+        once the run registry existed:
+
+        1. Streamlit shows its global "app running" widget with a Stop button once
+           a script run has been going for 500ms, and that widget's Stop calls
+           ``request_script_stop`` - the *same* call a widget click makes
+           internally under ``runner.fastReruns``. Having a long-lived script run
+           therefore makes "the user stopped this" indistinguishable from "the
+           user clicked something", which is why cancellation has to be explicit.
+        2. Any widget interaction queues a rerun, which unwinds the script run
+           mid-turn. Nothing is lost (the run persists itself), but the display
+           stops until something triggers another render.
+
+        Starting the turn and returning leaves the script run short, so neither
+        applies. The turn's progress is read from the run registry instead.
+
+        Args:
+            message: User input message.
+
+        Returns:
+            A snapshot dict of the new run.
+
+        Raises:
+            RunBusyError: a turn for this thread is already in flight. Callers
+                should check :meth:`is_run_active` first; this is the backstop.
+        """
+        if getattr(self._agent_runner, "supports_polling", None) and self._agent_runner.supports_polling():
+            state = self._agent_runner.start(message, self._thread_id)
+            return state.snapshot()
+        # A runner with no registry support has to be driven synchronously, or
+        # there is nothing to read progress from.
+        for _event in self.send_message(message):
+            pass
+        return {}
+
     def send_message(self, message: str) -> Iterator[Dict[str, Any]]:
         """Send a message to the agent and stream events back.
         

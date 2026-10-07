@@ -92,7 +92,13 @@ class RunState:
     and :meth:`snapshot`.
     """
 
-    def __init__(self, thread_id: str, message: str, messages: Optional[List[Dict[str, Any]]] = None) -> None:
+    def __init__(
+        self,
+        thread_id: str,
+        message: str,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        revision: int = 0,
+    ) -> None:
         self.run_id: str = uuid.uuid4().hex
         self.thread_id: str = thread_id
         self.message: str = message
@@ -107,12 +113,18 @@ class RunState:
         self.events: List[Dict[str, Any]] = []
         self.status: str = RUNNING
         self.error: Optional[str] = None
+        # Starts above zero for a thread's second and later runs - see
+        # RunRegistry.start. The UI compares this against the value it last
+        # rendered to decide whether its view is stale, so it must increase
+        # monotonically for the life of the thread. Restarting each run at 0
+        # means a second turn ends on the same number as the first, the UI sees
+        # "nothing changed", and silently keeps a one-turn-stale transcript.
+        self._revision: int = revision
         # Set by request_cancel(). The producer checks it at its next checkpoint
         # and unwinds. Cooperative rather than an asyncio task cancellation,
         # because the producer is mid-`astream` and a bare cancel can leave the
         # LangGraph checkpointer mid-step.
         self.cancel_requested: bool = False
-        self._revision: int = 0
         # The Future returned by EventLoopThread.schedule, when there is one.
         # Cancelling it propagates CancelledError into the coroutine *at its await
         # point* - which for the real agent is inside its own astream generator,
@@ -245,13 +257,19 @@ class RunRegistry:
                 exception for why two concurrent turns on one thread corrupt the
                 transcript rather than merely confusing the UI.
         """
-        state = RunState(thread_id, message, messages)
         with self._lock:
             current = self._runs.get(thread_id)
             if current is not None and current.is_running:
                 raise RunBusyError(
                     f"a turn for thread {thread_id!r} is already running"
                 )
+            state = RunState(
+                thread_id,
+                message,
+                messages,
+                # Carry the thread's revision forward so it only ever increases.
+                revision=(current.revision + 1) if current is not None else 0,
+            )
             self._runs[thread_id] = state
         return state
 
