@@ -12,7 +12,7 @@ Commit dates and short SHAs are given so any entry can be traced back.
 
 ## [Unreleased]
 
-After the initial agent (2026-08-28 → 2026-10-03).
+After the initial agent (2026-08-28 → 2026-10-05).
 
 ### Added
 
@@ -30,7 +30,8 @@ After the initial agent (2026-08-28 → 2026-10-03).
   starts, stating whether the checkpointer, virtual filesystem store, LLM API,
   agent object, and observability are actually connected. (2026-10-02)
 - **Module launcher** — `python -m streamlit_ui` with `--backend`, `--agent`,
-  `--debug`, and `--streaming` flags that translate to env vars. (2026-10-02)
+  `--llm-backend`, `--debug`, and `--streaming` flags that translate to env vars.
+  (2026-10-02; `--llm-backend` 2026-10-05, `fd8279b`)
 - **Full-lifecycle A2A client** — one `A2AClient` covering send, streaming send,
   subscribe, get, list, cancel, and polling, plus a CLI wrapping all of it.
   (2026-09-24, `ccd8f66`, PR #10)
@@ -46,7 +47,24 @@ After the initial agent (2026-08-28 → 2026-10-03).
   (2026-09-16, `0ed358f`)
 - **Docs** — PR conventions and a three-paragraph PR template (`CONTRIBUTING.md`,
   2026-09-08); `AGENTS.md` as the orientation and trap reference for agents
-  (2026-10-03).
+  (2026-10-03); a reorganised `docs/` with one job per document, a routing table
+  from change type to document, and a troubleshooting section seeded from real
+  incidents (2026-10-05).
+
+### Security
+
+- **The A2A server no longer binds every network interface by default.** The bind
+  is now a two-way `--host` flag: `local` (the default) binds `127.0.0.1`, so the
+  port is reachable only from the host, and `all_interfaces` restores the previous
+  `0.0.0.0` behaviour, which is also what survives a Wi-Fi IP change. A specific
+  address is set with `A2A_BIND` rather than being a third flag value, since
+  pinning one interface gives up the IP-change resilience. The agent card's
+  advertised URL is derived from the bind, because the client sends every JSON-RPC
+  call to the address in the card rather than to the address it was pointed at —
+  previously the two could not disagree only because the wildcard bind happened to
+  cover whatever was advertised. There is still no authentication on the endpoint
+  and every caller shares one task-store owner, so the server says so on startup
+  when it is bound widely. (#32, #38)
 
 ### Changed
 
@@ -58,6 +76,39 @@ After the initial agent (2026-08-28 → 2026-10-03).
 
 ### Fixed
 
+- **Stopping a Streamlit run did not cancel the in-flight agent stream.** The
+  handle from `schedule()` was discarded and the consumer blocked on
+  `events.get()` with no cleanup, so pressing Stop — which closes the generator —
+  left the agent streaming to completion on the event loop. The handle is now
+  cancelled in a `finally`, and a cancelled run deliberately emits no final
+  message rather than writing state for a turn the user stopped.
+  (2026-10-07, #39)
+- **Every Langfuse generation reported zero tokens.** `langchain-openai` only
+  auto-enables `stream_usage` for the default OpenAI base URL, and this project
+  always passes an explicit `base_url`, so the server was never asked for a usage
+  chunk. Now set explicitly on the `ChatOpenAI` branch. (2026-10-05, `82d26ff`)
+- **A rotated API key required a manual `.env` edit *and* a process restart.** The
+  credential is now re-read from the `.env` file on an auth failure and patched
+  onto the live clients, so editing `.env` under a running server is enough. Also
+  corrects `on_failure`, which was set to a value that does not re-raise — a dead
+  key reached the agent as model-authored text instead of an exception.
+  (2026-10-05, `235118a`, #13)
+- **The A2A CLI printed Python tracebacks for ordinary outcomes.** A protocol
+  refusal is now one `[server] <ErrorType>: <message>` line with a hint naming the
+  command to use instead, and Ctrl-C is one disconnect line exiting 130. (2026-10-05,
+  `36cd107`, `629e4a7`, #33, #34)
+- **The `--debug` banner asserted components were connected without probing
+  them**, and named `MISTRAL_API_KEY` regardless of backend. It now reports
+  `not probed` when there is nothing to probe, and the real path names the
+  resolved backend. (2026-10-05, `2d56539`)
+- **Copying `.env.example` verbatim crashed at startup** — `LLM_API_KEY=` is
+  present-but-empty, and `os.getenv`'s default only fires when the variable is
+  absent. Absent, empty and whitespace-only now all resolve to `"none"`.
+  (2026-10-05, `5136e96`)
+- **A stale model override from another backend beat the selected backend's
+  default**, producing a provider 404 mid-conversation. `LLM_MODEL` is deleted and
+  defaults moved to a table; a cross-backend leftover is now reported at startup.
+  (2026-10-05, `aa3b886`, #21)
 - Bytecode is no longer tracked in git. (2026-09-25, `d2d2046`)
 - A duplicated function definition was removed from the agent runtime. (2026-10-03,
   `232244a`)
@@ -70,16 +121,17 @@ After the initial agent (2026-08-28 → 2026-10-03).
 
 Open and documented; see the milestone board for the full picture.
 
-- LLM backend switching is env surgery rather than a UI control — the selector UX
-  is the blocker. (#21)
-- Langfuse shows one trace per model call instead of one per turn, because no
-  session id reaches the agent invocation. (#22)
-- The OpenRouter backend emits no per-request HTTP log, unlike the local backend.
-  (#24)
 - Live token streaming is not implemented; the `--streaming` flag is inert and the
   answer arrives whole. (#17, #19)
 - Interacting with the UI mid-stream can drop the in-flight turn. (#20)
-- Rotating the model-server key requires a manual `.env` edit and an A2A restart. (#13)
+- A sidebar selector for the LLM backend is not built. Switching backend is now a
+  `--llm-backend` flag rather than an `.env` edit, so this is convenience rather
+  than necessity — and the process-wide cache would make a per-user dropdown
+  unsafe until it is keyed by backend. (#21)
+- The A2A server has no authentication. Loopback-only by default, but
+  `--host all_interfaces` exposes an unauthenticated agent to the network.
+- `aiosqlite` is imported by production code and was not declared in
+  `pyproject.toml`; it resolved transitively. (2026-10-05, now pinned)
 
 ## [0.1.0]
 

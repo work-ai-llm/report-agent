@@ -418,6 +418,9 @@ class RealAgentRunnerAdapter:
         events: "queue.Queue[Any]" = queue.Queue()
         sentinel = object()
         final_parts: List[str] = []
+        # Set when the consumer abandons this run, so the finally block can tell
+        # "stopped by the user" apart from "finished".
+        cancelled = False
         config = {
             "configurable": {"thread_id": thread_id, "checkpoint_ns": ""},
             # Langfuse reads this at the chain root and propagates it to every
@@ -515,6 +518,7 @@ class RealAgentRunnerAdapter:
                         yield from inner
 
         async def _consume() -> None:
+            nonlocal cancelled
             start = time.monotonic()
             def _ts() -> str:
                 return f"{time.monotonic() - start:.1f}s"
@@ -553,6 +557,14 @@ class RealAgentRunnerAdapter:
                     for chunk in _iter_messages(update):
                         _handle_chunk(chunk)
                 _print(f"[AGENT STREAM]: astream loop finished at t={_ts()} total_updates={_updates}")
+            except asyncio.CancelledError:
+                # The consumer went away (Streamlit's Stop closes the generator
+                # this is feeding). Re-raise so the task ends cancelled, and set
+                # the flag so the finally block does not treat an abandoned run
+                # as a completed one.
+                cancelled = True
+                _print(f"[AGENT STREAM]: cancelled by the consumer at t={_ts()}")
+                raise
             except Exception as exc:  # noqa: BLE001 - surface to UI consumer
                 _print(f"[AGENT ERROR]: t={_ts()} {type(exc).__name__}: {exc}")
                 import traceback
@@ -560,7 +572,12 @@ class RealAgentRunnerAdapter:
                 events.put({"type": "error", "data": f"{type(exc).__name__}: {exc}"})
             finally:
                 _print(f"[AGENT STREAM]: finally block at t={_ts()}")
-                if final_parts:
+                if cancelled:
+                    # An abandoned run must not emit a final answer or fall back
+                    # to the checkpointer. Doing either writes state for a turn
+                    # the user stopped, which then shows up in the session list.
+                    _print("[AGENT STREAM]: skipping final message for a cancelled run")
+                elif final_parts:
                     text = "".join(final_parts)
                     events.put({"type": "message", "data": text})
                     _print(f"[AGENT RESPONSE]: {text}")
@@ -586,13 +603,26 @@ class RealAgentRunnerAdapter:
                         _print(f"[AGENT STREAM]: checkpointer fallback failed: {exc}")
                 events.put(sentinel)
 
-        self._runner.schedule(_consume())
-
-        while True:
-            item = events.get()
-            if item is sentinel:
-                break
-            yield item
+        # Hold on to the handle. EventLoopThread.schedule returns a
+        # concurrent.futures.Future, and cancelling it DOES propagate to the
+        # asyncio task even after the coroutine has started (verified on 3.11),
+        # which is what makes the finally below able to stop work in flight.
+        #
+        # This has to be a try/finally, not a bare call: abandoning this
+        # generator is exactly what happens when Streamlit's Stop button ends a
+        # script run, and without this the agent stream keeps running to
+        # completion after the UI has moved on.
+        handle = self._runner.schedule(_consume())
+        try:
+            while True:
+                item = events.get()
+                if item is sentinel:
+                    break
+                yield item
+        finally:
+            # Normal completion has already put the sentinel, so the task is
+            # done and this cancel() is a no-op returning False.
+            handle.cancel()
 
 
 # ---------------------------------------------------------------------------

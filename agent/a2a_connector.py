@@ -2,6 +2,7 @@ import sys
 import asyncio
 import os
 import socket
+import argparse
 
 # NOTE, this fix loop creation for postgres async connection ONLY if you make "uvicorn<0.36.0"
 if sys.platform == "win32":
@@ -350,6 +351,57 @@ async def lifespan(app: Starlette):
 # ==========================================
 # 2. Setup and Run the A2A Server
 # ==========================================
+# Bind presets. Only two, because those are the only two decisions anyone
+# actually makes: keep it on this machine, or open it up. `local` is the default:
+# the socket listens on loopback, so the port is not reachable from the LAN or
+# the tailnet. `all_interfaces` is the previous hardcoded behaviour and widens the
+# socket to every NIC at once - loopback, Wi-Fi, Tailscale, Ethernet, any VPN -
+# which means every peer on those networks can reach it.
+#
+# A specific address is deliberately NOT a third choice on the flag: pinning one
+# interface stops the server surviving a Wi-Fi IP change, which is the thing
+# all_interfaces exists to buy, and that trade deserves a deliberate edit rather
+# than a word on the command line. Set A2A_BIND when you need it.
+BIND_LOCAL = "127.0.0.1"
+BIND_ALL_INTERFACES = "0.0.0.0"
+_BIND_CHOICES = {
+    "local": BIND_LOCAL,
+    "all_interfaces": BIND_ALL_INTERFACES,
+}
+
+
+def _resolve_bind(argv=None) -> str:
+    """Resolve the socket bind address. Defaults to loopback.
+
+    ``A2A_BIND`` overrides the preset when set, which is the escape hatch for
+    pinning a specific interface. Flag and env disagreeing is resolved in favour
+    of the env var, so a machine that needs a custom address does not have to
+    remember the flag on every invocation.
+
+    Split from argument parsing, and read-only with respect to the environment,
+    so the precedence and the default can be asserted in the mock suite without
+    opening a socket.
+    """
+    parser = argparse.ArgumentParser(
+        prog="python agent/a2a_connector.py",
+        description="Run the A2A pentest report-agent server.",
+    )
+    parser.add_argument(
+        "--host",
+        choices=sorted(_BIND_CHOICES),
+        default="local",
+        help=(
+            "local (default) binds 127.0.0.1, reachable only from this machine. "
+            "all_interfaces binds 0.0.0.0, reachable from the LAN and the "
+            "tailnet, and survives a Wi-Fi IP change. For any other address, set "
+            "the A2A_BIND env var instead (that pins one interface, so it will "
+            "not survive an IP change). No authentication either way."
+        ),
+    )
+    preset = _BIND_CHOICES[parser.parse_args(argv).host]
+    return (os.getenv("A2A_BIND") or "").strip() or preset
+
+
 def _resolve_lan_ip() -> str:
     """LAN IP to advertise in the agent card.
 
@@ -370,7 +422,34 @@ def _resolve_lan_ip() -> str:
         return "127.0.0.1"
 
 
-def main():
+def _resolve_advertised_ip(bind: str) -> str:
+    """The address to put in the agent card, derived from where we actually listen.
+
+    This has to track the bind rather than being computed independently, because
+    the client does not POST to the address it was pointed at. ``A2AClient``
+    resolves the card from ``--server`` and then sends every JSON-RPC call to the
+    URL *inside that card* (a2a ``ClientFactory.create`` ->
+    ``JsonRpcTransport.url``). So if the card advertises an address the socket is
+    not listening on, the card fetch succeeds and then every subsequent call
+    fails with connection refused.
+
+    Under the old hardcoded ``0.0.0.0`` bind that could not happen: listening on
+    every interface happened to cover whatever the auto-detect advertised. Change
+    the bind without changing this, and it starts happening.
+    """
+    if bind == BIND_LOCAL:
+        # Loopback bind means the card must say loopback, whatever A2A_HOST says.
+        return BIND_LOCAL
+    if bind == BIND_ALL_INTERFACES:
+        # The one case needing a real answer: many interfaces are covered, so
+        # A2A_HOST (or auto-detect) decides which one we name.
+        return _resolve_lan_ip()
+    # A specific interface is the only address the socket is on, so it is the
+    # only correct thing to advertise. A2A_HOST does not apply here.
+    return bind
+
+
+def main(argv=None):
 
     # Define the agent's skills (capabilities)
     skill = AgentSkill(
@@ -383,10 +462,14 @@ def main():
         examples=['Generate a report from the uploaded findings.', 'Analyze the attached port scan results.'],
     )
 
-    # Bind address: configurable via A2A_HOST/A2A_PORT, auto-detected by default.
-    # The socket binds 0.0.0.0 (all interfaces) so Wi-Fi IP changes can't break
-    # startup; LOCAL_IP is only what we advertise in the agent card.
-    LOCAL_IP = _resolve_lan_ip()
+    # Socket bind and advertised card URL are decided together, from one place.
+    # Two env vars, one job each: A2A_BIND is the socket, A2A_HOST is only the IP
+    # advertised in the card under all_interfaces. A2A_HOST deliberately does not
+    # control the socket, because overloading it would make an existing deployment
+    # that set A2A_HOST start binding that one specific IP and lose the Wi-Fi
+    # resilience the all-interfaces bind exists to provide.
+    BIND = _resolve_bind(argv)
+    LOCAL_IP = _resolve_advertised_ip(BIND)
     PORT = int(os.getenv("A2A_PORT", "9999"))
     
     # Define the public-facing Agent Card
@@ -425,12 +508,25 @@ def main():
 
     app = Starlette(routes=routes, lifespan=lifespan)
 
-    print(f"A2A Server running at http://{LOCAL_IP}:{PORT} (listening on 0.0.0.0:{PORT})")
+    wide_open = BIND == BIND_ALL_INTERFACES
+    print(f"A2A Server bound to {BIND}:{PORT}")
+    print(
+        f"  reachable from: {'the LAN and the tailnet' if wide_open else 'this machine only'}"
+    )
     print(f"Agent Card available at: http://{LOCAL_IP}:{PORT}/.well-known/agent-card.json")
+    if wide_open:
+        # Worth saying out loud: the segment this server appears in argues that
+        # execution is serialised to control cost, and that argument quietly
+        # assumes nobody else can submit a task. On this bind they can.
+        print(
+            "  WARNING: there is no authentication on this endpoint. Anyone who can "
+            "reach it can submit tasks and spend the provider quota, and every "
+            "caller shares one task-store owner. Use --host local unless you "
+            "specifically need remote access."
+        )
 
-    # Bind all interfaces so the server survives Wi-Fi/IP changes;
-    # clients can use the advertised LAN IP or 127.0.0.1 locally.
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    # Bind exactly what was asked for; the card above already reflects it.
+    uvicorn.run(app, host=BIND, port=PORT)
 
 if __name__ == "__main__":
     main()

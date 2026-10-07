@@ -28,6 +28,11 @@ How to use it (run from the repo root ``report agent/``):
 
 Server address: ``--server`` flag, else ``A2A_SERVER_URL`` env,
 else ``http://127.0.0.1:9999``.
+
+Exit codes: ``0`` success, ``1`` a protocol-level error reported by the server
+(printed as one ``[server] <ErrorType>: <message>`` line, with a hint naming the
+command to use instead where one applies), ``2`` bad usage from argparse,
+``130`` Ctrl-C (the client disconnected; the server keeps working).
 """
 
 import argparse
@@ -46,6 +51,7 @@ if sys.platform == "win32":
 from client.a2a_client import A2AClient
 from a2a.types.a2a_pb2 import TaskState
 from a2a.helpers import get_message_text
+from a2a.utils.errors import A2AError
 
 DEFAULT_SERVER = "http://127.0.0.1:9999"
 
@@ -103,6 +109,39 @@ def _print_task_full(task):
             if text:
                 print(f"  --- artifact ({len(text)} chars) ---")
                 print(f"    {text[:500]}")
+
+
+# A protocol refusal is an answer, not a crash.
+#
+# The server rejecting `subscribe` on a finished task is correct behaviour, and
+# it arrives as an A2AError carrying a one-line explanation. Letting it escape
+# main() printed a full traceback for it, so a routine refusal filled the
+# terminal with a stack trace and the actual message was easy to miss.
+#
+# These hints go one step further and name the command that would have worked,
+# because "that operation is not supported" on its own does not tell you what
+# to do next. Two error types are listed because the SDK has used both for the
+# terminal-state refusal - UnsupportedOperationError is the documented one, but
+# a2a-sdk 1.1.0 answers with InvalidParamsError, so keying on only the
+# documented name would leave the common case without a hint.
+_TERMINAL_STATE_HINT = (
+    "subscribe only works while the task is live; "
+    "use `get --task <task_id>` to collect a finished one"
+)
+
+_A2A_ERROR_HINTS = {
+    ("subscribe", "UnsupportedOperationError"): _TERMINAL_STATE_HINT,
+    ("subscribe", "InvalidParamsError"): _TERMINAL_STATE_HINT,
+}
+
+
+def _report_a2a_error(exc: A2AError, command: str) -> None:
+    """Print a protocol error as one line, plus a hint where one applies."""
+    # str(exc) is the server's message; A2AError.__str__ returns it verbatim.
+    print(f"[server] {type(exc).__name__}: {exc}", file=sys.stderr)
+    hint = _A2A_ERROR_HINTS.get((command, type(exc).__name__))
+    if hint:
+        print(f"hint: {hint}", file=sys.stderr)
 
 
 async def _make_client(server_url):
@@ -235,7 +274,25 @@ def main():
     p_poll.set_defaults(func=cmd_poll)
 
     args = parser.parse_args()
-    asyncio.run(args.func(args))
+    try:
+        asyncio.run(args.func(args))
+    except KeyboardInterrupt:
+        # Ctrl-C is a disconnect, not a crash. The server needs no change here:
+        # on client disconnect the SDK's producer task is independent of the HTTP
+        # request and a background consumer keeps persisting events, so the work
+        # continues. Only the client-side rendering was wrong.
+        #
+        # The message states that property rather than leaving it implied, since
+        # a bare "disconnected" reads like the work was cancelled. Exit 130 is
+        # the conventional shell code for SIGINT.
+        print("[client disconnected - the server keeps working]", file=sys.stderr)
+        raise SystemExit(130) from None
+    except A2AError as exc:
+        # Exit 1: the command failed, but for a reported reason rather than a
+        # crash. `from None` because the traceback of the A2AError itself is
+        # exactly what this handler exists to avoid printing.
+        _report_a2a_error(exc, args.command)
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":
