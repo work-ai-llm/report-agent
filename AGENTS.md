@@ -108,8 +108,18 @@ Break one of these and you lose data silently, not loudly.
   `{"source": "ui"}`. Writing UI rows into `""` wipes the agent's own state.
 - **Store keys are slash-prefixed.** Virtual filesystem entries live in namespace
   `("filesystem",)` with keys like `/findings/nmap.txt` and values shaped
-  `{"content": str, "encoding": "utf-8"}`. The UI and the agent must agree exactly
-  or uploads become invisible to the agent.
+  `{"content": str, "encoding": "utf-8", "created_at": iso, "modified_at": iso}`.
+  The UI and the agent must agree exactly or uploads become invisible to the
+  agent.
+- **The two store timestamps are load-bearing, not decoration.** `deepagents`
+  builds them in `create_file_data` for anything the agent writes, but its
+  `glob`/`grep` reach `file_data["modified_at"]` with a *bare subscript*
+  (`_glob_search_files` in `deepagents/backends/utils.py`) while the reader that
+  produced the dict guards the same key. A row missing `modified_at` therefore
+  raises `KeyError: 'modified_at'` **out of the tool**, which kills the turn
+  instead of returning an error the model can react to — the UI then shows
+  nothing at all, because error events carry no row to render. Any writer here
+  must set both fields or `glob` breaks on that file.
 - **The agent's filesystem is two backends, and the second one is not
   persisted.** The filesystem is a composite: `/context/` is routed to the store,
   and every other path — the `/scratchpad/` the agent drafts into — goes to an

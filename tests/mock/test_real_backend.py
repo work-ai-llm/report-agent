@@ -10,6 +10,7 @@ import os
 import tempfile
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -109,6 +110,28 @@ class TestRealFileStoreAdapter:
         # ...and never under the old slash-less key (the UI bug being fixed).
         legacy = writer.run(runtime.store.aget(rb._NAMESPACE, "reports/r.md"))
         assert legacy is None
+
+    def test_stored_value_carries_the_timestamps_glob_requires(self, backend):
+        """A UI upload must be shaped exactly like an agent-written file.
+
+        deepagents builds store values with ``create_file_data``, which sets
+        ``created_at`` and ``modified_at``. Its ``glob``/``grep`` read
+        ``file_data["modified_at"]`` with a bare subscript, so a row without it
+        raises KeyError out of the tool and kills the turn rather than returning
+        an error the model can react to. Uploads that omit the timestamps
+        therefore break ``glob`` for every file the operator has uploaded.
+        """
+        runner, runtime = backend
+        fs = rb.RealFileStoreAdapter(runner, runtime.store)
+        fs.write_file("findings/test_2.txt", b"small test file")
+
+        item = runner.run(runtime.store.aget(rb._NAMESPACE, "/findings/test_2.txt"))
+        assert item is not None
+        for field in ("content", "encoding", "created_at", "modified_at"):
+            assert field in item.value, f"store row is missing {field!r}"
+        # ISO 8601, as deepagents writes them.
+        datetime.fromisoformat(item.value["created_at"])
+        datetime.fromisoformat(item.value["modified_at"])
 
     def test_read_missing_returns_none(self, backend):
         runner, runtime = backend

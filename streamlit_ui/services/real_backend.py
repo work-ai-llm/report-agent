@@ -37,9 +37,19 @@ touching the agent's rows. ``list_threads`` scans all namespaces and
 
 Files live in namespace ``("filesystem",)`` as v2 values, the exact format the
 real agent's ``FilesystemMiddleware`` (deepagents ``StoreBackend``) writes:
-``{"content": <str>, "encoding": "utf-8"}``. Keys are paths like
-``findings/nmap.txt`` / ``reports/report.md``, so files the agent later writes
-appear in the UI and vice versa.
+``{"content": <str>, "encoding": "utf-8", "created_at": <iso>,
+"modified_at": <iso>}``. Keys are paths like ``findings/nmap.txt`` /
+``reports/report.md``, so files the agent later writes appear in the UI and vice
+versa.
+
+The two timestamps are **not optional**. deepagents builds them in
+``create_file_data`` for anything the agent writes, but its ``glob`` and ``grep``
+reach ``file_data["modified_at"]`` with a bare subscript
+(``deepagents/backends/utils.py``, ``_glob_search_files``) while the reader that
+produced the dict guards the same key. A row without the field therefore raises
+``KeyError: 'modified_at'`` out of the tool, which kills the turn instead of
+returning an error the model can react to. UI uploads have to carry the same
+fields the agent does, or ``glob`` breaks on every uploaded file.
 
 ## Debug printing of agent output
 
@@ -377,7 +387,15 @@ class RealFileStoreAdapter:
         return text.encode("utf-8")
 
     def write_file(self, path: str, content: bytes) -> None:
-        value = {"content": self._to_text(content), "encoding": "utf-8"}
+        # Timestamps are required, not decoration - see "File store format".
+        # Written as one value so the row is never observed half-formed.
+        now = datetime.now(timezone.utc).isoformat()
+        value = {
+            "content": self._to_text(content),
+            "encoding": "utf-8",
+            "created_at": now,
+            "modified_at": now,
+        }
 
         async def _write() -> None:
             await self._store.aput(_NAMESPACE, self._key(path), value)
