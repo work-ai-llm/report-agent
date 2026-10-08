@@ -87,10 +87,19 @@ leftover. A mismatch the heuristic cannot see is left to the provider.
 
 Assembled in `_init_middleware`, in this order:
 
-1. **`FilesystemMiddleware`** (always) — backs the virtual filesystem.
-2. **`LLMToolEmulator`** (only when `debug_mode=True`) — intercepts
+1. **`SkillsMiddleware`** (always) — injects the skill library's `name` +
+   `description` into the system message. Progressive disclosure: the workflow
+   body is not in the prompt, the agent pulls it with `read_file` on
+   `/skills/<name>/SKILL.md` when it decides the skill applies.
+2. **`FilesystemMiddleware`** (always) — backs the virtual filesystem.
+3. **`LLMToolEmulator`** (only when `debug_mode=True`) — intercepts
    `export_report_to_local_disk` and answers it from `llm_small`.
-3. **`CredentialRefreshRetryMiddleware`** (always) — see below.
+4. **`CredentialRefreshRetryMiddleware`** (always) — see below.
+
+Skills are gated by their `description`, not by the system prompt: a skill that
+says "skip for small reports" is skipped, and the agent is expected to say so
+rather than load it. `agent/reports.md` carries only a pointer to the skill, not
+the workflow it holds.
 
 #### `CredentialRefreshRetryMiddleware`
 
@@ -139,12 +148,30 @@ Two namespaces matter:
 Writing UI rows into `""` destroys the agent's own state. This is the single
 most destructive mistake available in the codebase.
 
+The virtual filesystem is a `CompositeBackend` with three routes, so one
+filesystem tool serves three different stores:
+
+| Path | Backend | Holds |
+|---|---|---|
+| `/context/` | store-backed, `("filesystem",)` | templates, guides, findings, compiled reports |
+| `/skills/` | real disk (`agent/skills/`) | `SKILL.md` files |
+| everything else | in-memory, per session | the `/scratchpad/` drafts |
+
+Route matching strips the prefix before the store lookup, so the agent's
+`/context/findings/x.txt` is the store key `/findings/x.txt`. That is why
+`dev_tools/store_cli.py seed --dir <dir>` produces keys relative to `<dir>`: seed
+a directory that *contains* `findings/` and the keys line up with what the agent
+asks for.
+
 ### Tools
 
 - Filesystem tools (`ls`, `read_file`, `write_file`) come from
   `FilesystemMiddleware`, not from hand-written definitions.
 - `export_report_to_local_disk` is the one real tool, defined in
   `report_agent.py`. It pulls a compiled report out of the store onto local disk.
+- Skills are files on disk, reached through the same `read_file` tool at
+  `/skills/<name>/SKILL.md`. Editing a `SKILL.md` changes agent behaviour with no
+  code change and no restart.
 
 ### Observability
 

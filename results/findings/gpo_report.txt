@@ -1,0 +1,7 @@
+GPO enumeration - CORP.LOCAL (Default Domain Policy)
+Minimum password length: 8 characters
+Password complexity: NOT enabled
+Password reuse: NOT restricted
+Account lockout threshold: NOT configured (consistent with the auth log review)
+Users with 'Password Not Required': svc_report
+Kerberos policy: AES128 allowed, DES encryption enabled (weak)

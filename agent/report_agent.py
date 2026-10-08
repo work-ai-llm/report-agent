@@ -22,8 +22,8 @@ from psycopg.rows import dict_row
 # NEW IMPORTS for Persistent Virtual Filesystem
 from langgraph.store.postgres import PostgresStore, AsyncPostgresStore
 from langgraph.store.sqlite.aio import AsyncSqliteStore
-from deepagents.middleware import FilesystemMiddleware
-from deepagents.backends import CompositeBackend, StateBackend, StoreBackend
+from deepagents.middleware import FilesystemMiddleware, SkillsMiddleware
+from deepagents.backends import CompositeBackend, FilesystemBackend, StateBackend, StoreBackend
 from langchain_core.rate_limiters import InMemoryRateLimiter
 from langchain.agents.middleware._retry import calculate_delay, should_retry_exception
 from langchain.agents.middleware import LLMToolEmulator, ModelRetryMiddleware
@@ -295,6 +295,11 @@ CONTEXT_DIR = Path(__file__).parent / "context"
 
 sys_prompt_path = Path(__file__).parent / "reports.md"
 
+# Skills library: each subdirectory holds a skill (agent/skills/<skill-name>/SKILL.md).
+# The skills middleware exposes these via progressive disclosure, and the virtual
+# filesystem routes /skills/ to this directory on the real disk.
+SKILLS_DIR = Path(__file__).parent / "skills"
+
 # Local SQLite fallback (single file, two tables inside - same pattern as Postgres)
 # Overridable via REPORT_AGENT_DB_PATH so tests/experiments can use a temp file.
 LOCAL_DB_PATH = Path(os.environ.get("REPORT_AGENT_DB_PATH", str(Path(__file__).parent / "agent_session.db")))
@@ -369,6 +374,7 @@ class AgentRuntime:
         self.langfuse_ok = False
         self.system_prompt_text = None
         self.fs_middleware = None
+        self.skills_middleware = None
         self.llm = None
         self.llm_small = None
         # Which backend _init_llm resolved. Set there, not here; declared so the
@@ -618,25 +624,40 @@ class AgentRuntime:
 
     def _init_middleware(self):
         """Configure middleware ONLY (LLMs are created in ``_init_llm``)."""
+        # Backend shared by the filesystem middleware and the skills middleware.
+        # - /context/  -> persistent Store (templates, interpretations, findings, reports)
+        # - /skills/   -> real local disk (SKILL.md skill definitions)
+        # - everything else -> ephemeral StateBackend (/scratchpad/)
+        composite_backend = CompositeBackend(
+            default=StateBackend(),
+            routes={
+                "/context/": StoreBackend(namespace=lambda ctx: ("filesystem",), file_format="v2"),
+                "/skills/": FilesystemBackend(root_dir=SKILLS_DIR, virtual_mode=True),
+            },
+        )
+
         # Configure the Filesystem Middleware
-        # - /context/ is saved to Postgres (persistent, shared across agents)
-        # - /scratchpad/ stays in memory (ephemeral, for agent's temporary notes)
         self.fs_middleware = FilesystemMiddleware(
-            backend=CompositeBackend(
-                default=StateBackend(),
-                # FIX: Explicitly define the namespace to resolve the deprecation warning
-                routes={"/context/": StoreBackend(namespace=lambda ctx: ("filesystem",), file_format="v2")}
-                ),
+            backend=composite_backend,
             system_prompt=(
                 "You have access to a persistent virtual filesystem. "
                 "Use 'ls' to explore directories like '/context/templates/' or '/context/interpretations/' "
-                "to discover available phases. Use 'read_file' to retrieve the exact content you need."
+                "to discover available phases. Use 'read_file' to retrieve the exact content you need. "
+                "Skills live under '/skills/'."
             ),
             custom_tool_descriptions={
                 "ls": "List files and directories. Use this to discover what phases (e.g., recon, enum, exploitation) are available in '/context/'.",
-                "read_file": "Read the full contents of a file. Use this to get templates or interpretation guides.",
+                "read_file": "Read the full contents of a file. Use this to get templates, interpretation guides, or skill instructions.",
                 "write_file": "Write a new file. Useful for saving drafts in '/scratchpad/draft.md' before finalizing.",
             }
+        )
+
+        # Skills middleware: progressive disclosure of the agent's skills library.
+        # Only name+description of each skill is injected into the system prompt;
+        # the agent reads the full SKILL.md via read_file on demand.
+        self.skills_middleware = SkillsMiddleware(
+            backend=composite_backend,
+            sources=[("/skills/", "Report Agent")],
         )
         
         # Rate limiter - constructed, deliberately NOT wired into any model.
@@ -902,9 +923,10 @@ class AgentRuntime:
           - LLMToolEmulator: included ONLY when ``debug_mode`` is enabled.
           - retry_middleware: always included (model request retries).
         """
-        middleware = [self.fs_middleware, self.retry_middleware]
+        middleware = [self.skills_middleware, self.fs_middleware] if self.skills_middleware is not None else [self.fs_middleware]
         if debug_mode and self.tool_emulator is not None:
             middleware.insert(1, self.tool_emulator)
+        middleware.append(self.retry_middleware)
         
         self.agent = create_agent(
             model=self.llm,

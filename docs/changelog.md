@@ -16,6 +16,21 @@ After the initial agent (2026-08-28 → 2026-10-05).
 
 ### Added
 
+- **`report-generation` skill** - the report workflow now ships as a skill
+  (`agent/skills/report-generation/SKILL.md`) instead of living in the system
+  prompt. Only the skill's `name` and `description` are injected; the agent pulls
+  the workflow with `read_file` when it decides the skill applies, and says it is
+  skipping the skill when it does not. Gated to larger reports by its own
+  `description` - the gate is a sentence in the skill, not code.
+- **`/skills/` filesystem route** - the virtual filesystem gained a third route,
+  to real disk, so editing a `SKILL.md` changes agent behaviour with no code
+  change and no restart.
+- **Cross-check phase in the skill** - before assembly, every source file's
+  distinctive evidence is checked against the drafted sections and gaps are fixed.
+- **Skill behaviour experiment** (`tests/experiments/skill_gate_behavior.py`) -
+  runs the agent with and without the skill against a known ground truth and
+  scores fact retention and invented tokens. Its finding fixtures in
+  `results/findings/` are synthetic.
 - **Streamlit UI** — full chat application with session selector, findings upload,
   report download, and delete. Supports three run modes: full real agent, real
   persistence with a mock agent, and a fully in-memory mock sandbox. (2026-10-02,
