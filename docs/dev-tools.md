@@ -34,7 +34,7 @@ python dev_tools/store_cli.py [--sqlite] <command>
 | `wipe` | Empties the filesystem namespace |
 | `inspect` | Lists what is in it |
 | `list-sessions` | Every `thread_id` in the checkpointer |
-| `inspect-session --thread-id ID` | Full conversation history for one session |
+| `inspect-session --thread-id ID` | Full conversation history for one session, including a one-line summary of each message's reasoning (`--full-reasoning` prints it all) |
 | `export --key K --out F` | Writes a store entry to a local file |
 | `delete --key K` | Removes one entry |
 | `reconcile-files` | Normalises keys to the agent's slash-prefixed form |

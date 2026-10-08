@@ -206,7 +206,7 @@ async def list_sessions():
         import traceback
         traceback.print_exc()
 
-async def inspect_session_store(thread_id: str, last_n: int = 0):
+async def inspect_session_store(thread_id: str, last_n: int = 0, full_reasoning: bool = False):
     if last_n and last_n > 0:
         print(f"(showing last {last_n} message(s) — full history stays in the checkpointer)")
     print(f"Inspecting session state for thread_id: '{thread_id}'...")
@@ -278,6 +278,15 @@ async def inspect_session_store(thread_id: str, last_n: int = 0):
                     tool_calls = getattr(m, 'tool_calls', None)
                     tool_call_id = getattr(m, 'tool_call_id', None)
                     name = getattr(m, 'name', None)
+                # Model reasoning, where the backend surfaced any. The local
+                # backend needs ReasoningChatOpenAI to keep the field at all
+                # (#18); OpenRouter's client extracts it itself. Collapsed by
+                # default because it is routinely longer than the answer.
+                reasoning = ''
+                if isinstance(m, dict):
+                    reasoning = (m.get('additional_kwargs') or {}).get('reasoning_content') or ''
+                else:
+                    reasoning = (getattr(m, 'additional_kwargs', None) or {}).get('reasoning_content') or ''
                 # Format content
                 if isinstance(content, list):
                     parts = []
@@ -298,6 +307,16 @@ async def inspect_session_store(thread_id: str, last_n: int = 0):
                 print(f"\n--- Message {idx} [{mtype}] ---")
                 if name:
                     print(f"  name: {name}")
+                if isinstance(reasoning, str) and reasoning.strip():
+                    lines = reasoning.strip().splitlines()
+                    if full_reasoning:
+                        print(f"  reasoning ({len(reasoning)} chars, {len(lines)} lines):")
+                        for rl in lines:
+                            print(f"    {rl}")
+                    else:
+                        print(f"  reasoning ({len(reasoning)} chars, {len(lines)} lines): {lines[0]}")
+                        if len(lines) > 1:
+                            print("    ... use --full-reasoning to print it all")
                 if tool_call_id:
                     print(f"  tool_call_id: {tool_call_id}")
                 # Flat UI format carries args/result directly on the dict
@@ -447,6 +466,7 @@ Examples:
     p_session = subparsers.add_parser("inspect-session", help="Inspect full session history from checkpointer")
     p_session.add_argument("--thread-id", type=str, required=True, help="The thread_id (context_id) of the session")
     p_session.add_argument("--tail", type=int, default=0, help="Show only the last N messages (0 = all)")
+    p_session.add_argument("--full-reasoning", action="store_true", help="Print each message's full reasoning instead of a one-line summary");
     p_session.add_argument("--out", type=Path, default=None, help="Also write full output to this file (for long threads that overflow the cmd window)")
 
     p_reconcile = subparsers.add_parser("reconcile-files", help="Normalize filesystem keys to the agent's /slash form")
@@ -477,14 +497,14 @@ Examples:
             buf = io.StringIO()
             import contextlib
             with contextlib.redirect_stdout(buf):
-                await inspect_session_store(args.thread_id, last_n=args.tail)
+                await inspect_session_store(args.thread_id, last_n=args.tail, full_reasoning=args.full_reasoning)
             text = buf.getvalue()
             args.out.parent.mkdir(parents=True, exist_ok=True)
             args.out.write_text(text, encoding="utf-8")
             print(text)
             print(f"(full output also saved to {args.out.absolute()})")
         else:
-            await inspect_session_store(args.thread_id, last_n=args.tail)
+            await inspect_session_store(args.thread_id, last_n=args.tail, full_reasoning=args.full_reasoning)
     elif args.command == "reconcile-files":
         await reconcile_files()
     else:

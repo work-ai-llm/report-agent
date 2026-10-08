@@ -102,6 +102,19 @@ After the initial agent (2026-08-28 → 2026-10-05).
 
 ### Fixed
 
+- **Uploading a finding through the UI broke `glob` for the rest of the session.**
+  UI uploads stored `{content, encoding}`, while deepagents' `create_file_data`
+  adds `created_at` and `modified_at`. Its `glob`/`grep` read
+  `file_data["modified_at"]` with a bare subscript, so any uploaded file raised
+  `KeyError: 'modified_at'` out of the tool - which kills the turn instead of
+  returning an error the model can react to, and shows nothing in the chat
+  because error events carry no row to render. Uploads now carry the same
+  fields the agent writes. Files already uploaded before this still need a
+  backfill. (#29)
+- **`store_cli inspect-session` never showed model reasoning.** The field is in
+  `additional_kwargs` and the renderer only printed `content` and `tool_calls`,
+  so reasoning looked absent from the checkpointer when it was stored the whole
+  time. Now summarised per message, with `--full-reasoning` to print it. (#18)
 - **Model reasoning was discarded before anything could display it.** The local
   backend's chat model was `langchain_openai`'s `ChatOpenAI`, whose SSE parser
   is written against the OpenAI API spec and reads five delta keys - `id`,
