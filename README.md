@@ -141,7 +141,7 @@ backend, so switching `LLM_BACKEND` switches the model with it.
 pytest              # mock suite only — no services, no keys, ~35s
 ```
 
-Two suites, deliberately separate:
+Two suites and a set of experiments, deliberately separate:
 
 - **Mock** — `pytest`. The fast inner loop and the gate for UI and adapter
   changes. This is what CI should run.
@@ -151,6 +151,13 @@ Two suites, deliberately separate:
   ```bash
   pytest tests/acceptance/5_report_agent_structure.py
   ```
+
+- **Experiment** — `tests/experiments/` scripts, run manually by path. The
+  finding files in `results/findings/` that feed them are **synthetic data**,
+  written by hand so fact retention can be measured against a known ground
+  truth: fake domain, RFC 1918 and RFC 5737 addresses, invented share and file
+  names. They are not engagement output, and nothing should be inferred about a
+  real target from them.
 
 Bare `pytest` collects only `tests/mock/test_*.py`. The numbered acceptance
 scripts do not match pytest's discovery patterns and are never run automatically.

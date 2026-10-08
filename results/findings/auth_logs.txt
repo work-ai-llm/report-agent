@@ -1,0 +1,9 @@
+Windows Event Log review - RDP logons to 192.168.1.50 (xrdp) + VPN concentrator
+4625 failed logon events in last 14 days:
+  638 attempts from 203.0.113.42 (external) targeting account 'svc_backup'
+  91 attempts from 192.168.1.77 (internal jump host) targeting 'jdoe'
+  Account lockout threshold: NOT configured (no lockout observed in 14 days)
+4624 successful logon (type 10, RemoteInteractive) for 'svc_backup' from
+  203.0.113.42 after attempt #571
+Suspicious: successful interactive logon from the same external host that failed 571 times
+VPN log: user 'jdoe' authenticated from 198.51.100.9 at 03:12, never seen before

@@ -1,0 +1,12 @@
+smbclient enumeration - 192.168.1.50 (Ubuntu, Samba smbd 4.11.6)
+Share: IPC$       (remote IPC, no access)
+Share: ADMIN$     (remote admin, no access)
+Share: C$         (remote admin, no access)
+Share: public     READ for Everyone (anonymous) - 37 files
+                 (org_chart.pdf, welcome.docx, vpn-guide.pdf)
+Share: payroll    READ/WRITE for 'svc_backup' - 118 files
+                 (salaries_2026.xlsx, bonuses.xlsx, payroll_runlist.csv)
+Share: corp_backups READ for 'svc_backup' - 4 files, 1.4 GB total
+                 (ntds.dit.bak from 2026-06-28, GPO_backup.zip, SYSVOL.tar.gz)
+Anonymous session established as user 'nobody' - no password required.
+Note: svc_backup holds SeBackupPrivilege, so this account can read the backup set.

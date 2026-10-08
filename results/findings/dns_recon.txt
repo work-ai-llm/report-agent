@@ -1,0 +1,10 @@
+dig @192.168.1.51 axfr corp.local - zone transfer ALLOWED (unauthenticated)
+  corp.local. SOA ns1.corp.local. admin.corp.local. (2026091801 3600 900 604800 3600)
+  corp.local. NS ns1.corp.local.
+  corp.local. A 192.168.1.51
+  dc01.corp.local. A 192.168.1.51
+  fileserver.corp.local. A 192.168.1.50
+  vpn.corp.local. A 192.168.1.52
+  Serial 2026091801 - last updated 2026-09-18
+Recursion enabled on 192.168.1.53 (secondary DNS) - allows UDP amplification
+Version string: BIND 9.11.3 (Ubuntu)

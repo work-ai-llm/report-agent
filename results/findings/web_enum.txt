@@ -1,0 +1,9 @@
+Web app 192.168.1.50:80 (Apache httpd 2.4.41, Ubuntu)
+  /server-status - mod_status exposed to unauthenticated users (?auto refresh)
+  /backup/       - directory listing enabled, serves old tarballs
+  TRACE method enabled on / and /index.html
+  X-Powered-By: PHP/7.4.33 disclosed
+  /timesheet/    - internal timesheet v3.1, default credentials admin:timesheet WORKED
+  CVE-2021-26691 (Apache mod_session buffer overflow) - server appears vulnerable
+  No WAF, no HSTS header, session cookies without Secure flag
+  Port 443 not configured - plain HTTP only
