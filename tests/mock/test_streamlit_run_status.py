@@ -530,6 +530,114 @@ class TestNoDuplicateToolCallsWhileStreaming:
         )
 
 
+class TestTokenStreamRendersWhileRunning:
+    """Streamed assistant text must be visible before the turn finishes.
+
+    The run coalesces token deltas into ``in_flight_text`` and clears it when the
+    ``message`` event carries the finished answer. Both halves matter:
+
+    - live text has to be rendered from that buffer, not from the token events -
+      the event log has one entry per delta, and the history renderer's fallback
+      branch turns anything unrecognised into its own chat bubble, so a
+      per-event render would emit one bubble per token;
+    - the buffer has to be cleared by the final message, or the finished answer
+      is drawn twice: once live and once from the persisted transcript.
+
+    Driven through a real checkpointer because reconciliation reads the persisted
+    rows back, and the finished-turn case needs them to actually be there.
+    """
+
+    ROWS = [{"type": "user", "content": "scan the host"}]
+    ANSWER = "Scanned. One host up."
+
+    @staticmethod
+    def _harness():
+        """Script: a live run mid-token, then the chat area."""
+        import streamlit as st
+
+        from streamlit_ui.services.run_registry import REGISTRY
+        from tests.mock.mock_objects_streamlit import HARNESS
+
+        service = HARNESS["service"]
+        thread_id = HARNESS["thread_id"]
+
+        # Persist the finished rows the transcript should end up holding.
+        service._checkpointer.put(thread_id, {"messages": list(HARNESS["rows"])})
+
+        st.session_state.current_thread_id = thread_id
+        st.session_state._service_thread = thread_id
+        # Stale revision, so reconciliation rehydrates - the state a mid-turn
+        # interaction creates.
+        st.session_state._seen_run_revision = None
+        st.session_state.chat_messages = []
+
+        # Seeded with the history from *before* this turn, as the real adapter
+        # does. Seeding it with the answer as well would put the assistant row in
+        # the run twice, once from the seed and once from the final message.
+        state = REGISTRY.start(thread_id, "scan the host", list(HARNESS["pre_rows"]))
+        for delta in HARNESS["deltas"]:
+            state.record_event({"type": "token", "data": delta})
+        if HARNESS["finished"]:
+            state.record_event({"type": "message", "data": HARNESS["answer"]},
+                               [{"type": "assistant", "content": HARNESS["answer"]}])
+            state.finish()
+
+        import streamlit_ui.app as app_module
+
+        app_module._reconcile_with_persisted(service)
+        app_module.render_main_chat(service)
+
+    def _drive(self, deltas, finished: bool):
+        from streamlit_ui.services.agent_service import PenTestAgentService
+        from tests.mock.mock_objects_streamlit import (
+            HARNESS,
+            MockAgentRunner,
+            MockCheckpointer,
+            MockFileStore,
+        )
+
+        rows = list(self.ROWS)
+        if finished:
+            rows.append({"type": "assistant", "content": self.ANSWER})
+
+        service = PenTestAgentService(
+            thread_id="th-token",
+            checkpointer=MockCheckpointer(),
+            file_store=MockFileStore(),
+            agent_runner=MockAgentRunner(),
+        )
+        HARNESS.clear()
+        HARNESS.update({
+            "service": service,
+            "thread_id": "th-token",
+            "rows": rows,
+            "pre_rows": list(self.ROWS),
+            "deltas": list(deltas),
+            "finished": finished,
+            "answer": self.ANSWER,
+        })
+        return AppTest.from_function(self._harness).run()
+
+    def test_partial_tokens_are_visible_while_the_turn_runs(self):
+        at = self._drive(["Scanned", ". One host up."], finished=False)
+        text = " ".join(str(m.value) for m in at.markdown)
+        assert "Scanned" in text, f"streamed text not rendered: {text!r}"
+
+    def test_finished_answer_is_not_drawn_twice(self):
+        """One answer, drawn by one renderer.
+
+        A finished run hands rendering back to the normal history path, so the
+        live region must not keep claiming the text as well. The buffer-clearing
+        invariant itself is unit-tested against ``RunState`` - here the live
+        region is not rendered at all once the run is terminal.
+        """
+        at = self._drive(["Scanned", ". One host up."], finished=True)
+        text = " ".join(str(m.value) for m in at.markdown)
+        assert text.count("Scanned") == 1, (
+            f"the answer was rendered more than once: {text!r}"
+        )
+
+
 class TestStoredHistoryNormalisation:
     """Partial mode stores tool calls in a role-shaped row; they must still render."""
 

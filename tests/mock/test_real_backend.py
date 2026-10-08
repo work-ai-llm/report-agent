@@ -214,9 +214,11 @@ class TestRealAgentRunnerAdapter:
             self._chunks = chunks
             self._exc = exc
             self.calls = []
+            self.versions = []
 
-        async def astream(self, stream_input, config=None, stream_mode=None):
+        async def astream(self, stream_input, config=None, stream_mode=None, version=None):
             self.calls.append((stream_input, config, stream_mode))
+            self.versions.append(version)
             if self._exc is not None:
                 raise self._exc
             for batch in self._chunks:
@@ -253,10 +255,68 @@ class TestRealAgentRunnerAdapter:
         assert events[-1]["data"] == "Scan complete."
         stream_input, config, stream_mode = agent.calls[0]
         assert stream_input == {"messages": [{"role": "user", "content": "scan target"}]}
-        assert stream_mode is None
+        assert stream_mode == ["messages", "updates"]
+        assert agent.versions == ["v2"]
         assert config["configurable"]["thread_id"] == "th1"
         assert config["configurable"]["checkpoint_ns"] == ""
         assert config["metadata"]["langfuse_session_id"] == "th1"
+
+    def test_v2_stream_parts_dispatch_on_their_own_type(self, backend, monkeypatch):
+        """v2 StreamParts are routed by ``type``, so one stream yields both.
+
+        This is the shape LangGraph emits for
+        ``stream_mode=["messages", "updates"], version="v2"``: the same item
+        carries its mode name. The v1 format multiplexes the same two channels
+        into naked ``(mode, payload)`` tuples, which is what made both channels
+        undiscriminable before.
+        """
+        from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            {"type": "updates", "ns": (), "data": {"agent": {"messages": [AIMessage(
+                content="",
+                tool_calls=[{"name": "nmap_scan", "args": {"target": "10.0.0.1"},
+                             "id": "c1", "type": "tool_call"}])]}}},
+            {"type": "updates", "ns": (), "data": {"agent": {"messages": [ToolMessage(
+                content="80/tcp open", tool_call_id="c1", name="nmap_scan")]}}},
+            {"type": "messages", "ns": (),
+             "data": (AIMessageChunk(content="Scan"), {"langgraph_node": "model"})},
+            # A reasoning-heavy local model emits many chunks whose text is empty.
+            {"type": "messages", "ns": (),
+             "data": (AIMessageChunk(content=""), {"langgraph_node": "model"})},
+            {"type": "messages", "ns": (),
+             "data": (AIMessageChunk(content=" complete."), {"langgraph_node": "model"})},
+            {"type": "updates", "ns": (), "data": {"agent": {"messages": [AIMessage(
+                content="Scan complete.")]}}},
+        ])
+        events = self._events(backend, agent, "scan target", "th-v2")
+        assert [e["type"] for e in events] == [
+            "tool_call", "tool_result", "token", "token", "message",
+        ]
+        assert [e["data"] for e in events if e["type"] == "token"] == ["Scan", " complete."]
+        assert events[-1]["data"] == "Scan complete."
+        assert agent.versions == ["v2"]
+
+    def test_tool_result_on_the_messages_channel_is_not_read_as_assistant_text(
+        self, backend, monkeypatch
+    ):
+        """A ``ToolMessage`` also arrives on the messages channel.
+
+        Its ``content_blocks`` carry a ``text`` block, so a consumer that did not
+        check the message type would emit the tool's output as assistant prose -
+        drawn once as the tool result and again as the agent talking.
+        """
+        from langchain_core.messages import ToolMessage
+
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            {"type": "messages", "ns": (), "data": (ToolMessage(
+                content="80/tcp open", tool_call_id="c1", name="nmap_scan"),
+                {"langgraph_node": "tools"})},
+        ])
+        events = self._events(backend, agent, "scan target", "th-toolmsg")
+        assert [e for e in events if e["type"] == "token"] == []
 
     def test_handles_top_level_messages_and_serialized_dicts(self, backend, monkeypatch):
         monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
@@ -508,7 +568,7 @@ class TestRunCancellation:
             self.started = threading.Event()
             self.stopped = False
 
-        async def astream(self, stream_input, config=None, stream_mode=None):
+        async def astream(self, stream_input, config=None, stream_mode=None, version=None):
             self.started.set()
             try:
                 yield {"messages": [self._chunk]}

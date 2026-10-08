@@ -111,6 +111,13 @@ class RunState:
         # gets persisted, so the adapter and the UI never disagree about it.
         self.messages: List[Dict[str, Any]] = list(messages or [])
         self.events: List[Dict[str, Any]] = []
+        # Assistant text for the turn in flight, coalesced from ``token`` events.
+        # Held separately from ``messages`` because the completed assistant row is
+        # only known when the model node ends - without this the live view would
+        # show nothing until the whole answer had been produced. Cleared by the
+        # ``message`` event that carries the finished text, so the live region
+        # and the transcript cannot both claim the same words.
+        self.in_flight_text: str = ""
         self.status: str = RUNNING
         self.error: Optional[str] = None
         # Starts above zero for a thread's second and later runs - see
@@ -166,6 +173,10 @@ class RunState:
     ) -> None:
         """Record one streamed event plus the message rows it contributes.
 
+        ``token`` and ``message`` also maintain :attr:`in_flight_text`, so the
+        live view stays in step with the event log from a single write path -
+        the mock adapter emits the same event types and gets it for free.
+
         Args:
             event: The UI event dict (``tool_call`` / ``tool_result`` / ``token``
                 / ``message`` / ``error``).
@@ -175,6 +186,15 @@ class RunState:
         """
         with self._lock:
             self.events.append(event)
+            event_type = event.get("type")
+            if event_type == "token":
+                data = event.get("data")
+                if isinstance(data, str):
+                    self.in_flight_text += data
+            elif event_type == "message":
+                # The finished answer is now in ``messages``; the live region
+                # must stop claiming it or the text renders twice.
+                self.in_flight_text = ""
             if additions:
                 self.messages.extend(additions)
             self._revision += 1
@@ -227,6 +247,7 @@ class RunState:
                 "revision": self._revision,
                 "events": list(self.events),
                 "messages": list(self.messages),
+                "in_flight_text": self.in_flight_text,
             }
 
 

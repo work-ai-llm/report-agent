@@ -544,6 +544,11 @@ def render_live_turn(service: PenTestAgentService) -> None:
     Tool calls appear as they are made, with their result filling in underneath, so
     "the agent is doing something odd" is visible rather than inferred.
 
+Assistant text streams in from ``RunState.in_flight_text``, which the run coalesces
+from token deltas. That buffer is cleared by the ``message`` event carrying the
+finished answer, so the live region and the persisted transcript never both claim
+the same words.
+
     ``run_every`` is decided when the fragment is created, from whether a run is
     active, so an idle app has no timer running at all. The app forces one rerun
     after starting a turn precisely so the fragment gets created live.
@@ -561,6 +566,13 @@ def render_live_turn(service: PenTestAgentService) -> None:
         if running:
             events = snapshot.get("events", [])
             render_chat_history(_history_from_stored(snapshot.get("messages", [])))
+            in_flight = snapshot.get("in_flight_text") or ""
+            if in_flight.strip():
+                # Token deltas, coalesced by the run. Rendered from that buffer
+                # rather than from the token events: the log holds one entry per
+                # delta, so replaying it would rebuild the same string on every
+                # poll, and one chat bubble per token downstream.
+                render_message("assistant", in_flight)
             with st.status("Agent is running\u2026", expanded=True):
                 st.caption(
                     f"{len(events)} step(s) so far. The sidebar stays usable \u2014 "

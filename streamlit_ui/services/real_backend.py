@@ -444,6 +444,60 @@ def _copy_rows(rows: List[Any]) -> List[Any]:
     return [dict(r) if isinstance(r, dict) else r for r in rows]
 
 
+# LangChain normalises provider-specific reasoning onto these content-block
+# types. Listed so the streaming loop recognises them; see ``_streamed_text``.
+_REASONING_BLOCK_TYPES = frozenset({"reasoning", "thinking"})
+
+
+def _classify_part(part: Any) -> Tuple[str, Any]:
+    """Map one stream item onto ``(mode, payload)``.
+
+    With ``version="v2"`` every item is a ``StreamPart`` dict carrying its own
+    mode name in ``type``, which removes the ambiguity that made the v1 format
+    unusable here: v1 multiplexes a list of modes into naked ``(mode, payload)``
+    tuples, so a consumer that unpacks every 2-tuple as ``(chunk, metadata)``
+    reads the mode *name* as the chunk and drops both channels.
+
+    Untyped items are still accepted as node-diffs, and a bare
+    ``(chunk, metadata)`` pair as the messages channel, so a graph that ignores
+    the requested stream mode degrades to the previous behaviour instead of
+    rendering nothing.
+    """
+    if isinstance(part, dict):
+        mode = part.get("type")
+        if mode in ("messages", "updates"):
+            return mode, part["data"]
+        return "updates", part
+    if isinstance(part, tuple) and len(part) == 2:
+        return "messages", part
+    return "updates", part
+
+
+def _streamed_text(token: Any) -> Iterator[str]:
+    """Yield the visible-text deltas carried by one message-stream chunk.
+
+    Reads ``content_blocks`` rather than ``.text`` so every provider's reasoning
+    arrives on the same normalised block types. Empty blocks are skipped: a
+    reasoning-heavy local model emits a large majority of chunks whose text is
+    the empty string, and emitting those would flood the live view with blanks.
+    """
+    for block in getattr(token, "content_blocks", None) or []:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            text = block.get("text") or ""
+            if text:
+                yield text
+        elif block_type in _REASONING_BLOCK_TYPES:
+            # Seam for #18. Recognised so the loop does not change shape when
+            # reasoning lands, but deliberately not emitted: the model layer
+            # drops the field before it reaches here, so there is nothing to
+            # stream yet. Whether it needs its own buffer or renders inline is
+            # the reasoning branch's call, not this one's.
+            continue
+
+
 class RealAgentRunnerAdapter:
     """Adapt ``runtime.agent`` to ``AgentRunnerProtocol``.
 
@@ -813,18 +867,15 @@ class RealAgentRunnerAdapter:
             stopped_by_user = False
             try:
                 _print(f"[AGENT STREAM]: calling astream() at t={_ts()}")
-                # NOTE: stream_mode=["messages","updates"] was tried for live
-                # token streaming but the langchain create_agent + middleware
-                # graph only yields (str, metadata) tuples on the messages
-                # channel (no dict updates at all), so structured events
-                # (tool_call / tool_result / the final message) never arrive.
-                # Plain node-diff streaming works: dict updates drive the UI
-                # events and the final message. Live token deltas would need a
-                # graph/middleware that also emits structured node outputs.
-                astream_iter = self._agent.astream(stream_input, config=config)
+                astream_iter = self._agent.astream(
+                    stream_input,
+                    config=config,
+                    stream_mode=["messages", "updates"],
+                    version="v2",
+                )
                 _print(f"[AGENT STREAM]: astream() returned iterator at t={_ts()}, type={type(astream_iter).__name__}")
                 _print(f"[AGENT STREAM]: entering async for loop at t={_ts()}")
-                async for update in astream_iter:
+                async for part in astream_iter:
                     # Explicit stop. Raising CancelledError rather than just
                     # `break`ing matters: breaking out of an `async for` does not
                     # close the generator, so the agent's own astream would keep
@@ -837,20 +888,25 @@ class RealAgentRunnerAdapter:
                         _print(f"[AGENT STREAM]: stop requested by the user at t={_ts()}")
                         raise asyncio.CancelledError()
                     _updates += 1
-                    if isinstance(update, tuple) and len(update) == 2:
-                        # (AIMessageChunk, metadata) from the "messages" channel.
-                        message_chunk, _meta = update
-                        if isinstance(message_chunk, AIMessageChunk):
-                            delta = getattr(message_chunk, "content", "")
-                            if isinstance(delta, str) and delta:
-                                _emit({"type": "token", "data": delta})
+                    kind, payload = _classify_part(part)
+                    if kind == "messages":
+                        # The messages channel carries token deltas. Only assistant
+                        # chunks are read: a ToolMessage also arrives here, and
+                        # letting its text through would render tool output as
+                        # assistant prose on top of the tool_result event.
+                        token = payload[0]
+                        if isinstance(token, AIMessageChunk):
+                            for text in _streamed_text(token):
+                                _emit({"type": "token", "data": text})
+                        continue
+                    if kind != "updates":
                         continue
                     _print(
                         f"[AGENT STREAM]: update#{_updates} t={_ts()} "
-                        f"keys={list(update) if isinstance(update, dict) else type(update).__name__}"
+                        f"keys={list(payload) if isinstance(payload, dict) else type(payload).__name__}"
                     )
                     before = state.revision
-                    for chunk in _iter_messages(update):
+                    for chunk in _iter_messages(payload):
                         _handle_chunk(chunk)
                     # Persist on the loop thread, right after the batch. This is
                     # the write that used to live in the script thread's

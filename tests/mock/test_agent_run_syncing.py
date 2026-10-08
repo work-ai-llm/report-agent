@@ -103,7 +103,7 @@ class _SlowAgent:
         self._gap = gap_seconds
         self.astream_calls = 0
 
-    async def astream(self, stream_input, config=None, stream_mode=None):
+    async def astream(self, stream_input, config=None, stream_mode=None, version=None):
         from langchain_core.messages import AIMessage, ToolMessage
 
         self.astream_calls += 1
@@ -584,6 +584,28 @@ class TestRunStateAndRegistry:
         state.record_event({"type": "token", "data": "llo"})
         assert state.messages == []
         assert len(state.events) == 2
+
+    def test_tokens_coalesce_into_the_in_flight_buffer(self):
+        """One string, not one entry per delta - the fragment re-reads it whole."""
+        state = RunState("t", "hi")
+        for delta in ("Scan", "ned", " cleanly."):
+            state.record_event({"type": "token", "data": delta})
+        assert state.snapshot()["in_flight_text"] == "Scanned cleanly."
+
+    def test_the_final_message_empties_the_in_flight_buffer(self):
+        """Otherwise the live region and the transcript both claim the answer.
+
+        The completed assistant row lands in ``messages`` on the same event, so a
+        buffer that outlived it would render the answer twice.
+        """
+        state = RunState("t", "hi")
+        state.record_event({"type": "token", "data": "Scanned cleanly."})
+        assert state.snapshot()["in_flight_text"] == "Scanned cleanly."
+        state.record_event({"type": "message", "data": "Scanned cleanly."},
+                           [{"type": "assistant", "content": "Scanned cleanly."}])
+        snap = state.snapshot()
+        assert snap["in_flight_text"] == ""
+        assert snap["messages"] == [{"type": "assistant", "content": "Scanned cleanly."}]
 
     def test_snapshot_is_consistent(self):
         state = RunState("t", "hi", [{"type": "user", "content": "hi"}])
