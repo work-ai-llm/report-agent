@@ -35,3 +35,12 @@ Do not use them to learn how the system works. Use:
   scratchpad panels. Records why the agent's scratchpad had to be reconstructed
   from persisted tool calls rather than read from storage: the in-memory backend
   is never checkpointed in this project.
+- **`PR-skill-scratchpad.md`** — the journal for landing the report-generation
+  skill: what was wired (skill file, trimmed prompt, `/skills/` route,
+  `SkillsMiddleware`), what was left undone, and the wiring references. Written
+  mid-branch, before the cross-check phase and the experiments existed; it
+  describes the skill as it stood at that commit.
+- **`report-generation-skill.md`** — the approach behind the report-generation
+  skill (Scratchpad Assembly): the read→write proximity hypothesis it rests on,
+  the with/without experiments run against a local model, and why the skill is
+  gated to larger reports.
