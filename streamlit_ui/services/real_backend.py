@@ -444,11 +444,6 @@ def _copy_rows(rows: List[Any]) -> List[Any]:
     return [dict(r) if isinstance(r, dict) else r for r in rows]
 
 
-# LangChain normalises provider-specific reasoning onto these content-block
-# types. Listed so the streaming loop recognises them; see ``_streamed_text``.
-_REASONING_BLOCK_TYPES = frozenset({"reasoning", "thinking"})
-
-
 def _classify_part(part: Any) -> Tuple[str, Any]:
     """Map one stream item onto ``(mode, payload)``.
 
@@ -476,26 +471,24 @@ def _classify_part(part: Any) -> Tuple[str, Any]:
 def _streamed_text(token: Any) -> Iterator[str]:
     """Yield the visible-text deltas carried by one message-stream chunk.
 
-    Reads ``content_blocks`` rather than ``.text`` so every provider's reasoning
-    arrives on the same normalised block types. Empty blocks are skipped: a
-    reasoning-heavy local model emits a large majority of chunks whose text is
-    the empty string, and emitting those would flood the live view with blanks.
+    Reads ``content_blocks`` rather than ``.text`` so every provider's block type
+    arrives normalised instead of on a parallel path. Empty blocks are skipped: a
+    reasoning-heavy model emits a large majority of chunks whose text is the empty
+    string, and emitting those would flood the live view with blanks.
+
+    Reasoning blocks are skipped here on purpose. They are not missing - the
+    adapter collects them and attaches them to the assistant row, so they reach
+    the transcript and the renderer. This loop is for visible text only; if
+    reasoning ever needs to arrive progressively rather than per segment, that is
+    where it would be added.
     """
     for block in getattr(token, "content_blocks", None) or []:
         if not isinstance(block, dict):
             continue
-        block_type = block.get("type")
-        if block_type == "text":
+        if block.get("type") == "text":
             text = block.get("text") or ""
             if text:
                 yield text
-        elif block_type in _REASONING_BLOCK_TYPES:
-            # Seam for #18. Recognised so the loop does not change shape when
-            # reasoning lands, but deliberately not emitted: the model layer
-            # drops the field before it reaches here, so there is nothing to
-            # stream yet. Whether it needs its own buffer or renders inline is
-            # the reasoning branch's call, not this one's.
-            continue
 
 
 class RealAgentRunnerAdapter:

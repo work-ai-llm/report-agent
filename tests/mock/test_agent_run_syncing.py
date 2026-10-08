@@ -607,6 +607,28 @@ class TestRunStateAndRegistry:
         assert snap["in_flight_text"] == ""
         assert snap["messages"] == [{"type": "assistant", "content": "Scanned cleanly."}]
 
+    def test_a_flushed_segment_also_empties_the_buffer(self):
+        """Mid-turn prose is flushed as ``assistant_text`` when a segment ends.
+
+        The agent interleaves prose with tool calls, so a turn can flush several
+        segments before it ends. Clearing only on the final ``message`` would leave
+        every earlier segment on screen twice - once from its row, once from the
+        buffer - for the rest of the turn.
+        """
+        state = RunState("t", "hi")
+        state.record_event({"type": "token", "data": "I'll read the rest."})
+        state.record_event({"type": "assistant_text", "data": "I'll read the rest."},
+                           [{"type": "assistant", "content": "I'll read the rest."}])
+        assert state.snapshot()["in_flight_text"] == ""
+
+        state.record_event({"type": "tool_call", "data": {"name": "read_file", "args": {}}},
+                           [{"type": "tool_call", "name": "read_file", "args": {}}])
+        state.record_event({"type": "token", "data": "Now the answer."})
+        assert state.snapshot()["in_flight_text"] == "Now the answer."
+        state.record_event({"type": "message", "data": "Now the answer."},
+                           [{"type": "assistant", "content": "Now the answer."}])
+        assert state.snapshot()["in_flight_text"] == ""
+
     def test_snapshot_is_consistent(self):
         state = RunState("t", "hi", [{"type": "user", "content": "hi"}])
         state.record_event({"type": "message", "data": "yo"}, [{"type": "assistant", "content": "yo"}])
