@@ -141,8 +141,13 @@ def render_chat_history(messages: List[Dict[str, Any]]) -> None:
                     )
                     i += 1
                 if i < len(messages) and messages[i].get("type") == "assistant":
-                    render_reasoning(messages[i].get("reasoning"))
-                    st.write(messages[i]["content"])
+                    row = messages[i]
+                    render_reasoning(row.get("reasoning"))
+                    st.write(row["content"])
+                    if row.get("incomplete"):
+                        # The turn was stopped partway. Say so, or the reader sees a
+                        # half sentence and has to guess whether it is the answer.
+                        st.caption("⚠️ stopped before finishing")
                     i += 1
 
         else:

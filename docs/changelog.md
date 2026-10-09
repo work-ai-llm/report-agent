@@ -41,6 +41,11 @@ After the initial agent (2026-08-28 → 2026-10-05).
 
 ### Fixed
 
+- **A stopped turn no longer discards its partial prose.** Pressing Stop used to
+  throw away whatever the model had written so far, on the grounds that a saved
+  partial turn would show up in the session list looking complete. The prose is
+  now kept and marked `incomplete`, and the transcript says the turn was stopped
+  before finishing - no data loss, and still no half-answer presented as an answer.
 - **Flushed prose segments rendered twice mid-turn.** Clearing the live buffer only
   when the whole turn ended left every already-flushed segment on screen for the
   rest of the run, because the adapter flushes prose at each tool-call boundary.
@@ -214,9 +219,6 @@ After the initial agent (2026-08-28 → 2026-10-05).
 Open and documented; see the milestone board for the full picture.
 
 - Interacting with the UI mid-stream can drop the in-flight turn. (#20)
-- A turn cancelled mid-stream discards its partial prose rather than saving it, so
-  an interrupted turn leaves no trace of what it had produced. Deliberate for now -
-  saving it as-is would make a stopped turn look completed in the session list.
 - Tool call arguments and tool output still arrive complete rather than
   incrementally. Not available from the async v2 API.
 - A sidebar selector for the LLM backend is not built. Switching backend is now a

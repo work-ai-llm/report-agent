@@ -711,6 +711,31 @@ class TestStoredHistoryNormalisation:
         out = app_module._history_from_stored([{"role": "assistant", "content": "hi"}])
         assert out == [{"type": "assistant", "content": "hi"}]
 
+    def test_a_stopped_rows_marker_survives_normalisation(self):
+        """Reading the transcript back must not lose it.
+
+        The rows are rebuilt from role-shaped storage, so a flag dropped here
+        would make a half-answer look like a finished one on the next reload -
+        exactly the reason the flag exists.
+        """
+        from streamlit_ui import app as app_module
+
+        out = app_module._history_from_stored([
+            {"role": "assistant", "content": "I checked the scan and",
+             "incomplete": True},
+        ])
+        assert out == [{"type": "assistant", "content": "I checked the scan and",
+                         "incomplete": True}], out
+
+    def test_reasoning_survives_normalisation(self):
+        from streamlit_ui import app as app_module
+
+        out = app_module._history_from_stored([
+            {"role": "assistant", "content": "4.", "reasoning": "2+2 is 4"},
+        ])
+        assert out == [{"type": "assistant", "content": "4.",
+                         "reasoning": "2+2 is 4"}], out
+
     def test_structured_rows_pass_through_untouched(self):
         from streamlit_ui import app as app_module
 
@@ -855,6 +880,31 @@ class TestReasoningRendering:
         captions = " ".join(str(c.value) for c in at.caption)
         assert "Considering the options." in captions
         assert len(at.chat_message) == 1
+
+    def test_a_stopped_turn_is_marked_in_the_transcript(self):
+        """Partial prose is kept, but never reads as a finished answer."""
+        at = self._drive([
+            {"type": "user", "content": "scan it"},
+            {"type": "assistant", "content": "I checked the scan and",
+             "incomplete": True},
+        ])
+        assert not at.exception, f"render failed: {at.exception}"
+
+        body = " ".join(str(m.value) for m in at.markdown)
+        assert "I checked the scan and" in body, f"the prose was dropped: {body!r}"
+
+        captions = " ".join(str(c.value) for c in at.caption)
+        assert "stopped" in captions, (
+            f"a half sentence is shown with no sign it was cut off: {captions!r}"
+        )
+
+    def test_a_complete_turn_is_not_marked_stopped(self):
+        at = self._drive([
+            {"type": "assistant", "content": "A complete answer."},
+        ])
+        assert not at.exception
+        captions = " ".join(str(c.value) for c in at.caption)
+        assert "stopped" not in captions, "a finished turn was marked incomplete"
 
     def test_a_message_without_reasoning_renders_unchanged(self):
         at = self._drive([

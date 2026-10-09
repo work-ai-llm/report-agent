@@ -748,11 +748,13 @@ class TestRunCancellation:
         assert self._drain_until_stopped(agent)
 
     def test_cancelled_run_emits_no_final_message(self, backend, monkeypatch, capsys):
-        """A stopped turn must not be reported as a finished one.
+        """A stopped turn is saved, but never as a finished answer.
 
-        The finally block emits whatever text had accumulated and can fall back to
-        the checkpointer. Doing either writes state for a turn the user stopped,
-        which then appears in the session list as a completed entry.
+        It used to be discarded outright, on the grounds that a saved partial turn
+        shows up in the session list looking complete. The partial prose is real
+        output the model wrote, so it is kept - as an ``incomplete`` row, and never
+        through the final-message or checkpointer-fallback paths, which are what
+        would present it as an answer.
         """
         monkeypatch.setenv("STREAMLIT_AGENT_PRINT", "1")
         runner, _runtime = backend
@@ -775,9 +777,62 @@ class TestRunCancellation:
         # "stop requested by the user" check only fires when the cancel happens to
         # land on a graph-update boundary instead.
         assert "cancelled at" in out
-        assert "skipping final message for a stopped run" in out
+        # This agent streams a tool call and then blocks, so there is no buffered
+        # prose to save - it must say so rather than inventing a row.
+        assert "stopped with nothing buffered" in out
         assert "[AGENT RESPONSE]" not in out
         assert "AGENT RESPONSE (checkpointer)" not in out
+
+    def test_cancelled_run_keeps_its_partial_prose_as_incomplete(
+        self, backend, monkeypatch
+    ):
+        """Stopping mid-sentence must not throw the sentence away."""
+        from langchain_core.messages import AIMessageChunk
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        monkeypatch.setenv("STREAMLIT_STREAM", "0")
+
+        class _SlowEndless:
+            """Emits a couple of prose segments, then blocks forever."""
+
+            def __init__(self):
+                self.started = threading.Event()
+                self.stopped = False
+
+            async def astream(self, stream_input, config=None,
+                              stream_mode=None, version=None):
+                yield {"agent": {"messages": [AIMessageChunk(content="I checked ")]}}
+                yield {"agent": {"messages": [AIMessageChunk(content="the scan and ")]}}
+                self.started.set()
+                try:
+                    while True:
+                        await asyncio.sleep(0.01)
+                        yield {"agent": {"messages": [AIMessageChunk(content="")]}}
+                except asyncio.CancelledError:
+                    self.stopped = True
+                    raise
+
+        runner, _runtime = backend
+        agent = _SlowEndless()
+        adapter = rb.RealAgentRunnerAdapter(runner, agent)
+        REGISTRY.clear()
+        adapter.start("long turn", "th-cancel-partial")
+        assert agent.started.wait(5)
+
+        adapter.cancel("th-cancel-partial")
+        assert _wait_until_idle(REGISTRY, "th-cancel-partial")
+
+        state = REGISTRY.get("th-cancel-partial")
+        rows = [r for r in state.messages if r.get("type") == "assistant"]
+        assert rows, "the partial prose was discarded"
+        assert "I checked the scan and" in rows[-1]["content"]
+        assert rows[-1].get("incomplete") is True, (
+            "a stopped turn must be marked incomplete, not presented as an answer"
+        )
+
+        # Still not a final answer.
+        assert [e["type"] for e in state.events if e["type"] == "message"] == []
 
     def test_cancel_is_refused_when_nothing_is_running(self, backend):
         runner, _runtime = backend

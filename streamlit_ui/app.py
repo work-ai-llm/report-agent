@@ -476,6 +476,22 @@ def render_sidebar(service: PenTestAgentService) -> None:
             render_report_downloader(service.download_report, selected_report)
 
 
+def _assistant_entry(m: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a normalised assistant entry from a role-shaped stored row.
+
+    Carries ``reasoning`` and ``incomplete`` through rather than rebuilding a bare
+    ``{type, content}`` entry. Dropping them here would silently discard a
+    stopped turn's marker on the way back from the checkpointer, and the transcript
+    would present a half sentence as though it were the whole answer.
+    """
+    entry: Dict[str, Any] = {"type": "assistant", "content": m.get("content")}
+    if m.get("reasoning"):
+        entry["reasoning"] = m["reasoning"]
+    if m.get("incomplete"):
+        entry["incomplete"] = True
+    return entry
+
+
 def _history_from_stored(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert stored history entries into a flat event list.
 
@@ -510,9 +526,9 @@ def _history_from_stored(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                         "args": tc.get("args", {}),
                     })
                 if m.get("content"):
-                    normalised.append({"type": "assistant", "content": m["content"]})
+                    normalised.append(_assistant_entry(m))
             else:
-                normalised.append({"type": "assistant", "content": m["content"]})
+                normalised.append(_assistant_entry(m))
         else:
             normalised.append({"type": "assistant", "content": str(m)})
     return normalised

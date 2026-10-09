@@ -742,7 +742,7 @@ class RealAgentRunnerAdapter:
                 pending_parts.append(text)
                 _print(f"[CNK]: {text}")
 
-        def _flush_text(*, final: bool) -> None:
+        def _flush_text(*, final: bool, cancelled: bool = False) -> None:
             """Publish the buffered segment(s) as a row the renderer can draw.
 
             ``state.messages`` is what the live renderer reads, so a segment only
@@ -751,6 +751,12 @@ class RealAgentRunnerAdapter:
             -> the answer), so each segment is flushed as soon as the next tool
             call or tool result proves something else follows it. Whatever is
             still buffered when the stream ends is the answer.
+
+            ``cancelled`` marks a turn the user stopped. The partial prose is
+            still saved - it is what the model actually produced, and discarding
+            it loses real work - but the row is flagged so the transcript can say
+            it was interrupted rather than presenting a half sentence as though it
+            were the answer.
             """
             nonlocal pending_parts, pending_reasoning
             reasoning = "".join(pending_reasoning).strip()
@@ -765,6 +771,8 @@ class RealAgentRunnerAdapter:
                 # transcript keeps one entry per assistant message and the
                 # renderer can show the thinking above the answer it produced.
                 row["reasoning"] = reasoning
+            if cancelled:
+                row["incomplete"] = True
             if final:
                 _emit({"type": "message", "data": text}, [row])
                 _print(f"[AGENT RESPONSE]: {text}")
@@ -975,15 +983,28 @@ class RealAgentRunnerAdapter:
             finally:
                 _print(f"[AGENT STREAM]: finally block at t={_ts()}")
                 if cancelled or stopped_by_user:
-                    # A stopped turn must not emit a final answer or fall back to
-                    # the checkpointer. Doing either writes state for a turn the
-                    # user stopped, which then shows up in the session list as a
-                    # completed entry.
+                    # A stopped turn keeps whatever prose it had produced. It is
+                    # real output the model wrote, and throwing it away loses work
+                    # the user may have wanted to read - or to ask about next turn.
+                    #
+                    # It is saved as an `incomplete` row rather than a final
+                    # message, because a turn that was stopped did not reach an
+                    # answer and the transcript should not imply that it did. The
+                    # earlier behaviour here discarded it entirely, on the grounds
+                    # that a saved partial turn shows up in the session list; the
+                    # flag answers that without the data loss.
                     #
                     # Two paths reach here: `cancelled` is an asyncio task
                     # cancellation, `stopped_by_user` is the cooperative break out
                     # of the astream loop after cancel() was called.
-                    _print("[AGENT STREAM]: skipping final message for a stopped run")
+                    if pending_parts or pending_reasoning:
+                        _print("[AGENT STREAM]: saving partial prose for a stopped run")
+                        _flush_text(final=False, cancelled=True)
+                    else:
+                        _print(
+                            "[AGENT STREAM]: stopped with nothing buffered - "
+                            "no row to save"
+                        )
                 elif saw_text:
                     # Whatever is still buffered is the turn's answer.
                     _flush_text(final=True)
