@@ -665,6 +665,9 @@ class RealAgentRunnerAdapter:
         # Set when the consumer abandons this run, so the finally block can tell
         # "stopped by the user" apart from "finished".
         cancelled = False
+        # Read once per turn rather than per part: the launcher flags are fixed for
+        # the life of the process, so this cannot change mid-run.
+        streaming = is_streaming_enabled()
         config = {
             "configurable": {"thread_id": thread_id, "checkpoint_ns": ""},
             # Langfuse reads this at the chain root and propagates it to every
@@ -887,8 +890,17 @@ class RealAgentRunnerAdapter:
                         # chunks are read: a ToolMessage also arrives here, and
                         # letting its text through would render tool output as
                         # assistant prose on top of the tool_result event.
+                        #
+                        # With --no-streaming the deltas are dropped at the source
+                        # rather than filtered at the render. Nothing downstream
+                        # changes: the "updates" channel still drives tool calls and
+                        # tool results, and each prose segment still flushes into a
+                        # row when the next tool call proves it ended. The turn
+                        # simply arrives in one piece instead of word by word, which
+                        # is also slightly less work - no per-token events, and no
+                        # in-flight buffer to repaint.
                         token = payload[0]
-                        if isinstance(token, AIMessageChunk):
+                        if streaming and isinstance(token, AIMessageChunk):
                             for text in _streamed_text(token):
                                 _emit({"type": "token", "data": text})
                         continue
@@ -1378,5 +1390,11 @@ def component_status_lines() -> List[str]:
         lines.append("observability (langfuse): connected (langfuse handler attached)")
     else:
         lines.append("observability (langfuse): not connected (no langfuse credentials/offline)")
+
+    # Streaming is a launcher flag, not a connection - but it changes what the
+    # chat does on every turn, and it is the one mode with no visible sign of
+    # being wrong. Report it wherever the other modes are reported.
+    mode = "token streaming" if is_streaming_enabled() else "no streaming (whole answer at once)"
+    lines.append(f"streaming: {mode}")
 
     return lines

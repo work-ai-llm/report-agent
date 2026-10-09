@@ -318,6 +318,36 @@ class TestRealAgentRunnerAdapter:
         events = self._events(backend, agent, "scan target", "th-toolmsg")
         assert [e for e in events if e["type"] == "token"] == []
 
+    def test_no_streaming_drops_token_deltas_but_keeps_tool_calls(
+        self, backend, monkeypatch
+    ):
+        """``--no-streaming`` silences prose only.
+
+        Tool calls and tool results come off the ``updates`` channel and are not
+        affected, so a no-streaming turn still shows its work happening - it just
+        arrives in one piece instead of word by word.
+        """
+        from langchain_core.messages import AIMessage, AIMessageChunk
+
+        monkeypatch.setenv("STREAMLIT_STREAM", "0")
+        agent = self._FakeAsyncAgent([
+            {"type": "updates", "ns": (), "data": {"agent": {"messages": [AIMessage(
+                content="",
+                tool_calls=[{"name": "nmap_scan", "args": {"target": "10.0.0.1"},
+                             "id": "c1", "type": "tool_call"}])]}}},
+            {"type": "messages", "ns": (),
+             "data": (AIMessageChunk(content="Scanning"), {"langgraph_node": "model"})},
+            {"type": "messages", "ns": (),
+             "data": (AIMessageChunk(content=" now."), {"langgraph_node": "model"})},
+            {"type": "updates", "ns": (), "data": {"agent": {"messages": [AIMessage(
+                content="Scanning now.")]}}},
+        ])
+        events = self._events(backend, agent, "scan", "th-nostream")
+        kinds = [e["type"] for e in events]
+        assert "token" not in kinds, f"token events leaked with streaming off: {kinds}"
+        assert "tool_call" in kinds, f"tool calls must survive: {kinds}"
+        assert kinds[-1] == "message"
+
     def test_handles_top_level_messages_and_serialized_dicts(self, backend, monkeypatch):
         monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
         agent = self._FakeAsyncAgent([
@@ -697,12 +727,14 @@ class TestRealBackendStatus:
             lines = rs.component_status_lines()
         finally:
             _reset_backend_cache()
-        assert len(lines) == 5
+        # Five connectivity components, then the streaming mode line.
+        assert len(lines) == 6
         assert lines[0].startswith("checkpointer: connected (sqlite:")
         assert lines[1].startswith("virtual filesystem store: connected (sqlite:")
         assert "llm api: not connected" in lines[2]
         assert "agent object: not connected" in lines[3]
         assert "observability (langfuse):" in lines[4]
+        assert lines[5].startswith("streaming: ")
 
     def test_mock_mode_still_wins_over_real_backend(self, monkeypatch):
         monkeypatch.setenv("STREAMLIT_USE_MOCKS", "1")

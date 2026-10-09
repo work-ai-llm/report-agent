@@ -47,9 +47,21 @@ class TestMockModeReport:
     def test_reports_five_components(self, monkeypatch):
         monkeypatch.setenv("STREAMLIT_USE_MOCKS", "1")
         lines = rs.component_status_lines()
-        assert len(lines) == 5
+        # Five connectivity components, plus the streaming mode line - which is a
+        # mode rather than a connection, but is reported here so --no-streaming
+        # is visible without guessing.
+        assert len(lines) == 6
         for component in ALL_COMPONENTS:
             assert any(l.startswith(component + ":") for l in lines)
+
+    def test_report_names_the_streaming_mode(self, monkeypatch):
+        """--no-streaming is silent behaviour, so the banner has to state it."""
+        monkeypatch.setenv("STREAMLIT_USE_MOCKS", "1")
+        monkeypatch.delenv("STREAMLIT_STREAM", raising=False)
+        assert any("token streaming" in l for l in rs.component_status_lines())
+
+        monkeypatch.setenv("STREAMLIT_STREAM", "0")
+        assert any("no streaming" in l for l in rs.component_status_lines())
 
     def test_checkpointer_and_filesystem_connected(self, monkeypatch):
         monkeypatch.setenv("STREAMLIT_USE_MOCKS", "1")
@@ -72,10 +84,11 @@ class TestMockModeReport:
         monkeypatch.setenv("STREAMLIT_USE_MOCKS", "1")
         rs.print_status_banner()
         out = capsys.readouterr().out
-        # Plain, one-component-per-line output.
-        assert out.count("\n") == 5
+        # Plain, one-component-per-line output (five components + streaming mode).
+        assert out.count("\n") == 6
         assert "checkpointer: connected" in out
         assert "observability (langfuse): not connected" in out
+        assert "streaming:" in out
 
 
 class TestProductionModeReport:

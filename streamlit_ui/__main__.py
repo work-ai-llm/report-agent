@@ -19,9 +19,9 @@ variables - those still work when a flag is omitted):
   ``mocks`` is the full in-memory sandbox (mock checkpointer, store AND agent).
   Default: ``real``.
 - ``--streaming`` / ``--no-streaming`` - render live token deltas in the chat
-  (default: streaming on). **Work in progress** - the flag is plumbed through
-  to ``STREAMLIT_STREAM`` but live token streaming is not wired up yet; the
-  chat currently shows tool calls live and a single aggregated final answer.
+  (default: streaming on). With ``--no-streaming`` the prose arrives in one
+  piece instead of word by word; tool calls and tool results still stream live
+  either way.
 
 Examples::
 
@@ -218,8 +218,9 @@ def _apply_runtime_flags(args):
         os.environ.pop("STREAMLIT_USE_REAL_BACKEND", None)
         os.environ.pop("STREAMLIT_USE_REAL_AGENT", None)
 
-    # NOTE(WIP): streaming is not implemented yet. This only sets
-    # STREAMLIT_STREAM for the future streaming work; it is inert today.
+    # Consumed by the real adapter, which drops token deltas at the source when
+    # this is off. Tool calls and tool results stream either way - only the
+    # prose arrives in one piece.
     if streaming is not None:
         os.environ["STREAMLIT_STREAM"] = "1" if streaming else "0"
 
