@@ -719,6 +719,87 @@ class TestStoredHistoryNormalisation:
         assert app_module._history_from_stored(rows) == rows
 
 
+class TestReasoningRendering:
+    """Reasoning is the same message as the answer, just visually subordinate.
+
+    It used to be a collapsed expander of its own, which split one utterance into
+    two: the answer sat in the bubble, and the thinking that produced it was
+    somewhere off to the side behind a disclosure the reader had to know to open.
+    It now renders as dimmed text inside the same bubble, in reading order.
+    """
+
+    ROWS = [
+        {"type": "user", "content": "scan the host"},
+        {"type": "assistant", "content": "One host is up.",
+         "reasoning": "Checked the scan output, port 80 was open."},
+    ]
+
+    @staticmethod
+    def _harness():
+        import streamlit as st
+
+        from tests.mock.mock_objects_streamlit import HARNESS
+        from streamlit_ui.components.chat_display import render_chat_history
+
+        render_chat_history(list(HARNESS["rows"]))
+
+    def _drive(self, rows):
+        from tests.mock.mock_objects_streamlit import HARNESS
+
+        HARNESS.clear()
+        HARNESS.update({"rows": list(rows)})
+        return AppTest.from_function(self._harness).run()
+
+    def test_reasoning_renders_inline_not_behind_a_disclosure(self):
+        at = self._drive(self.ROWS)
+        assert not at.exception, f"render failed: {at.exception}"
+
+        captions = " ".join(str(c.value) for c in at.caption)
+        assert "port 80 was open" in captions, (
+            f"reasoning was not rendered as dimmed text: {captions!r}"
+        )
+
+        # No expander to hide behind.
+        labels = " ".join(str(e.label) for e in at.expander)
+        assert "Reasoning" not in labels, (
+            f"reasoning is behind a disclosure again: {labels!r}"
+        )
+
+        # Same assistant bubble as the answer, so it is one utterance.
+        assert len(at.chat_message) == 2, (
+            f"expected the user bubble and one assistant bubble: "
+            f"{len(at.chat_message)} rendered"
+        )
+
+        body = " ".join(str(m.value) for m in at.markdown)
+        assert "One host is up." in body, f"the answer went missing: {body!r}"
+
+    def test_reasoning_stays_subordinate_to_the_answer(self):
+        """Order matters: the thinking is shown first, then what it concluded."""
+        at = self._drive(self.ROWS)
+        assert not at.exception
+        # st.caption renders before st.write within the bubble, so the caption
+        # element exists independently of the answer's markdown element.
+        assert at.caption, "reasoning caption missing"
+        assert at.markdown, "answer missing"
+
+    def test_a_message_without_reasoning_renders_unchanged(self):
+        at = self._drive([
+            {"type": "user", "content": "hi"},
+            {"type": "assistant", "content": "hello"},
+        ])
+        assert not at.exception
+        assert not at.caption, "an empty reasoning caption was rendered"
+        assert "hello" in " ".join(str(m.value) for m in at.markdown)
+
+    def test_blank_reasoning_renders_nothing(self):
+        at = self._drive([
+            {"type": "assistant", "content": "hello", "reasoning": "   \n  "},
+        ])
+        assert not at.exception
+        assert not at.caption, "whitespace-only reasoning was rendered"
+
+
 class TestReconcileHelper:
     """``_reconcile_with_persisted`` is extracted so it can be tested directly.
 

@@ -80,12 +80,21 @@ def render_tool_call(tool_name: str, tool_args: Dict[str, Any], tool_result: Opt
 
 
 def render_reasoning(reasoning: Optional[str]) -> None:
-    """Render a model's reasoning, collapsed so it never competes with the answer.
+    """Render a model's reasoning as dimmed text above the answer it produced.
 
-    Collapsed by default on purpose: this is the agent's own working commentary
-    over the operator's findings, and it is frequently longer than the answer it
-    produced. It is also only present when the backend surfaced it - the local
-    model needs ``ReasoningChatOpenAI`` to keep the field at all (#18).
+    One utterance, not two: the reasoning and the answer it led to are the same
+    message, so they sit in the same assistant bubble with the thinking first.
+    That keeps reading order intact - you see the model work, then its conclusion -
+    rather than having to open a separate panel and remember what it said.
+
+    ``st.caption`` rather than hand-written HTML: it is the dimmed text style
+    Streamlit already ships, so it follows the active theme in both light and dark
+    instead of hardcoding a grey that disappears on one of them. Reasoning is
+    frequently longer than the answer, and a caption is visually subordinate
+    without being hidden, which is the balance wanted here.
+
+    Absent when the backend did not surface the field - the local model needs
+    ``ReasoningChatOpenAI`` to keep it at all (#18).
 
     Args:
         reasoning: Reasoning text, or None/empty when the model did not expose
@@ -93,8 +102,7 @@ def render_reasoning(reasoning: Optional[str]) -> None:
     """
     if not reasoning or not reasoning.strip():
         return
-    with st.expander("Reasoning", expanded=False):
-        st.markdown(reasoning)
+    st.caption(reasoning.strip())
 
 
 def render_chat_history(messages: List[Dict[str, Any]]) -> None:
