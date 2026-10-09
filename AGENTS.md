@@ -164,18 +164,68 @@ Each of these cost real debugging time. They are not obvious from the code.
   boot hang instead of degrading.
 - On Windows, `report_agent.py` and `real_backend.py` both set
   `WindowsSelectorEventLoopPolicy`. Removing either breaks async Postgres on win32.
-- `stream_mode=["messages", "updates"]` does **not** work with this graph and
-  middleware stack: the messages channel yields only `(chunk, metadata)` tuples, so
-  structured `tool_call` / `tool_result` events never arrive. The UI depends on plain
-  node-diff streaming. Tracked in #17 and #19 — do not retry it blind.
+- **LangGraph's `stream_mode` list needs `version="v2"`, or both channels die.** The
+  default v1 format multiplexes a list of modes into naked `(mode, payload)` tuples.
+  A consumer that unpacks every 2-tuple as `(chunk, metadata)` — the shape of
+  `stream_mode="messages"` alone — reads the mode *name* as the chunk, fails its
+  `isinstance` guard, and drops everything, including the state updates that were
+  arriving correctly all along. It looks exactly like a middleware bug. Pass
+  `stream_mode=["messages", "updates"], version="v2"` and dispatch on `part["type"]`.
+  The messages channel then gives token deltas, and the updates channel gives the
+  completed parsed tool calls. This was the real cause behind #17 and #19; the
+  "do not retry it blind" warning that used to live here is obsolete.
+- **The v3 streaming API's `interleave()` is sync-only.** The docs show
+  `stream_events(version="v3")` with `.interleave("messages", "tool_calls")` and it
+  reads like the obvious choice. `AsyncGraphRunStream` has no `interleave` — only the
+  sync `GraphRunStream` does — and its `tool_calls` projection is a raw
+  `StreamChannel`, not the ergonomic view. From async code, use the v2 list API.
+- **Incremental tool *output* is not available in v2.** Tool results arrive complete
+  as a `ToolMessage` on the updates channel. `output_deltas` is a v3-sync feature;
+  on async it would take `get_stream_writer` inside every tool.
+- A `ToolMessage` also arrives on the `messages` channel, and its `content_blocks`
+  carry a `text` block. Reading text blocks without checking the message type emits
+  the tool's output as assistant prose — drawn once as the tool result and again as
+  the agent talking. Check `isinstance(token, AIMessageChunk)`.
+- **Token and reasoning deltas must be coalesced into a buffer, not rendered from
+  the event list.** `RunState.in_flight_text` and `in_flight_reasoning` exist for
+  this. The live fragment re-reads them whole on a 0.4s timer and Streamlit
+  repaints from scratch every tick, so rendering from the delta log rebuilds the
+  same string on every poll and yields one chat bubble per token (the history
+  renderer's fallback branch turns anything unrecognised into its own bubble). The
+  buffers also cost nothing: tokens are never persisted, only the completed row is.
+- **Clear both in-flight buffers when a segment flushes into `messages`.** The
+  adapter flushes prose as `assistant_text` whenever a tool call proves the segment
+  ended, not only at the end of the turn, so clearing only on the final message
+  leaves every already-flushed segment rendering twice for the rest of the run.
+- **Reasoning arrives on the `messages` channel, in `additional_kwargs`,** not in
+  `content_blocks` — it is a non-standard field the stock OpenAI delta reader does
+  not recognise, which is the whole reason `ReasoningChatOpenAI` exists (#18). Both
+  channels feed the row and that is not duplication: the deltas drive the live
+  region, and a completed message on `updates` carries the whole span and owns the
+  durable row.
+- **`EventLoopThread` must be constructed before `AgentRuntime.initialize()`.** The
+  runtime's checkpointer and store bind to the loop they were created on;
+  initialising on a throwaway `asyncio.run()` loop leaves them holding a closed one
+  and the first real query fails with "Event loop is closed". There is no
+  `EventLoopThread.start()` — the constructor starts the loop.
 - Langfuse groups a turn into one trace only when
   `metadata["langfuse_session_id"]` is present in the run config — **not** in
   `config["configurable"]`, and the key is not `session.id`. The handler reads
   `metadata` at the chain root and propagates it; `configurable.session_id` is
   ignored entirely, and `"session.id"` looks plausible and does nothing, which is
   what made this look broken for so long. Both surfaces pass it.
-- `STREAMLIT_STREAM` / `--no-streaming` is plumbed but **inert** — live token
-  streaming is not implemented. Tool calls appear live; the answer arrives whole.
+- `--no-streaming` (`STREAMLIT_STREAM=0`) drops token and reasoning deltas **at the
+  source**; tool calls and tool results still stream live, and each prose segment
+  still flushes into a row. The flag was inert for a long time because
+  `is_streaming_enabled()` existed with tests around it and **no callers** — check
+  that a helper is actually called, not merely present. The mode is reported by the
+  `--debug` banner, since with streaming off the only evidence it took effect is
+  the absence of tokens, which looks identical to a model that streamed nothing.
+- A local reasoning model emits a large majority of chunks whose *text* is empty —
+  48 reasoning deltas against 1 text delta for a trivial question. Filter on
+  `content_blocks`, or the live view fills with blanks. Measured on a tool-using
+  turn: reasoning begins around 5s and the first word of the answer around 28s, so
+  the absence of visible text early in a turn is expected, not a hang.
 
 ## Tests
 

@@ -214,9 +214,11 @@ class TestRealAgentRunnerAdapter:
             self._chunks = chunks
             self._exc = exc
             self.calls = []
+            self.versions = []
 
-        async def astream(self, stream_input, config=None, stream_mode=None):
+        async def astream(self, stream_input, config=None, stream_mode=None, version=None):
             self.calls.append((stream_input, config, stream_mode))
+            self.versions.append(version)
             if self._exc is not None:
                 raise self._exc
             for batch in self._chunks:
@@ -253,10 +255,182 @@ class TestRealAgentRunnerAdapter:
         assert events[-1]["data"] == "Scan complete."
         stream_input, config, stream_mode = agent.calls[0]
         assert stream_input == {"messages": [{"role": "user", "content": "scan target"}]}
-        assert stream_mode is None
+        assert stream_mode == ["messages", "updates"]
+        assert agent.versions == ["v2"]
         assert config["configurable"]["thread_id"] == "th1"
         assert config["configurable"]["checkpoint_ns"] == ""
         assert config["metadata"]["langfuse_session_id"] == "th1"
+
+    def test_reasoning_deltas_stream_rather_than_arriving_as_one_blob(
+        self, backend, monkeypatch
+    ):
+        """Reasoning must be readable while the model is still thinking.
+
+        It used to reach the UI only inside the completed row, so a model that
+        spends a minute reasoning showed nothing at all until the whole span had
+        been produced - the longest silence in the app, with no sign anything was
+        happening. Now each delta is emitted as it arrives.
+        """
+        from langchain_core.messages import AIMessage, AIMessageChunk
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            # Reasoning arrives first, on the messages channel, one delta at a
+            # time - the shape ReasoningChatOpenAI actually produces.
+            {"type": "messages", "ns": (), "data": (AIMessageChunk(
+                content="",
+                additional_kwargs={"reasoning_content": "The user "}), {})},
+            {"type": "messages", "ns": (), "data": (AIMessageChunk(
+                content="",
+                additional_kwargs={"reasoning_content": "wants 2+2. "}), {})},
+            {"type": "messages", "ns": (), "data": (AIMessageChunk(
+                content="",
+                additional_kwargs={"reasoning_content": "That is 4."}), {})},
+            {"type": "messages", "ns": (), "data": (AIMessageChunk(
+                content="4."), {})},
+            # The completed message still carries the whole span, and that is
+            # what the durable row gets.
+            {"type": "updates", "ns": (), "data": {"agent": {"messages": [AIMessage(
+                content="4.",
+                additional_kwargs={
+                    "reasoning_content": "The user wants 2+2. That is 4."})]}}},
+        ])
+        adapter = rb.RealAgentRunnerAdapter(backend[0], agent)
+        state = adapter.start("2+2?", "th-reason-stream")
+        assert _wait_until_idle(REGISTRY, "th-reason-stream")
+
+        events = [e["type"] for e in state.events]
+        assert events.count("reasoning") == 3, (
+            f"reasoning did not arrive incrementally: {events}"
+        )
+        deltas = [e["data"] for e in state.events if e["type"] == "reasoning"]
+        assert deltas == ["The user ", "wants 2+2. ", "That is 4."]
+
+        # Reasoning precedes the answer, which is the order it is read in.
+        assert events.index("reasoning") < events.index("token")
+
+        # And the finished row still owns it, exactly once.
+        rows = [r for r in state.messages if r.get("type") == "assistant"]
+        assert len(rows) == 1
+        assert rows[0]["reasoning"] == "The user wants 2+2. That is 4."
+        assert rows[0]["content"] == "4."
+
+        # The live buffers released both once the row took over.
+        assert state.snapshot()["in_flight_reasoning"] == ""
+        assert state.snapshot()["in_flight_text"] == ""
+
+    def test_reasoning_stays_silent_when_streaming_is_off(
+        self, backend, monkeypatch
+    ):
+        """--no-streaming suppresses deltas; the row still carries the span."""
+        from langchain_core.messages import AIMessage, AIMessageChunk
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        monkeypatch.setenv("STREAMLIT_STREAM", "0")
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            {"type": "messages", "ns": (), "data": (AIMessageChunk(
+                content="",
+                additional_kwargs={"reasoning_content": "quietly "}), {})},
+            {"type": "updates", "ns": (), "data": {"agent": {"messages": [AIMessage(
+                content="4.",
+                additional_kwargs={"reasoning_content": "quietly done."})]}}},
+        ])
+        adapter = rb.RealAgentRunnerAdapter(backend[0], agent)
+        state = adapter.start("2+2?", "th-reason-off")
+        assert _wait_until_idle(REGISTRY, "th-reason-off")
+
+        assert [e for e in state.events if e["type"] == "reasoning"] == []
+        rows = [r for r in state.messages if r.get("type") == "assistant"]
+        assert rows[0]["reasoning"] == "quietly done."
+
+    def test_v2_stream_parts_dispatch_on_their_own_type(self, backend, monkeypatch):
+        """v2 StreamParts are routed by ``type``, so one stream yields both.
+
+        This is the shape LangGraph emits for
+        ``stream_mode=["messages", "updates"], version="v2"``: the same item
+        carries its mode name. The v1 format multiplexes the same two channels
+        into naked ``(mode, payload)`` tuples, which is what made both channels
+        undiscriminable before.
+        """
+        from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
+
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            {"type": "updates", "ns": (), "data": {"agent": {"messages": [AIMessage(
+                content="",
+                tool_calls=[{"name": "nmap_scan", "args": {"target": "10.0.0.1"},
+                             "id": "c1", "type": "tool_call"}])]}}},
+            {"type": "updates", "ns": (), "data": {"agent": {"messages": [ToolMessage(
+                content="80/tcp open", tool_call_id="c1", name="nmap_scan")]}}},
+            {"type": "messages", "ns": (),
+             "data": (AIMessageChunk(content="Scan"), {"langgraph_node": "model"})},
+            # A reasoning-heavy local model emits many chunks whose text is empty.
+            {"type": "messages", "ns": (),
+             "data": (AIMessageChunk(content=""), {"langgraph_node": "model"})},
+            {"type": "messages", "ns": (),
+             "data": (AIMessageChunk(content=" complete."), {"langgraph_node": "model"})},
+            {"type": "updates", "ns": (), "data": {"agent": {"messages": [AIMessage(
+                content="Scan complete.")]}}},
+        ])
+        events = self._events(backend, agent, "scan target", "th-v2")
+        assert [e["type"] for e in events] == [
+            "tool_call", "tool_result", "token", "token", "message",
+        ]
+        assert [e["data"] for e in events if e["type"] == "token"] == ["Scan", " complete."]
+        assert events[-1]["data"] == "Scan complete."
+        assert agent.versions == ["v2"]
+
+    def test_tool_result_on_the_messages_channel_is_not_read_as_assistant_text(
+        self, backend, monkeypatch
+    ):
+        """A ``ToolMessage`` also arrives on the messages channel.
+
+        Its ``content_blocks`` carry a ``text`` block, so a consumer that did not
+        check the message type would emit the tool's output as assistant prose -
+        drawn once as the tool result and again as the agent talking.
+        """
+        from langchain_core.messages import ToolMessage
+
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            {"type": "messages", "ns": (), "data": (ToolMessage(
+                content="80/tcp open", tool_call_id="c1", name="nmap_scan"),
+                {"langgraph_node": "tools"})},
+        ])
+        events = self._events(backend, agent, "scan target", "th-toolmsg")
+        assert [e for e in events if e["type"] == "token"] == []
+
+    def test_no_streaming_drops_token_deltas_but_keeps_tool_calls(
+        self, backend, monkeypatch
+    ):
+        """``--no-streaming`` silences prose only.
+
+        Tool calls and tool results come off the ``updates`` channel and are not
+        affected, so a no-streaming turn still shows its work happening - it just
+        arrives in one piece instead of word by word.
+        """
+        from langchain_core.messages import AIMessage, AIMessageChunk
+
+        monkeypatch.setenv("STREAMLIT_STREAM", "0")
+        agent = self._FakeAsyncAgent([
+            {"type": "updates", "ns": (), "data": {"agent": {"messages": [AIMessage(
+                content="",
+                tool_calls=[{"name": "nmap_scan", "args": {"target": "10.0.0.1"},
+                             "id": "c1", "type": "tool_call"}])]}}},
+            {"type": "messages", "ns": (),
+             "data": (AIMessageChunk(content="Scanning"), {"langgraph_node": "model"})},
+            {"type": "messages", "ns": (),
+             "data": (AIMessageChunk(content=" now."), {"langgraph_node": "model"})},
+            {"type": "updates", "ns": (), "data": {"agent": {"messages": [AIMessage(
+                content="Scanning now.")]}}},
+        ])
+        events = self._events(backend, agent, "scan", "th-nostream")
+        kinds = [e["type"] for e in events]
+        assert "token" not in kinds, f"token events leaked with streaming off: {kinds}"
+        assert "tool_call" in kinds, f"tool calls must survive: {kinds}"
+        assert kinds[-1] == "message"
 
     def test_handles_top_level_messages_and_serialized_dicts(self, backend, monkeypatch):
         monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
@@ -508,7 +682,7 @@ class TestRunCancellation:
             self.started = threading.Event()
             self.stopped = False
 
-        async def astream(self, stream_input, config=None, stream_mode=None):
+        async def astream(self, stream_input, config=None, stream_mode=None, version=None):
             self.started.set()
             try:
                 yield {"messages": [self._chunk]}
@@ -574,11 +748,13 @@ class TestRunCancellation:
         assert self._drain_until_stopped(agent)
 
     def test_cancelled_run_emits_no_final_message(self, backend, monkeypatch, capsys):
-        """A stopped turn must not be reported as a finished one.
+        """A stopped turn is saved, but never as a finished answer.
 
-        The finally block emits whatever text had accumulated and can fall back to
-        the checkpointer. Doing either writes state for a turn the user stopped,
-        which then appears in the session list as a completed entry.
+        It used to be discarded outright, on the grounds that a saved partial turn
+        shows up in the session list looking complete. The partial prose is real
+        output the model wrote, so it is kept - as an ``incomplete`` row, and never
+        through the final-message or checkpointer-fallback paths, which are what
+        would present it as an answer.
         """
         monkeypatch.setenv("STREAMLIT_AGENT_PRINT", "1")
         runner, _runtime = backend
@@ -601,9 +777,62 @@ class TestRunCancellation:
         # "stop requested by the user" check only fires when the cancel happens to
         # land on a graph-update boundary instead.
         assert "cancelled at" in out
-        assert "skipping final message for a stopped run" in out
+        # This agent streams a tool call and then blocks, so there is no buffered
+        # prose to save - it must say so rather than inventing a row.
+        assert "stopped with nothing buffered" in out
         assert "[AGENT RESPONSE]" not in out
         assert "AGENT RESPONSE (checkpointer)" not in out
+
+    def test_cancelled_run_keeps_its_partial_prose_as_incomplete(
+        self, backend, monkeypatch
+    ):
+        """Stopping mid-sentence must not throw the sentence away."""
+        from langchain_core.messages import AIMessageChunk
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        monkeypatch.setenv("STREAMLIT_STREAM", "0")
+
+        class _SlowEndless:
+            """Emits a couple of prose segments, then blocks forever."""
+
+            def __init__(self):
+                self.started = threading.Event()
+                self.stopped = False
+
+            async def astream(self, stream_input, config=None,
+                              stream_mode=None, version=None):
+                yield {"agent": {"messages": [AIMessageChunk(content="I checked ")]}}
+                yield {"agent": {"messages": [AIMessageChunk(content="the scan and ")]}}
+                self.started.set()
+                try:
+                    while True:
+                        await asyncio.sleep(0.01)
+                        yield {"agent": {"messages": [AIMessageChunk(content="")]}}
+                except asyncio.CancelledError:
+                    self.stopped = True
+                    raise
+
+        runner, _runtime = backend
+        agent = _SlowEndless()
+        adapter = rb.RealAgentRunnerAdapter(runner, agent)
+        REGISTRY.clear()
+        adapter.start("long turn", "th-cancel-partial")
+        assert agent.started.wait(5)
+
+        adapter.cancel("th-cancel-partial")
+        assert _wait_until_idle(REGISTRY, "th-cancel-partial")
+
+        state = REGISTRY.get("th-cancel-partial")
+        rows = [r for r in state.messages if r.get("type") == "assistant"]
+        assert rows, "the partial prose was discarded"
+        assert "I checked the scan and" in rows[-1]["content"]
+        assert rows[-1].get("incomplete") is True, (
+            "a stopped turn must be marked incomplete, not presented as an answer"
+        )
+
+        # Still not a final answer.
+        assert [e["type"] for e in state.events if e["type"] == "message"] == []
 
     def test_cancel_is_refused_when_nothing_is_running(self, backend):
         runner, _runtime = backend
@@ -637,12 +866,14 @@ class TestRealBackendStatus:
             lines = rs.component_status_lines()
         finally:
             _reset_backend_cache()
-        assert len(lines) == 5
+        # Five connectivity components, then the streaming mode line.
+        assert len(lines) == 6
         assert lines[0].startswith("checkpointer: connected (sqlite:")
         assert lines[1].startswith("virtual filesystem store: connected (sqlite:")
         assert "llm api: not connected" in lines[2]
         assert "agent object: not connected" in lines[3]
         assert "observability (langfuse):" in lines[4]
+        assert lines[5].startswith("streaming: ")
 
     def test_mock_mode_still_wins_over_real_backend(self, monkeypatch):
         monkeypatch.setenv("STREAMLIT_USE_MOCKS", "1")

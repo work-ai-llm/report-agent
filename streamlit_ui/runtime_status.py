@@ -112,6 +112,7 @@ def component_status_lines() -> List[str]:
 
 
 def _mock_component_lines() -> List[str]:
+    from streamlit_ui.services.real_backend import is_streaming_enabled
     from tests.mock.mock_objects_streamlit import (
         MockCheckpointer,
         MockFileStore,
@@ -143,6 +144,9 @@ def _mock_component_lines() -> List[str]:
         lines.append(f"agent object: not connected (raised: {exc})")
 
     lines.append("observability (langfuse): not connected (not wired yet)")
+
+    mode = "token streaming" if is_streaming_enabled() else "no streaming (whole answer at once)"
+    lines.append(f"streaming: {mode}")
 
     return lines
 

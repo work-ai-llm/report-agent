@@ -133,6 +133,7 @@ from streamlit_ui.services.run_registry import RunBusyError
 from streamlit_ui.components.chat_display import (
     render_chat_history,
     render_message,
+    render_reasoning,
     render_tool_call,
 )
 from streamlit_ui.components.file_uploader import render_file_uploader
@@ -475,6 +476,22 @@ def render_sidebar(service: PenTestAgentService) -> None:
             render_report_downloader(service.download_report, selected_report)
 
 
+def _assistant_entry(m: Dict[str, Any]) -> Dict[str, Any]:
+    """Build a normalised assistant entry from a role-shaped stored row.
+
+    Carries ``reasoning`` and ``incomplete`` through rather than rebuilding a bare
+    ``{type, content}`` entry. Dropping them here would silently discard a
+    stopped turn's marker on the way back from the checkpointer, and the transcript
+    would present a half sentence as though it were the whole answer.
+    """
+    entry: Dict[str, Any] = {"type": "assistant", "content": m.get("content")}
+    if m.get("reasoning"):
+        entry["reasoning"] = m["reasoning"]
+    if m.get("incomplete"):
+        entry["incomplete"] = True
+    return entry
+
+
 def _history_from_stored(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Convert stored history entries into a flat event list.
 
@@ -509,9 +526,9 @@ def _history_from_stored(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
                         "args": tc.get("args", {}),
                     })
                 if m.get("content"):
-                    normalised.append({"type": "assistant", "content": m["content"]})
+                    normalised.append(_assistant_entry(m))
             else:
-                normalised.append({"type": "assistant", "content": m["content"]})
+                normalised.append(_assistant_entry(m))
         else:
             normalised.append({"type": "assistant", "content": str(m)})
     return normalised
@@ -544,6 +561,11 @@ def render_live_turn(service: PenTestAgentService) -> None:
     Tool calls appear as they are made, with their result filling in underneath, so
     "the agent is doing something odd" is visible rather than inferred.
 
+Assistant text streams in from ``RunState.in_flight_text``, which the run coalesces
+from token deltas. That buffer is cleared by the ``message`` event carrying the
+finished answer, so the live region and the persisted transcript never both claim
+the same words.
+
     ``run_every`` is decided when the fragment is created, from whether a run is
     active, so an idle app has no timer running at all. The app forces one rerun
     after starting a turn precisely so the fragment gets created live.
@@ -558,9 +580,34 @@ def render_live_turn(service: PenTestAgentService) -> None:
         snapshot = service.active_run_snapshot()
         running = bool(snapshot) and snapshot.get("status") == "running"
 
+        # The fragment keeps its timer for the life of the fragment, so switching
+        # sessions mid-turn would otherwise leave it repainting the *previous*
+        # session's live run inside the newly selected one - wrong turn, wrong
+        # thread, and it never stops because that run really is still going.
+        # The run itself is unaffected: it is owned by the registry, not by this
+        # script run. Returning before the running->done bookkeeping matters - that
+        # edge belongs to the run we are following, not to one we just left.
+        if running and snapshot.get("thread_id") != st.session_state.current_thread_id:
+            return
+
         if running:
             events = snapshot.get("events", [])
             render_chat_history(_history_from_stored(snapshot.get("messages", [])))
+            in_flight = snapshot.get("in_flight_text") or ""
+            reasoning = snapshot.get("in_flight_reasoning") or ""
+            if reasoning.strip() or in_flight.strip():
+                # Both coalesced by the run. Rendered from those buffers rather
+                # than from the delta events: the log holds one entry per delta,
+                # so replaying it would rebuild the same string on every poll, and
+                # one chat bubble per token downstream.
+                #
+                # Reasoning is dimmed and sits above the answer - the same shape
+                # render_reasoning gives a finished row, so a turn looks identical
+                # before and after it completes.
+                with st.chat_message("assistant"):
+                    render_reasoning(reasoning)
+                    if in_flight.strip():
+                        st.write(in_flight)
             with st.status("Agent is running\u2026", expanded=True):
                 st.caption(
                     f"{len(events)} step(s) so far. The sidebar stays usable \u2014 "

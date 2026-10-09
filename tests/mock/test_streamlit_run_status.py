@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Optional
 
 import pytest
 import streamlit as st
@@ -429,8 +430,11 @@ class TestNoDuplicateToolCallsWhileStreaming:
         # mid-turn leaves behind.
         service._checkpointer.put(thread_id, {"messages": HARNESS["rows"]})
 
-        st.session_state.current_thread_id = thread_id
-        st.session_state._service_thread = thread_id
+        # ``view_thread`` is the session the *UI* is pointed at, which is not
+        # necessarily the thread that owns the live run. A session switch is
+        # exactly that split: the run keeps going, the view moves on.
+        st.session_state.current_thread_id = HARNESS.get("view_thread", thread_id)
+        st.session_state._service_thread = st.session_state.current_thread_id
         if HARNESS["active"]:
             # A stale revision, so reconciliation rehydrates chat_messages from the
             # persisted rows - the exact state a mid-turn interaction creates.
@@ -451,7 +455,7 @@ class TestNoDuplicateToolCallsWhileStreaming:
         app_module._reconcile_with_persisted(service)
         app_module.render_main_chat(service)
 
-    def _drive(self, run_active: bool):
+    def _drive(self, run_active: bool, view_thread: Optional[str] = None):
         from streamlit_ui.services.agent_service import PenTestAgentService
         from streamlit_ui.services.run_registry import REGISTRY
         from tests.mock.mock_objects_streamlit import (
@@ -484,6 +488,7 @@ class TestNoDuplicateToolCallsWhileStreaming:
             "thread_id": "th-dup",
             "rows": list(self.ROWS),
             "active": run_active,
+            "view_thread": view_thread or "th-dup",
         })
         return AppTest.from_function(self._harness).run()
 
@@ -499,6 +504,43 @@ class TestNoDuplicateToolCallsWhileStreaming:
         labels = " ".join(str(e.label) for e in at.expander)
         assert labels.count("read_file") == 1, (
             f"rendered {labels.count('read_file')} times when idle: {labels!r}"
+        )
+
+    def _rerun(self, view_thread: str):
+        """Re-render against a different selected thread, same live run.
+
+        Deliberately does not register a second run - the point is that the
+        registry still holds the *same* in-flight run while the view has moved.
+        """
+        from tests.mock.mock_objects_streamlit import HARNESS
+
+        HARNESS["view_thread"] = view_thread
+        return AppTest.from_function(self._harness).run()
+
+    def test_switching_sessions_does_not_repaint_the_old_live_run(self):
+        """The live fragment must follow the selected thread, not whatever is live.
+
+        The fragment's timer outlives a session switch, so without the guard it
+        kept drawing the previous session's in-flight run into the newly selected
+        one - and never stopped, because that run really was still going.
+        """
+        at = self._drive(run_active=True)
+        labels = " ".join(str(e.label) for e in at.expander)
+        assert labels.count("read_file") == 1, "the live turn should draw first"
+
+        at = self._rerun("th-somewhere-else")
+
+        labels = " ".join(str(e.label) for e in at.expander)
+        assert "read_file" not in labels, (
+            f"the previous session's live run was repainted here: {labels!r}"
+        )
+
+    def test_the_live_turn_still_draws_when_the_thread_matches(self):
+        """The guard must not break the ordinary case."""
+        at = self._drive(run_active=True)
+        labels = " ".join(str(e.label) for e in at.expander)
+        assert labels.count("read_file") == 1, (
+            f"the live turn stopped drawing on its own thread: {labels!r}"
         )
 
     def test_finished_history_is_not_hidden_while_a_run_is_live(self):
@@ -527,6 +569,114 @@ class TestNoDuplicateToolCallsWhileStreaming:
         text = " ".join(str(getattr(m, "value", m)) for m in at.markdown)
         assert "first answer" in text, (
             f"the earlier turn vanished while a run was live: {text!r}"
+        )
+
+
+class TestTokenStreamRendersWhileRunning:
+    """Streamed assistant text must be visible before the turn finishes.
+
+    The run coalesces token deltas into ``in_flight_text`` and clears it when the
+    ``message`` event carries the finished answer. Both halves matter:
+
+    - live text has to be rendered from that buffer, not from the token events -
+      the event log has one entry per delta, and the history renderer's fallback
+      branch turns anything unrecognised into its own chat bubble, so a
+      per-event render would emit one bubble per token;
+    - the buffer has to be cleared by the final message, or the finished answer
+      is drawn twice: once live and once from the persisted transcript.
+
+    Driven through a real checkpointer because reconciliation reads the persisted
+    rows back, and the finished-turn case needs them to actually be there.
+    """
+
+    ROWS = [{"type": "user", "content": "scan the host"}]
+    ANSWER = "Scanned. One host up."
+
+    @staticmethod
+    def _harness():
+        """Script: a live run mid-token, then the chat area."""
+        import streamlit as st
+
+        from streamlit_ui.services.run_registry import REGISTRY
+        from tests.mock.mock_objects_streamlit import HARNESS
+
+        service = HARNESS["service"]
+        thread_id = HARNESS["thread_id"]
+
+        # Persist the finished rows the transcript should end up holding.
+        service._checkpointer.put(thread_id, {"messages": list(HARNESS["rows"])})
+
+        st.session_state.current_thread_id = thread_id
+        st.session_state._service_thread = thread_id
+        # Stale revision, so reconciliation rehydrates - the state a mid-turn
+        # interaction creates.
+        st.session_state._seen_run_revision = None
+        st.session_state.chat_messages = []
+
+        # Seeded with the history from *before* this turn, as the real adapter
+        # does. Seeding it with the answer as well would put the assistant row in
+        # the run twice, once from the seed and once from the final message.
+        state = REGISTRY.start(thread_id, "scan the host", list(HARNESS["pre_rows"]))
+        for delta in HARNESS["deltas"]:
+            state.record_event({"type": "token", "data": delta})
+        if HARNESS["finished"]:
+            state.record_event({"type": "message", "data": HARNESS["answer"]},
+                               [{"type": "assistant", "content": HARNESS["answer"]}])
+            state.finish()
+
+        import streamlit_ui.app as app_module
+
+        app_module._reconcile_with_persisted(service)
+        app_module.render_main_chat(service)
+
+    def _drive(self, deltas, finished: bool):
+        from streamlit_ui.services.agent_service import PenTestAgentService
+        from tests.mock.mock_objects_streamlit import (
+            HARNESS,
+            MockAgentRunner,
+            MockCheckpointer,
+            MockFileStore,
+        )
+
+        rows = list(self.ROWS)
+        if finished:
+            rows.append({"type": "assistant", "content": self.ANSWER})
+
+        service = PenTestAgentService(
+            thread_id="th-token",
+            checkpointer=MockCheckpointer(),
+            file_store=MockFileStore(),
+            agent_runner=MockAgentRunner(),
+        )
+        HARNESS.clear()
+        HARNESS.update({
+            "service": service,
+            "thread_id": "th-token",
+            "rows": rows,
+            "pre_rows": list(self.ROWS),
+            "deltas": list(deltas),
+            "finished": finished,
+            "answer": self.ANSWER,
+        })
+        return AppTest.from_function(self._harness).run()
+
+    def test_partial_tokens_are_visible_while_the_turn_runs(self):
+        at = self._drive(["Scanned", ". One host up."], finished=False)
+        text = " ".join(str(m.value) for m in at.markdown)
+        assert "Scanned" in text, f"streamed text not rendered: {text!r}"
+
+    def test_finished_answer_is_not_drawn_twice(self):
+        """One answer, drawn by one renderer.
+
+        A finished run hands rendering back to the normal history path, so the
+        live region must not keep claiming the text as well. The buffer-clearing
+        invariant itself is unit-tested against ``RunState`` - here the live
+        region is not rendered at all once the run is terminal.
+        """
+        at = self._drive(["Scanned", ". One host up."], finished=True)
+        text = " ".join(str(m.value) for m in at.markdown)
+        assert text.count("Scanned") == 1, (
+            f"the answer was rendered more than once: {text!r}"
         )
 
 
@@ -561,12 +711,216 @@ class TestStoredHistoryNormalisation:
         out = app_module._history_from_stored([{"role": "assistant", "content": "hi"}])
         assert out == [{"type": "assistant", "content": "hi"}]
 
+    def test_a_stopped_rows_marker_survives_normalisation(self):
+        """Reading the transcript back must not lose it.
+
+        The rows are rebuilt from role-shaped storage, so a flag dropped here
+        would make a half-answer look like a finished one on the next reload -
+        exactly the reason the flag exists.
+        """
+        from streamlit_ui import app as app_module
+
+        out = app_module._history_from_stored([
+            {"role": "assistant", "content": "I checked the scan and",
+             "incomplete": True},
+        ])
+        assert out == [{"type": "assistant", "content": "I checked the scan and",
+                         "incomplete": True}], out
+
+    def test_reasoning_survives_normalisation(self):
+        from streamlit_ui import app as app_module
+
+        out = app_module._history_from_stored([
+            {"role": "assistant", "content": "4.", "reasoning": "2+2 is 4"},
+        ])
+        assert out == [{"type": "assistant", "content": "4.",
+                         "reasoning": "2+2 is 4"}], out
+
     def test_structured_rows_pass_through_untouched(self):
         from streamlit_ui import app as app_module
 
         rows = [{"type": "user", "content": "x"},
                 {"type": "tool_call", "name": "ls", "args": {}, "result": "y"}]
         assert app_module._history_from_stored(rows) == rows
+
+
+class TestReasoningRendering:
+    """Reasoning is the same message as the answer, just visually subordinate.
+
+    It used to be a collapsed expander of its own, which split one utterance into
+    two: the answer sat in the bubble, and the thinking that produced it was
+    somewhere off to the side behind a disclosure the reader had to know to open.
+    It now renders as dimmed text inside the same bubble, in reading order.
+    """
+
+    ROWS = [
+        {"type": "user", "content": "scan the host"},
+        {"type": "assistant", "content": "One host is up.",
+         "reasoning": "Checked the scan output, port 80 was open."},
+    ]
+
+    @staticmethod
+    def _harness():
+        import streamlit as st
+
+        from tests.mock.mock_objects_streamlit import HARNESS
+        from streamlit_ui.components.chat_display import render_chat_history
+
+        render_chat_history(list(HARNESS["rows"]))
+
+    def _drive(self, rows):
+        from tests.mock.mock_objects_streamlit import HARNESS
+
+        HARNESS.clear()
+        HARNESS.update({"rows": list(rows)})
+        return AppTest.from_function(self._harness).run()
+
+    @staticmethod
+    def _live_harness():
+        """Script: a run in flight, carrying reasoning and partial prose."""
+        import streamlit as st
+
+        import streamlit_ui.app as app_module
+        from tests.mock.mock_objects_streamlit import HARNESS
+
+        st.session_state.current_thread_id = "th-live"
+        app_module.render_live_turn(HARNESS["service"])
+
+    def _drive_live(self, reasoning: str, text: str):
+        from streamlit_ui.services.agent_service import PenTestAgentService
+        from streamlit_ui.services.run_registry import REGISTRY
+        from tests.mock.mock_objects_streamlit import (
+            HARNESS,
+            MockAgentRunner,
+            MockCheckpointer,
+            MockFileStore,
+        )
+
+        service = PenTestAgentService(
+            thread_id="th-live",
+            checkpointer=MockCheckpointer(),
+            file_store=MockFileStore(),
+            agent_runner=MockAgentRunner(),
+        )
+        state = REGISTRY.start("th-live", "scan it", [])
+        for delta in ("Reading ", "the scan output,"):
+            state.record_event({"type": "reasoning", "data": delta})
+        for delta in ("Port ", "80 is"):
+            state.record_event({"type": "token", "data": delta})
+
+        # Override the two buffers with exactly what was asked for, so each case
+        # states its own inputs rather than depending on the splits above.
+        state.in_flight_reasoning = reasoning
+        state.in_flight_text = text
+
+        HARNESS.clear()
+        HARNESS.update({"service": service})
+        return AppTest.from_function(self._live_harness).run()
+
+    def test_reasoning_renders_inline_not_behind_a_disclosure(self):
+        at = self._drive(self.ROWS)
+        assert not at.exception, f"render failed: {at.exception}"
+
+        captions = " ".join(str(c.value) for c in at.caption)
+        assert "port 80 was open" in captions, (
+            f"reasoning was not rendered as dimmed text: {captions!r}"
+        )
+
+        # No expander to hide behind.
+        labels = " ".join(str(e.label) for e in at.expander)
+        assert "Reasoning" not in labels, (
+            f"reasoning is behind a disclosure again: {labels!r}"
+        )
+
+        # Same assistant bubble as the answer, so it is one utterance.
+        assert len(at.chat_message) == 2, (
+            f"expected the user bubble and one assistant bubble: "
+            f"{len(at.chat_message)} rendered"
+        )
+
+        body = " ".join(str(m.value) for m in at.markdown)
+        assert "One host is up." in body, f"the answer went missing: {body!r}"
+
+    def test_reasoning_stays_subordinate_to_the_answer(self):
+        """Order matters: the thinking is shown first, then what it concluded."""
+        at = self._drive(self.ROWS)
+        assert not at.exception
+        # st.caption renders before st.write within the bubble, so the caption
+        # element exists independently of the answer's markdown element.
+        assert at.caption, "reasoning caption missing"
+        assert at.markdown, "answer missing"
+
+    def test_live_reasoning_and_text_share_one_bubble(self):
+        """In flight, reasoning is dimmed above the partial answer.
+
+        The same shape a finished row gets, so a turn does not visibly restyle
+        itself when it completes - and both halves in one bubble, because they are
+        one utterance being produced.
+        """
+        at = self._drive_live(reasoning="Reading the scan output,", text="Port 80 is")
+        assert not at.exception, f"render failed: {at.exception}"
+
+        captions = " ".join(str(c.value) for c in at.caption)
+        assert "Reading the scan output," in captions, (
+            f"live reasoning was not rendered dimmed: {captions!r}"
+        )
+        body = " ".join(str(m.value) for m in at.markdown)
+        assert "Port 80 is" in body, f"live text was not rendered: {body!r}"
+        assert len(at.chat_message) == 1, (
+            f"expected one assistant bubble, got {len(at.chat_message)}"
+        )
+
+    def test_live_reasoning_alone_renders_without_an_answer_yet(self):
+        """A model can think for a while before saying anything.
+
+        Showing nothing during that stretch is what made a long turn look hung.
+        """
+        at = self._drive_live(reasoning="Considering the options.", text="")
+        assert not at.exception
+        captions = " ".join(str(c.value) for c in at.caption)
+        assert "Considering the options." in captions
+        assert len(at.chat_message) == 1
+
+    def test_a_stopped_turn_is_marked_in_the_transcript(self):
+        """Partial prose is kept, but never reads as a finished answer."""
+        at = self._drive([
+            {"type": "user", "content": "scan it"},
+            {"type": "assistant", "content": "I checked the scan and",
+             "incomplete": True},
+        ])
+        assert not at.exception, f"render failed: {at.exception}"
+
+        body = " ".join(str(m.value) for m in at.markdown)
+        assert "I checked the scan and" in body, f"the prose was dropped: {body!r}"
+
+        captions = " ".join(str(c.value) for c in at.caption)
+        assert "stopped" in captions, (
+            f"a half sentence is shown with no sign it was cut off: {captions!r}"
+        )
+
+    def test_a_complete_turn_is_not_marked_stopped(self):
+        at = self._drive([
+            {"type": "assistant", "content": "A complete answer."},
+        ])
+        assert not at.exception
+        captions = " ".join(str(c.value) for c in at.caption)
+        assert "stopped" not in captions, "a finished turn was marked incomplete"
+
+    def test_a_message_without_reasoning_renders_unchanged(self):
+        at = self._drive([
+            {"type": "user", "content": "hi"},
+            {"type": "assistant", "content": "hello"},
+        ])
+        assert not at.exception
+        assert not at.caption, "an empty reasoning caption was rendered"
+        assert "hello" in " ".join(str(m.value) for m in at.markdown)
+
+    def test_blank_reasoning_renders_nothing(self):
+        at = self._drive([
+            {"type": "assistant", "content": "hello", "reasoning": "   \n  "},
+        ])
+        assert not at.exception
+        assert not at.caption, "whitespace-only reasoning was rendered"
 
 
 class TestReconcileHelper:

@@ -444,6 +444,73 @@ def _copy_rows(rows: List[Any]) -> List[Any]:
     return [dict(r) if isinstance(r, dict) else r for r in rows]
 
 
+def _classify_part(part: Any) -> Tuple[str, Any]:
+    """Map one stream item onto ``(mode, payload)``.
+
+    With ``version="v2"`` every item is a ``StreamPart`` dict carrying its own
+    mode name in ``type``, which removes the ambiguity that made the v1 format
+    unusable here: v1 multiplexes a list of modes into naked ``(mode, payload)``
+    tuples, so a consumer that unpacks every 2-tuple as ``(chunk, metadata)``
+    reads the mode *name* as the chunk and drops both channels.
+
+    Untyped items are still accepted as node-diffs, and a bare
+    ``(chunk, metadata)`` pair as the messages channel, so a graph that ignores
+    the requested stream mode degrades to the previous behaviour instead of
+    rendering nothing.
+    """
+    if isinstance(part, dict):
+        mode = part.get("type")
+        if mode in ("messages", "updates"):
+            return mode, part["data"]
+        return "updates", part
+    if isinstance(part, tuple) and len(part) == 2:
+        return "messages", part
+    return "updates", part
+
+
+def _streamed_reasoning(token: Any) -> str:
+    """Return the reasoning delta carried by one message-stream chunk, if any.
+
+    ``reasoning_content`` in ``additional_kwargs`` is where the provider-specific
+    chat classes put it - ``ReasoningChatOpenAI`` for the local backend,
+    ``ChatOpenRouter`` for OpenRouter. Stock ``ChatOpenAI`` drops it, which is why
+    the local backend needs the subclass to see reasoning at all (#18).
+
+    Read from ``additional_kwargs`` rather than ``content_blocks`` because that is
+    where the delta actually lands: the reasoning is a non-standard field the
+    stock delta reader does not recognise, so it is carried alongside the message
+    rather than as one of its normalised blocks. Reading it from the messages
+    channel is what makes it incremental - the completed-message path on
+    ``updates`` only ever sees the whole thing at once.
+    """
+    kwargs = getattr(token, "additional_kwargs", None) or {}
+    part = kwargs.get("reasoning_content") or ""
+    return part if isinstance(part, str) else (str(part) if part else "")
+
+
+def _streamed_text(token: Any) -> Iterator[str]:
+    """Yield the visible-text deltas carried by one message-stream chunk.
+
+    Reads ``content_blocks`` rather than ``.text`` so every provider's block type
+    arrives normalised instead of on a parallel path. Empty blocks are skipped: a
+    reasoning-heavy model emits a large majority of chunks whose text is the empty
+    string, and emitting those would flood the live view with blanks.
+
+    Reasoning blocks are skipped here on purpose. They are not missing - the
+    adapter collects them and attaches them to the assistant row, so they reach
+    the transcript and the renderer. This loop is for visible text only; if
+    reasoning ever needs to arrive progressively rather than per segment, that is
+    where it would be added.
+    """
+    for block in getattr(token, "content_blocks", None) or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            text = block.get("text") or ""
+            if text:
+                yield text
+
+
 class RealAgentRunnerAdapter:
     """Adapt ``runtime.agent`` to ``AgentRunnerProtocol``.
 
@@ -618,6 +685,9 @@ class RealAgentRunnerAdapter:
         # Set when the consumer abandons this run, so the finally block can tell
         # "stopped by the user" apart from "finished".
         cancelled = False
+        # Read once per turn rather than per part: the launcher flags are fixed for
+        # the life of the process, so this cannot change mid-run.
+        streaming = is_streaming_enabled()
         config = {
             "configurable": {"thread_id": thread_id, "checkpoint_ns": ""},
             # Langfuse reads this at the chain root and propagates it to every
@@ -672,7 +742,7 @@ class RealAgentRunnerAdapter:
                 pending_parts.append(text)
                 _print(f"[CNK]: {text}")
 
-        def _flush_text(*, final: bool) -> None:
+        def _flush_text(*, final: bool, cancelled: bool = False) -> None:
             """Publish the buffered segment(s) as a row the renderer can draw.
 
             ``state.messages`` is what the live renderer reads, so a segment only
@@ -681,6 +751,12 @@ class RealAgentRunnerAdapter:
             -> the answer), so each segment is flushed as soon as the next tool
             call or tool result proves something else follows it. Whatever is
             still buffered when the stream ends is the answer.
+
+            ``cancelled`` marks a turn the user stopped. The partial prose is
+            still saved - it is what the model actually produced, and discarding
+            it loses real work - but the row is flagged so the transcript can say
+            it was interrupted rather than presenting a half sentence as though it
+            were the answer.
             """
             nonlocal pending_parts, pending_reasoning
             reasoning = "".join(pending_reasoning).strip()
@@ -695,6 +771,8 @@ class RealAgentRunnerAdapter:
                 # transcript keeps one entry per assistant message and the
                 # renderer can show the thinking above the answer it produced.
                 row["reasoning"] = reasoning
+            if cancelled:
+                row["incomplete"] = True
             if final:
                 _emit({"type": "message", "data": text}, [row])
                 _print(f"[AGENT RESPONSE]: {text}")
@@ -708,6 +786,14 @@ class RealAgentRunnerAdapter:
             put it - ``ReasoningChatOpenAI`` for the local backend,
             ``ChatOpenRouter`` for OpenRouter. It is read here rather than in
             the app because the run registry owns the rows the renderer draws.
+
+            Both channels matter, and they are not redundant. The ``messages``
+            channel delivers each delta separately, which is what the live view
+            streams; a *completed* message on ``updates`` carries the whole span
+            again, and that is what gets attached to the row so the transcript
+            still shows it once the run is over. One drives the live region, the
+            other owns the durable row - the same split as ``token`` versus the
+            assistant row.
             """
             nonlocal pending_reasoning
             kwargs = getattr(chunk, "additional_kwargs", None) or {}
@@ -813,18 +899,15 @@ class RealAgentRunnerAdapter:
             stopped_by_user = False
             try:
                 _print(f"[AGENT STREAM]: calling astream() at t={_ts()}")
-                # NOTE: stream_mode=["messages","updates"] was tried for live
-                # token streaming but the langchain create_agent + middleware
-                # graph only yields (str, metadata) tuples on the messages
-                # channel (no dict updates at all), so structured events
-                # (tool_call / tool_result / the final message) never arrive.
-                # Plain node-diff streaming works: dict updates drive the UI
-                # events and the final message. Live token deltas would need a
-                # graph/middleware that also emits structured node outputs.
-                astream_iter = self._agent.astream(stream_input, config=config)
+                astream_iter = self._agent.astream(
+                    stream_input,
+                    config=config,
+                    stream_mode=["messages", "updates"],
+                    version="v2",
+                )
                 _print(f"[AGENT STREAM]: astream() returned iterator at t={_ts()}, type={type(astream_iter).__name__}")
                 _print(f"[AGENT STREAM]: entering async for loop at t={_ts()}")
-                async for update in astream_iter:
+                async for part in astream_iter:
                     # Explicit stop. Raising CancelledError rather than just
                     # `break`ing matters: breaking out of an `async for` does not
                     # close the generator, so the agent's own astream would keep
@@ -837,20 +920,45 @@ class RealAgentRunnerAdapter:
                         _print(f"[AGENT STREAM]: stop requested by the user at t={_ts()}")
                         raise asyncio.CancelledError()
                     _updates += 1
-                    if isinstance(update, tuple) and len(update) == 2:
-                        # (AIMessageChunk, metadata) from the "messages" channel.
-                        message_chunk, _meta = update
-                        if isinstance(message_chunk, AIMessageChunk):
-                            delta = getattr(message_chunk, "content", "")
-                            if isinstance(delta, str) and delta:
-                                _emit({"type": "token", "data": delta})
+                    kind, payload = _classify_part(part)
+                    if kind == "messages":
+                        # The messages channel carries token deltas. Only assistant
+                        # chunks are read: a ToolMessage also arrives here, and
+                        # letting its text through would render tool output as
+                        # assistant prose on top of the tool_result event.
+                        #
+                        # With --no-streaming the deltas are dropped at the source
+                        # rather than filtered at the render. Nothing downstream
+                        # changes: the "updates" channel still drives tool calls and
+                        # tool results, and each prose segment still flushes into a
+                        # row when the next tool call proves it ended. The turn
+                        # simply arrives in one piece instead of word by word, which
+                        # is also slightly less work - no per-token events, and no
+                        # in-flight buffer to repaint.
+                        token = payload[0]
+                        if streaming and isinstance(token, AIMessageChunk):
+                            # Reasoning arrives on this channel as its own
+                            # deltas, before any prose does. Emitted separately
+                            # from the answer text because it is rendered as
+                            # dimmed commentary above it, and because it runs long
+                            # on its own - a reasoning-heavy model can emit a
+                            # minute of thinking before a single word of answer,
+                            # which previously showed as nothing at all until the
+                            # whole segment had arrived.
+                            reasoning = _streamed_reasoning(token)
+                            if reasoning:
+                                _emit({"type": "reasoning", "data": reasoning})
+                            for text in _streamed_text(token):
+                                _emit({"type": "token", "data": text})
+                        continue
+                    if kind != "updates":
                         continue
                     _print(
                         f"[AGENT STREAM]: update#{_updates} t={_ts()} "
-                        f"keys={list(update) if isinstance(update, dict) else type(update).__name__}"
+                        f"keys={list(payload) if isinstance(payload, dict) else type(payload).__name__}"
                     )
                     before = state.revision
-                    for chunk in _iter_messages(update):
+                    for chunk in _iter_messages(payload):
                         _handle_chunk(chunk)
                     # Persist on the loop thread, right after the batch. This is
                     # the write that used to live in the script thread's
@@ -875,15 +983,28 @@ class RealAgentRunnerAdapter:
             finally:
                 _print(f"[AGENT STREAM]: finally block at t={_ts()}")
                 if cancelled or stopped_by_user:
-                    # A stopped turn must not emit a final answer or fall back to
-                    # the checkpointer. Doing either writes state for a turn the
-                    # user stopped, which then shows up in the session list as a
-                    # completed entry.
+                    # A stopped turn keeps whatever prose it had produced. It is
+                    # real output the model wrote, and throwing it away loses work
+                    # the user may have wanted to read - or to ask about next turn.
+                    #
+                    # It is saved as an `incomplete` row rather than a final
+                    # message, because a turn that was stopped did not reach an
+                    # answer and the transcript should not imply that it did. The
+                    # earlier behaviour here discarded it entirely, on the grounds
+                    # that a saved partial turn shows up in the session list; the
+                    # flag answers that without the data loss.
                     #
                     # Two paths reach here: `cancelled` is an asyncio task
                     # cancellation, `stopped_by_user` is the cooperative break out
                     # of the astream loop after cancel() was called.
-                    _print("[AGENT STREAM]: skipping final message for a stopped run")
+                    if pending_parts or pending_reasoning:
+                        _print("[AGENT STREAM]: saving partial prose for a stopped run")
+                        _flush_text(final=False, cancelled=True)
+                    else:
+                        _print(
+                            "[AGENT STREAM]: stopped with nothing buffered - "
+                            "no row to save"
+                        )
                 elif saw_text:
                     # Whatever is still buffered is the turn's answer.
                     _flush_text(final=True)
@@ -1329,5 +1450,11 @@ def component_status_lines() -> List[str]:
         lines.append("observability (langfuse): connected (langfuse handler attached)")
     else:
         lines.append("observability (langfuse): not connected (no langfuse credentials/offline)")
+
+    # Streaming is a launcher flag, not a connection - but it changes what the
+    # chat does on every turn, and it is the one mode with no visible sign of
+    # being wrong. Report it wherever the other modes are reported.
+    mode = "token streaming" if is_streaming_enabled() else "no streaming (whole answer at once)"
+    lines.append(f"streaming: {mode}")
 
     return lines

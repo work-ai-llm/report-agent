@@ -70,9 +70,10 @@ when it is wrong.
 
 Stated plainly, because these are the things that look available and are not.
 
-- **No live token streaming in the UI.** Tool calls appear live; the answer
-  arrives whole. The `--streaming` / `--no-streaming` flags are plumbed and
-  currently do nothing.
+- **No incremental tool-call arguments or tool output.** Tool calls and tool
+  results stream live, but each arrives complete. Partially-streamed arguments
+  (`tool_call_chunks`) and incremental tool output would need the sync-only v3
+  streaming API or a stream writer inside every tool.
 - **No authentication on the A2A server.** Loopback-only by default, but
   `--host all_interfaces` exposes an unauthenticated agent to the network.
 - **No rate limiting is applied.** The limiter is built and deliberately not

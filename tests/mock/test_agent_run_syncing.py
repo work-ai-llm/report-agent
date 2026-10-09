@@ -103,7 +103,7 @@ class _SlowAgent:
         self._gap = gap_seconds
         self.astream_calls = 0
 
-    async def astream(self, stream_input, config=None, stream_mode=None):
+    async def astream(self, stream_input, config=None, stream_mode=None, version=None):
         from langchain_core.messages import AIMessage, ToolMessage
 
         self.astream_calls += 1
@@ -584,6 +584,90 @@ class TestRunStateAndRegistry:
         state.record_event({"type": "token", "data": "llo"})
         assert state.messages == []
         assert len(state.events) == 2
+
+    def test_tokens_coalesce_into_the_in_flight_buffer(self):
+        """One string, not one entry per delta - the fragment re-reads it whole."""
+        state = RunState("t", "hi")
+        for delta in ("Scan", "ned", " cleanly."):
+            state.record_event({"type": "token", "data": delta})
+        assert state.snapshot()["in_flight_text"] == "Scanned cleanly."
+
+    def test_the_final_message_empties_the_in_flight_buffer(self):
+        """Otherwise the live region and the transcript both claim the answer.
+
+        The completed assistant row lands in ``messages`` on the same event, so a
+        buffer that outlived it would render the answer twice.
+        """
+        state = RunState("t", "hi")
+        state.record_event({"type": "token", "data": "Scanned cleanly."})
+        assert state.snapshot()["in_flight_text"] == "Scanned cleanly."
+        state.record_event({"type": "message", "data": "Scanned cleanly."},
+                           [{"type": "assistant", "content": "Scanned cleanly."}])
+        snap = state.snapshot()
+        assert snap["in_flight_text"] == ""
+        assert snap["messages"] == [{"type": "assistant", "content": "Scanned cleanly."}]
+
+    def test_reasoning_deltas_coalesce_into_their_own_buffer(self):
+        """Reasoning streams on its own channel, ahead of any prose.
+
+        One buffer, not the text one: the two arrive independently and reasoning
+        runs long before the answer does, so sharing would blank whichever was
+        still empty.
+        """
+        state = RunState("t", "hi")
+        for delta in ("Let me ", "look at ", "that file."):
+            state.record_event({"type": "reasoning", "data": delta})
+        snap = state.snapshot()
+        assert snap["in_flight_reasoning"] == "Let me look at that file."
+        assert snap["in_flight_text"] == ""
+
+    def test_prose_and_reasoning_keep_separate_buffers(self):
+        """They interleave, so one must not clobber the other."""
+        state = RunState("t", "hi")
+        state.record_event({"type": "reasoning", "data": "thinking"})
+        state.record_event({"type": "token", "data": "answering"})
+        snap = state.snapshot()
+        assert snap["in_flight_reasoning"] == "thinking"
+        assert snap["in_flight_text"] == "answering"
+
+    def test_a_flushed_segment_clears_both_buffers(self):
+        """The row now carries the reasoning, so the live view must release it."""
+        state = RunState("t", "hi")
+        state.record_event({"type": "reasoning", "data": "thought it through"})
+        state.record_event({"type": "token", "data": "The answer."})
+        assert state.snapshot()["in_flight_reasoning"] == "thought it through"
+
+        state.record_event(
+            {"type": "message", "data": "The answer."},
+            [{"type": "assistant", "content": "The answer.",
+              "reasoning": "thought it through"}],
+        )
+        snap = state.snapshot()
+        assert snap["in_flight_reasoning"] == ""
+        assert snap["in_flight_text"] == ""
+        assert snap["messages"][0]["reasoning"] == "thought it through"
+
+    def test_a_flushed_segment_also_empties_the_buffer(self):
+        """Mid-turn prose is flushed as ``assistant_text`` when a segment ends.
+
+        The agent interleaves prose with tool calls, so a turn can flush several
+        segments before it ends. Clearing only on the final ``message`` would leave
+        every earlier segment on screen twice - once from its row, once from the
+        buffer - for the rest of the turn.
+        """
+        state = RunState("t", "hi")
+        state.record_event({"type": "token", "data": "I'll read the rest."})
+        state.record_event({"type": "assistant_text", "data": "I'll read the rest."},
+                           [{"type": "assistant", "content": "I'll read the rest."}])
+        assert state.snapshot()["in_flight_text"] == ""
+
+        state.record_event({"type": "tool_call", "data": {"name": "read_file", "args": {}}},
+                           [{"type": "tool_call", "name": "read_file", "args": {}}])
+        state.record_event({"type": "token", "data": "Now the answer."})
+        assert state.snapshot()["in_flight_text"] == "Now the answer."
+        state.record_event({"type": "message", "data": "Now the answer."},
+                           [{"type": "assistant", "content": "Now the answer."}])
+        assert state.snapshot()["in_flight_text"] == ""
 
     def test_snapshot_is_consistent(self):
         state = RunState("t", "hi", [{"type": "user", "content": "hi"}])

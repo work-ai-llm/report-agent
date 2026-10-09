@@ -111,6 +111,19 @@ class RunState:
         # gets persisted, so the adapter and the UI never disagree about it.
         self.messages: List[Dict[str, Any]] = list(messages or [])
         self.events: List[Dict[str, Any]] = []
+        # Assistant text for the turn in flight, coalesced from ``token`` events.
+        # Held separately from ``messages`` because a row only appears once the
+        # segment it covers is complete - without this the live view would show
+        # nothing until the whole answer had been produced. Cleared when a segment
+        # is flushed into ``messages``, so the live region and the transcript
+        # cannot both claim the same words.
+        self.in_flight_text: str = ""
+        # The same thing for the model's reasoning, coalesced from ``reasoning``
+        # deltas. Separate from ``in_flight_text`` because the two arrive on
+        # different channels and interleave independently - reasoning comes first
+        # and runs long before any prose does, and one buffer would blank the
+        # other.
+        self.in_flight_reasoning: str = ""
         self.status: str = RUNNING
         self.error: Optional[str] = None
         # Starts above zero for a thread's second and later runs - see
@@ -166,15 +179,41 @@ class RunState:
     ) -> None:
         """Record one streamed event plus the message rows it contributes.
 
+        ``token`` and ``assistant_text`` / ``message`` also maintain
+        :attr:`in_flight_text`, so the live view stays in step with the event log
+        from a single write path - the mock adapter emits the same event types and
+        gets it for free.
+
+        Both ``assistant_text`` and ``message`` clear the buffer, not just the
+        latter. The adapter flushes prose into a row as soon as the next tool call
+        or result proves a segment ended, so a turn can flush several segments
+        mid-stream. Clearing only on the final message would leave every already
+        flushed segment showing twice - once from its row and once from the buffer -
+        until the turn ended.
+
         Args:
             event: The UI event dict (``tool_call`` / ``tool_result`` / ``token``
-                / ``message`` / ``error``).
+                / ``assistant_text`` / ``message`` / ``error``).
             additions: Rows to append to :attr:`messages`. ``token`` deltas
                 contribute nothing - they are a display-time concern and would
                 otherwise multiply the persisted row count.
         """
         with self._lock:
             self.events.append(event)
+            event_type = event.get("type")
+            if event_type == "token":
+                data = event.get("data")
+                if isinstance(data, str):
+                    self.in_flight_text += data
+            elif event_type == "reasoning":
+                data = event.get("data")
+                if isinstance(data, str):
+                    self.in_flight_reasoning += data
+            elif event_type in ("assistant_text", "message"):
+                # This segment is now in ``messages``, reasoning attached. The live
+                # region must stop claiming either or both render twice.
+                self.in_flight_text = ""
+                self.in_flight_reasoning = ""
             if additions:
                 self.messages.extend(additions)
             self._revision += 1
@@ -227,6 +266,8 @@ class RunState:
                 "revision": self._revision,
                 "events": list(self.events),
                 "messages": list(self.messages),
+                "in_flight_text": self.in_flight_text,
+                "in_flight_reasoning": self.in_flight_reasoning,
             }
 
 
