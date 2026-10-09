@@ -346,12 +346,21 @@ Each of these cost real debugging time and is not obvious from the code.
   auto-enables it for the default OpenAI base URL. Because this repo always passes
   an explicit `base_url`, the flag stays off, no `stream_options` is sent, and
   every generation reports zero tokens.
-- **`stream_mode=["messages", "updates"]` does not work** with this graph and
-  middleware stack: the messages channel yields only `(chunk, metadata)` tuples,
-  so structured `tool_call` / `tool_result` events never arrive. The UI depends on
-  plain node-diff streaming. Tracked in #17 and #19 — do not retry it blind.
-- **`--streaming` / `STREAMLIT_STREAM` is inert.** Live token streaming is not
-  implemented; tool calls appear live and the answer arrives whole.
+- **`stream_mode=["messages", "updates"]` needs `version="v2"`.** Without it LangGraph
+  multiplexes the two channels into naked `(mode, payload)` tuples, and a consumer
+  that unpacks every 2-tuple as `(chunk, metadata)` drops both — including the tool
+  calls that were arriving correctly. Pass `version="v2"` and dispatch on
+  `part["type"]`. See `AGENTS.md` for the full trap, including why the v3
+  `interleave()` API is not usable from async code.
+- **`--no-streaming` / `STREAMLIT_STREAM=0` suppresses token and reasoning deltas** at
+  the source. Tool calls and tool results still stream live, and prose still flushes
+  into rows at segment boundaries — only the incremental prose is dropped.
+- **Live text and reasoning are repainted from coalesced buffers**, not from the
+  delta event log. `RunState` keeps `in_flight_text` and `in_flight_reasoning`, and
+  the live fragment re-reads them on a timer. Streamlit repaints a fragment from
+  scratch each tick, so rendering deltas directly would rebuild the same string every
+  poll and produce one chat bubble per token. Both buffers clear when a segment
+  flushes into the transcript.
 - **Langfuse session grouping needs `config["metadata"]["langfuse_session_id"]`.**
   Not `configurable`, and not `session.id` — that key is silently ignored, which is
   why it looked broken for so long.

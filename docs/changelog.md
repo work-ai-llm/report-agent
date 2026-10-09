@@ -16,6 +16,34 @@ After the initial agent (2026-08-28 → 2026-10-05).
 
 ### Added
 
+- **Live token and reasoning streaming in the chat.** Assistant prose and the
+  model's reasoning now render as they are generated instead of arriving with the
+  finished message. The adapter consumes LangGraph's `messages` channel via
+  `stream_mode=["messages", "updates"], version="v2"` and dispatches on the part's
+  own `type`; the previous attempt read v1's multiplexed `(mode, payload)` tuples
+  as `(chunk, metadata)`, which silently dropped both channels and left the flag
+  looking like a middleware bug (#17, #19). Tool calls and tool results are
+  unchanged - they already arrived complete, off the updates channel. Reasoning is
+  read from `additional_kwargs`, which is the field the stock `ChatOpenAI` delta
+  reader discards and `ReasoningChatOpenAI` exists to preserve (#18). Measured
+  against the local model: reasoning begins around 5s, the first word of the answer
+  around 28s, with reasoning visible throughout the gap.
+- **`--no-streaming` actually works.** The flag had been parsed and exported with
+  tests around it, but nothing read it. It now suppresses token and reasoning deltas
+  at the source; tool calls, tool results and prose segments are unaffected. The
+  active mode is reported by the `--debug` banner.
+- **Reasoning renders inline as dimmed text** rather than in a collapsible panel of
+  its own, so the thinking and the answer it produced read as one utterance. Uses
+  `st.caption`, so it follows the active theme in both light and dark.
+- **A turn survives switching sessions.** The live fragment's timer outlived a
+  session switch and kept repainting the previous session's in-flight run into the
+  newly selected one. It now follows the selected thread.
+
+### Fixed
+
+- **Flushed prose segments rendered twice mid-turn.** Clearing the live buffer only
+  when the whole turn ended left every already-flushed segment on screen for the
+  rest of the run, because the adapter flushes prose at each tool-call boundary.
 - **`report-generation` skill** - the report workflow now ships as a skill
   (`agent/skills/report-generation/SKILL.md`) instead of living in the system
   prompt. Only the skill's `name` and `description` are injected; the agent pulls
@@ -185,9 +213,12 @@ After the initial agent (2026-08-28 → 2026-10-05).
 
 Open and documented; see the milestone board for the full picture.
 
-- Live token streaming is not implemented; the `--streaming` flag is inert and the
-  answer arrives whole. (#17, #19)
 - Interacting with the UI mid-stream can drop the in-flight turn. (#20)
+- A turn cancelled mid-stream discards its partial prose rather than saving it, so
+  an interrupted turn leaves no trace of what it had produced. Deliberate for now -
+  saving it as-is would make a stopped turn look completed in the session list.
+- Tool call arguments and tool output still arrive complete rather than
+  incrementally. Not available from the async v2 API.
 - A sidebar selector for the LLM backend is not built. Switching backend is now a
   `--llm-backend` flag rather than an `.env` edit, so this is convenience rather
   than necessity — and the process-wide cache would make a per-user dropdown
