@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Optional
 
 import pytest
 import streamlit as st
@@ -429,8 +430,11 @@ class TestNoDuplicateToolCallsWhileStreaming:
         # mid-turn leaves behind.
         service._checkpointer.put(thread_id, {"messages": HARNESS["rows"]})
 
-        st.session_state.current_thread_id = thread_id
-        st.session_state._service_thread = thread_id
+        # ``view_thread`` is the session the *UI* is pointed at, which is not
+        # necessarily the thread that owns the live run. A session switch is
+        # exactly that split: the run keeps going, the view moves on.
+        st.session_state.current_thread_id = HARNESS.get("view_thread", thread_id)
+        st.session_state._service_thread = st.session_state.current_thread_id
         if HARNESS["active"]:
             # A stale revision, so reconciliation rehydrates chat_messages from the
             # persisted rows - the exact state a mid-turn interaction creates.
@@ -451,7 +455,7 @@ class TestNoDuplicateToolCallsWhileStreaming:
         app_module._reconcile_with_persisted(service)
         app_module.render_main_chat(service)
 
-    def _drive(self, run_active: bool):
+    def _drive(self, run_active: bool, view_thread: Optional[str] = None):
         from streamlit_ui.services.agent_service import PenTestAgentService
         from streamlit_ui.services.run_registry import REGISTRY
         from tests.mock.mock_objects_streamlit import (
@@ -484,6 +488,7 @@ class TestNoDuplicateToolCallsWhileStreaming:
             "thread_id": "th-dup",
             "rows": list(self.ROWS),
             "active": run_active,
+            "view_thread": view_thread or "th-dup",
         })
         return AppTest.from_function(self._harness).run()
 
@@ -499,6 +504,43 @@ class TestNoDuplicateToolCallsWhileStreaming:
         labels = " ".join(str(e.label) for e in at.expander)
         assert labels.count("read_file") == 1, (
             f"rendered {labels.count('read_file')} times when idle: {labels!r}"
+        )
+
+    def _rerun(self, view_thread: str):
+        """Re-render against a different selected thread, same live run.
+
+        Deliberately does not register a second run - the point is that the
+        registry still holds the *same* in-flight run while the view has moved.
+        """
+        from tests.mock.mock_objects_streamlit import HARNESS
+
+        HARNESS["view_thread"] = view_thread
+        return AppTest.from_function(self._harness).run()
+
+    def test_switching_sessions_does_not_repaint_the_old_live_run(self):
+        """The live fragment must follow the selected thread, not whatever is live.
+
+        The fragment's timer outlives a session switch, so without the guard it
+        kept drawing the previous session's in-flight run into the newly selected
+        one - and never stopped, because that run really was still going.
+        """
+        at = self._drive(run_active=True)
+        labels = " ".join(str(e.label) for e in at.expander)
+        assert labels.count("read_file") == 1, "the live turn should draw first"
+
+        at = self._rerun("th-somewhere-else")
+
+        labels = " ".join(str(e.label) for e in at.expander)
+        assert "read_file" not in labels, (
+            f"the previous session's live run was repainted here: {labels!r}"
+        )
+
+    def test_the_live_turn_still_draws_when_the_thread_matches(self):
+        """The guard must not break the ordinary case."""
+        at = self._drive(run_active=True)
+        labels = " ".join(str(e.label) for e in at.expander)
+        assert labels.count("read_file") == 1, (
+            f"the live turn stopped drawing on its own thread: {labels!r}"
         )
 
     def test_finished_history_is_not_hidden_while_a_run_is_live(self):

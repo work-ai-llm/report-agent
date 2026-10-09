@@ -563,6 +563,16 @@ the same words.
         snapshot = service.active_run_snapshot()
         running = bool(snapshot) and snapshot.get("status") == "running"
 
+        # The fragment keeps its timer for the life of the fragment, so switching
+        # sessions mid-turn would otherwise leave it repainting the *previous*
+        # session's live run inside the newly selected one - wrong turn, wrong
+        # thread, and it never stops because that run really is still going.
+        # The run itself is unaffected: it is owned by the registry, not by this
+        # script run. Returning before the running->done bookkeeping matters - that
+        # edge belongs to the run we are following, not to one we just left.
+        if running and snapshot.get("thread_id") != st.session_state.current_thread_id:
+            return
+
         if running:
             events = snapshot.get("events", [])
             render_chat_history(_history_from_stored(snapshot.get("messages", [])))
