@@ -261,6 +261,90 @@ class TestRealAgentRunnerAdapter:
         assert config["configurable"]["checkpoint_ns"] == ""
         assert config["metadata"]["langfuse_session_id"] == "th1"
 
+    def test_reasoning_deltas_stream_rather_than_arriving_as_one_blob(
+        self, backend, monkeypatch
+    ):
+        """Reasoning must be readable while the model is still thinking.
+
+        It used to reach the UI only inside the completed row, so a model that
+        spends a minute reasoning showed nothing at all until the whole span had
+        been produced - the longest silence in the app, with no sign anything was
+        happening. Now each delta is emitted as it arrives.
+        """
+        from langchain_core.messages import AIMessage, AIMessageChunk
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            # Reasoning arrives first, on the messages channel, one delta at a
+            # time - the shape ReasoningChatOpenAI actually produces.
+            {"type": "messages", "ns": (), "data": (AIMessageChunk(
+                content="",
+                additional_kwargs={"reasoning_content": "The user "}), {})},
+            {"type": "messages", "ns": (), "data": (AIMessageChunk(
+                content="",
+                additional_kwargs={"reasoning_content": "wants 2+2. "}), {})},
+            {"type": "messages", "ns": (), "data": (AIMessageChunk(
+                content="",
+                additional_kwargs={"reasoning_content": "That is 4."}), {})},
+            {"type": "messages", "ns": (), "data": (AIMessageChunk(
+                content="4."), {})},
+            # The completed message still carries the whole span, and that is
+            # what the durable row gets.
+            {"type": "updates", "ns": (), "data": {"agent": {"messages": [AIMessage(
+                content="4.",
+                additional_kwargs={
+                    "reasoning_content": "The user wants 2+2. That is 4."})]}}},
+        ])
+        adapter = rb.RealAgentRunnerAdapter(backend[0], agent)
+        state = adapter.start("2+2?", "th-reason-stream")
+        assert _wait_until_idle(REGISTRY, "th-reason-stream")
+
+        events = [e["type"] for e in state.events]
+        assert events.count("reasoning") == 3, (
+            f"reasoning did not arrive incrementally: {events}"
+        )
+        deltas = [e["data"] for e in state.events if e["type"] == "reasoning"]
+        assert deltas == ["The user ", "wants 2+2. ", "That is 4."]
+
+        # Reasoning precedes the answer, which is the order it is read in.
+        assert events.index("reasoning") < events.index("token")
+
+        # And the finished row still owns it, exactly once.
+        rows = [r for r in state.messages if r.get("type") == "assistant"]
+        assert len(rows) == 1
+        assert rows[0]["reasoning"] == "The user wants 2+2. That is 4."
+        assert rows[0]["content"] == "4."
+
+        # The live buffers released both once the row took over.
+        assert state.snapshot()["in_flight_reasoning"] == ""
+        assert state.snapshot()["in_flight_text"] == ""
+
+    def test_reasoning_stays_silent_when_streaming_is_off(
+        self, backend, monkeypatch
+    ):
+        """--no-streaming suppresses deltas; the row still carries the span."""
+        from langchain_core.messages import AIMessage, AIMessageChunk
+        from streamlit_ui.services.run_registry import REGISTRY
+
+        monkeypatch.setenv("STREAMLIT_STREAM", "0")
+        monkeypatch.delenv("STREAMLIT_AGENT_PRINT", raising=False)
+        agent = self._FakeAsyncAgent([
+            {"type": "messages", "ns": (), "data": (AIMessageChunk(
+                content="",
+                additional_kwargs={"reasoning_content": "quietly "}), {})},
+            {"type": "updates", "ns": (), "data": {"agent": {"messages": [AIMessage(
+                content="4.",
+                additional_kwargs={"reasoning_content": "quietly done."})]}}},
+        ])
+        adapter = rb.RealAgentRunnerAdapter(backend[0], agent)
+        state = adapter.start("2+2?", "th-reason-off")
+        assert _wait_until_idle(REGISTRY, "th-reason-off")
+
+        assert [e for e in state.events if e["type"] == "reasoning"] == []
+        rows = [r for r in state.messages if r.get("type") == "assistant"]
+        assert rows[0]["reasoning"] == "quietly done."
+
     def test_v2_stream_parts_dispatch_on_their_own_type(self, backend, monkeypatch):
         """v2 StreamParts are routed by ``type``, so one stream yields both.
 

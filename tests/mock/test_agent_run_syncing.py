@@ -607,6 +607,46 @@ class TestRunStateAndRegistry:
         assert snap["in_flight_text"] == ""
         assert snap["messages"] == [{"type": "assistant", "content": "Scanned cleanly."}]
 
+    def test_reasoning_deltas_coalesce_into_their_own_buffer(self):
+        """Reasoning streams on its own channel, ahead of any prose.
+
+        One buffer, not the text one: the two arrive independently and reasoning
+        runs long before the answer does, so sharing would blank whichever was
+        still empty.
+        """
+        state = RunState("t", "hi")
+        for delta in ("Let me ", "look at ", "that file."):
+            state.record_event({"type": "reasoning", "data": delta})
+        snap = state.snapshot()
+        assert snap["in_flight_reasoning"] == "Let me look at that file."
+        assert snap["in_flight_text"] == ""
+
+    def test_prose_and_reasoning_keep_separate_buffers(self):
+        """They interleave, so one must not clobber the other."""
+        state = RunState("t", "hi")
+        state.record_event({"type": "reasoning", "data": "thinking"})
+        state.record_event({"type": "token", "data": "answering"})
+        snap = state.snapshot()
+        assert snap["in_flight_reasoning"] == "thinking"
+        assert snap["in_flight_text"] == "answering"
+
+    def test_a_flushed_segment_clears_both_buffers(self):
+        """The row now carries the reasoning, so the live view must release it."""
+        state = RunState("t", "hi")
+        state.record_event({"type": "reasoning", "data": "thought it through"})
+        state.record_event({"type": "token", "data": "The answer."})
+        assert state.snapshot()["in_flight_reasoning"] == "thought it through"
+
+        state.record_event(
+            {"type": "message", "data": "The answer."},
+            [{"type": "assistant", "content": "The answer.",
+              "reasoning": "thought it through"}],
+        )
+        snap = state.snapshot()
+        assert snap["in_flight_reasoning"] == ""
+        assert snap["in_flight_text"] == ""
+        assert snap["messages"][0]["reasoning"] == "thought it through"
+
     def test_a_flushed_segment_also_empties_the_buffer(self):
         """Mid-turn prose is flushed as ``assistant_text`` when a segment ends.
 

@@ -118,6 +118,12 @@ class RunState:
         # is flushed into ``messages``, so the live region and the transcript
         # cannot both claim the same words.
         self.in_flight_text: str = ""
+        # The same thing for the model's reasoning, coalesced from ``reasoning``
+        # deltas. Separate from ``in_flight_text`` because the two arrive on
+        # different channels and interleave independently - reasoning comes first
+        # and runs long before any prose does, and one buffer would blank the
+        # other.
+        self.in_flight_reasoning: str = ""
         self.status: str = RUNNING
         self.error: Optional[str] = None
         # Starts above zero for a thread's second and later runs - see
@@ -199,10 +205,15 @@ class RunState:
                 data = event.get("data")
                 if isinstance(data, str):
                     self.in_flight_text += data
+            elif event_type == "reasoning":
+                data = event.get("data")
+                if isinstance(data, str):
+                    self.in_flight_reasoning += data
             elif event_type in ("assistant_text", "message"):
-                # This text is now in ``messages``; the live region must stop
-                # claiming it or it renders twice.
+                # This segment is now in ``messages``, reasoning attached. The live
+                # region must stop claiming either or both render twice.
                 self.in_flight_text = ""
+                self.in_flight_reasoning = ""
             if additions:
                 self.messages.extend(additions)
             self._revision += 1
@@ -256,6 +267,7 @@ class RunState:
                 "events": list(self.events),
                 "messages": list(self.messages),
                 "in_flight_text": self.in_flight_text,
+                "in_flight_reasoning": self.in_flight_reasoning,
             }
 
 

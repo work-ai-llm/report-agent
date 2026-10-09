@@ -468,6 +468,26 @@ def _classify_part(part: Any) -> Tuple[str, Any]:
     return "updates", part
 
 
+def _streamed_reasoning(token: Any) -> str:
+    """Return the reasoning delta carried by one message-stream chunk, if any.
+
+    ``reasoning_content`` in ``additional_kwargs`` is where the provider-specific
+    chat classes put it - ``ReasoningChatOpenAI`` for the local backend,
+    ``ChatOpenRouter`` for OpenRouter. Stock ``ChatOpenAI`` drops it, which is why
+    the local backend needs the subclass to see reasoning at all (#18).
+
+    Read from ``additional_kwargs`` rather than ``content_blocks`` because that is
+    where the delta actually lands: the reasoning is a non-standard field the
+    stock delta reader does not recognise, so it is carried alongside the message
+    rather than as one of its normalised blocks. Reading it from the messages
+    channel is what makes it incremental - the completed-message path on
+    ``updates`` only ever sees the whole thing at once.
+    """
+    kwargs = getattr(token, "additional_kwargs", None) or {}
+    part = kwargs.get("reasoning_content") or ""
+    return part if isinstance(part, str) else (str(part) if part else "")
+
+
 def _streamed_text(token: Any) -> Iterator[str]:
     """Yield the visible-text deltas carried by one message-stream chunk.
 
@@ -758,6 +778,14 @@ class RealAgentRunnerAdapter:
             put it - ``ReasoningChatOpenAI`` for the local backend,
             ``ChatOpenRouter`` for OpenRouter. It is read here rather than in
             the app because the run registry owns the rows the renderer draws.
+
+            Both channels matter, and they are not redundant. The ``messages``
+            channel delivers each delta separately, which is what the live view
+            streams; a *completed* message on ``updates`` carries the whole span
+            again, and that is what gets attached to the row so the transcript
+            still shows it once the run is over. One drives the live region, the
+            other owns the durable row - the same split as ``token`` versus the
+            assistant row.
             """
             nonlocal pending_reasoning
             kwargs = getattr(chunk, "additional_kwargs", None) or {}
@@ -901,6 +929,17 @@ class RealAgentRunnerAdapter:
                         # in-flight buffer to repaint.
                         token = payload[0]
                         if streaming and isinstance(token, AIMessageChunk):
+                            # Reasoning arrives on this channel as its own
+                            # deltas, before any prose does. Emitted separately
+                            # from the answer text because it is rendered as
+                            # dimmed commentary above it, and because it runs long
+                            # on its own - a reasoning-heavy model can emit a
+                            # minute of thinking before a single word of answer,
+                            # which previously showed as nothing at all until the
+                            # whole segment had arrived.
+                            reasoning = _streamed_reasoning(token)
+                            if reasoning:
+                                _emit({"type": "reasoning", "data": reasoning})
                             for text in _streamed_text(token):
                                 _emit({"type": "token", "data": text})
                         continue

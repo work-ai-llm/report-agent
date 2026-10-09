@@ -750,6 +750,48 @@ class TestReasoningRendering:
         HARNESS.update({"rows": list(rows)})
         return AppTest.from_function(self._harness).run()
 
+    @staticmethod
+    def _live_harness():
+        """Script: a run in flight, carrying reasoning and partial prose."""
+        import streamlit as st
+
+        import streamlit_ui.app as app_module
+        from tests.mock.mock_objects_streamlit import HARNESS
+
+        st.session_state.current_thread_id = "th-live"
+        app_module.render_live_turn(HARNESS["service"])
+
+    def _drive_live(self, reasoning: str, text: str):
+        from streamlit_ui.services.agent_service import PenTestAgentService
+        from streamlit_ui.services.run_registry import REGISTRY
+        from tests.mock.mock_objects_streamlit import (
+            HARNESS,
+            MockAgentRunner,
+            MockCheckpointer,
+            MockFileStore,
+        )
+
+        service = PenTestAgentService(
+            thread_id="th-live",
+            checkpointer=MockCheckpointer(),
+            file_store=MockFileStore(),
+            agent_runner=MockAgentRunner(),
+        )
+        state = REGISTRY.start("th-live", "scan it", [])
+        for delta in ("Reading ", "the scan output,"):
+            state.record_event({"type": "reasoning", "data": delta})
+        for delta in ("Port ", "80 is"):
+            state.record_event({"type": "token", "data": delta})
+
+        # Override the two buffers with exactly what was asked for, so each case
+        # states its own inputs rather than depending on the splits above.
+        state.in_flight_reasoning = reasoning
+        state.in_flight_text = text
+
+        HARNESS.clear()
+        HARNESS.update({"service": service})
+        return AppTest.from_function(self._live_harness).run()
+
     def test_reasoning_renders_inline_not_behind_a_disclosure(self):
         at = self._drive(self.ROWS)
         assert not at.exception, f"render failed: {at.exception}"
@@ -782,6 +824,37 @@ class TestReasoningRendering:
         # element exists independently of the answer's markdown element.
         assert at.caption, "reasoning caption missing"
         assert at.markdown, "answer missing"
+
+    def test_live_reasoning_and_text_share_one_bubble(self):
+        """In flight, reasoning is dimmed above the partial answer.
+
+        The same shape a finished row gets, so a turn does not visibly restyle
+        itself when it completes - and both halves in one bubble, because they are
+        one utterance being produced.
+        """
+        at = self._drive_live(reasoning="Reading the scan output,", text="Port 80 is")
+        assert not at.exception, f"render failed: {at.exception}"
+
+        captions = " ".join(str(c.value) for c in at.caption)
+        assert "Reading the scan output," in captions, (
+            f"live reasoning was not rendered dimmed: {captions!r}"
+        )
+        body = " ".join(str(m.value) for m in at.markdown)
+        assert "Port 80 is" in body, f"live text was not rendered: {body!r}"
+        assert len(at.chat_message) == 1, (
+            f"expected one assistant bubble, got {len(at.chat_message)}"
+        )
+
+    def test_live_reasoning_alone_renders_without_an_answer_yet(self):
+        """A model can think for a while before saying anything.
+
+        Showing nothing during that stretch is what made a long turn look hung.
+        """
+        at = self._drive_live(reasoning="Considering the options.", text="")
+        assert not at.exception
+        captions = " ".join(str(c.value) for c in at.caption)
+        assert "Considering the options." in captions
+        assert len(at.chat_message) == 1
 
     def test_a_message_without_reasoning_renders_unchanged(self):
         at = self._drive([

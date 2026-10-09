@@ -133,6 +133,7 @@ from streamlit_ui.services.run_registry import RunBusyError
 from streamlit_ui.components.chat_display import (
     render_chat_history,
     render_message,
+    render_reasoning,
     render_tool_call,
 )
 from streamlit_ui.components.file_uploader import render_file_uploader
@@ -577,12 +578,20 @@ the same words.
             events = snapshot.get("events", [])
             render_chat_history(_history_from_stored(snapshot.get("messages", [])))
             in_flight = snapshot.get("in_flight_text") or ""
-            if in_flight.strip():
-                # Token deltas, coalesced by the run. Rendered from that buffer
-                # rather than from the token events: the log holds one entry per
-                # delta, so replaying it would rebuild the same string on every
-                # poll, and one chat bubble per token downstream.
-                render_message("assistant", in_flight)
+            reasoning = snapshot.get("in_flight_reasoning") or ""
+            if reasoning.strip() or in_flight.strip():
+                # Both coalesced by the run. Rendered from those buffers rather
+                # than from the delta events: the log holds one entry per delta,
+                # so replaying it would rebuild the same string on every poll, and
+                # one chat bubble per token downstream.
+                #
+                # Reasoning is dimmed and sits above the answer - the same shape
+                # render_reasoning gives a finished row, so a turn looks identical
+                # before and after it completes.
+                with st.chat_message("assistant"):
+                    render_reasoning(reasoning)
+                    if in_flight.strip():
+                        st.write(in_flight)
             with st.status("Agent is running\u2026", expanded=True):
                 st.caption(
                     f"{len(events)} step(s) so far. The sidebar stays usable \u2014 "
