@@ -327,6 +327,53 @@ class ReportA2AExecutor(AgentExecutor):
 # ==========================================
 # 2. Starlette Lifespan (core fix)
 # ==========================================
+# The httpx client handed to BasePushNotificationSender is built in main() because
+# the request handler needs it, but the lifespan has to be able to close it - see
+# _close_runtime for why leaving it open wedges the whole shutdown.
+_push_httpx_client = None
+
+
+async def _close_runtime() -> None:
+    """Release everything opened at startup, best-effort.
+
+    ``runtime.pool.close()`` alone is not enough, and on the SQLite path it is
+    not even relevant: that path has no pool at all, just two ``aiosqlite``
+    Connections (one for the checkpointer, one for the store).
+
+    Each aiosqlite Connection owns a NON-daemon worker thread parked in
+    ``while True: tx.get()`` (aiosqlite/core.py), and that thread only exits when
+    the Connection is finalised and ``__del__`` puts a stop sentinel on its queue.
+    Leave them open and the interpreter blocks forever in ``threading._shutdown()``
+    waiting on their thread sentinels - by which point uvicorn has already
+    printed "Finished server process" and released the port, so the process looks
+    hung and Ctrl-C does nothing, because there is no application code left to
+    interrupt. dev_tools/store_cli.py closes these same two connections for the
+    same reason.
+
+    Every step is wrapped so one failure cannot abort the rest of the teardown.
+    """
+    for name in ("checkpointer", "store"):
+        conn = getattr(getattr(runtime, name, None), "conn", None)
+        if conn is None:
+            continue
+        try:
+            await conn.close()
+        except Exception as exc:  # noqa: BLE001 - shutdown must not mask itself
+            logger.debug("closing %s.conn failed: %s", name, exc)
+
+    if runtime.pool is not None:
+        try:
+            await runtime.pool.close()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("closing postgres pool failed: %s", exc)
+
+    if _push_httpx_client is not None:
+        try:
+            await _push_httpx_client.aclose()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("closing push-notification httpx client failed: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: Starlette):
     """
@@ -334,18 +381,17 @@ async def lifespan(app: Starlette):
     The asyncio event loop is now running, so it's safe to open the database connection.
     """
     logger.info("Opening database pool and setting up tables...")
-    
+
     # 1. Initialize the runtime (langfuse, prompt, middleware, pool, agent)
     await runtime.initialize()
-    
+
     logger.info("Database setup complete. Agent is ready to accept requests.")
-    
+
     yield  # <--- Application runs normally here, handling requests
-    
-    # 3. Clean up resources on shutdown
-    logger.info("Shutting down and closing database pool...")
-    if runtime.pool:
-        await runtime.pool.close()
+
+    # 2. Clean up on shutdown
+    logger.info("Shutting down and closing database resources...")
+    await _close_runtime()
 
 
 # ==========================================
@@ -490,14 +536,15 @@ def main(argv=None):
 
     
     # Wire up the request handler
-    httpx_client = httpx.AsyncClient()
+    global _push_httpx_client
+    _push_httpx_client = httpx.AsyncClient()
     push_config_store = InMemoryPushNotificationConfigStore()
     request_handler = DefaultRequestHandler(
         agent_executor=ReportA2AExecutor(),
         task_store=InMemoryTaskStore(),
         agent_card=public_agent_card,
         push_config_store=push_config_store,
-        push_sender = BasePushNotificationSender(httpx_client=httpx_client,
+        push_sender = BasePushNotificationSender(httpx_client=_push_httpx_client,
                     config_store=push_config_store)
     )
 
@@ -527,6 +574,16 @@ def main(argv=None):
 
     # Bind exactly what was asked for; the card above already reflects it.
     uvicorn.run(app, host=BIND, port=PORT)
+
+    # uvicorn has returned and the lifespan has already run _close_runtime, so
+    # there is nothing left to do but stop. Handing control back to the
+    # interpreter from here would re-enter threading._shutdown() and block on
+    # any non-daemon thread a dependency left behind - which is what made this
+    # process appear to ignore Ctrl-C after the port was already released.
+    # Flush first: os._exit skips the normal atexit/buffer-flushing path.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
 
 if __name__ == "__main__":
     main()
