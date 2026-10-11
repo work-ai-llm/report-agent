@@ -374,6 +374,38 @@ The server and the client never import each other. The CLI imports only the
 client. That is what lets the server be exercised by a test client and the client
 be exercised by a test server.
 
+What the operator actually triggers, and the one step in it that surprises
+people — the client does **not** post back to `--server`:
+
+```mermaid
+sequenceDiagram
+    participant U as Operator
+    participant CLI as dev_tools/a2a_cli.py
+    participant C as client/a2a_client.py
+    participant S as agent/a2a_connector.py
+
+    U->>CLI: python a2a_cli.py --server http://IP:9999 send "..."
+    CLI->>C: A2AClient.create(server_url, ...)
+    C->>S: GET /.well-known/agent-card.json
+    S-->>C: agent card
+    Note over C: the card's supportedInterfaces url<br/>becomes the POST target -<br/>--server is only used to find the card
+    C->>S: POST / - JSON-RPC message/send
+    S->>S: DefaultRequestHandler -> InMemoryTaskStore
+    S-->>C: status WORKING (immediate ack)
+    S-->>C: tool_call, artifact, final status
+    C-->>CLI: parsed events
+    CLI-->>U: human-readable lines + exit code
+```
+
+Two consequences worth stating when this comes up:
+
+- The card is the address book, so a bind that disagrees with the advertised URL
+  produces a server whose card fetch succeeds and whose every later call is
+  refused. See Binding below.
+- Every command is the same shape — `A2AClient` method, then one HTTP round trip.
+  What differs between `send`, `get`, `cancel`, `subscribe` and `poll` is the
+  JSON-RPC method and whether the response is a single reply or a stream.
+
 ### Server
 
 `agent/a2a_connector.py`. `ReportA2AExecutor` turns one A2A task into one agent
