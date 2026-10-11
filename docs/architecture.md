@@ -389,6 +389,91 @@ invocation.
   connection, heals the pool once and resumes the **same thread** — LangGraph
   continues from its last checkpoint instead of failing the run.
 
+```mermaid
+flowchart TD
+    C1["Client A"] & C2["Client B"] --> HTTP["JSON-RPC POST /<br/>binds loopback by default"]
+
+    HTTP --> CARD["Agent card<br/>URL derived from the bind"]
+    CARD -.->|"client POSTs to the address IN the card"| HTTP
+
+    HTTP --> HANDLER["DefaultRequestHandler"]
+    HANDLER --> TS[("InMemoryTaskStore<br/>owner-scoped<br/>owner '' for everyone")]
+    HANDLER --> PUSH["BasePushNotificationSender<br/>POSTs to a client-supplied URL"]
+
+    HANDLER --> EXEC["ReportA2AExecutor"]
+
+    EXEC --> ACK["IMMEDIATE ack<br/>'Waiting in execution queue'"]
+    ACK --> LOCK{"global_execution_lock<br/>acquired AFTER the ack"}
+
+    LOCK -->|free| RUN["agent.astream<br/>stream_mode=updates"]
+    LOCK -->|busy| KEEP["keep-alive every 30s<br/>NO TOTAL TIMEOUT"]
+
+    RUN --> RECURSE["recursion_limit = 40"]
+    RECURSE --> CASEA["CASE A - AIMessage with tool_calls"]
+    CASEA --> ART["write_file with 'report' in path<br/>-> emit artifact"]
+    RECURSE --> FINAL["final status<br/>EMITTED UNCONDITIONALLY"]
+
+    FINAL --> REL["release lock in finally"]
+```
+
+One turn end to end:
+
+```mermaid
+sequenceDiagram
+    participant CL as Client
+    participant H as RequestHandler
+    participant T as TaskStore
+    participant X as Executor
+    participant L as Global lock
+    participant A as Agent graph
+    participant DB as Checkpointer/Store
+    participant LF as Langfuse
+
+    CL->>H: message/send
+    H->>T: create task
+    H->>X: execute
+    X-->>CL: status WORKING "waiting in queue" (immediate ack)
+    X->>L: acquire
+    L-->>X: acquired
+    X->>A: astream(stream_mode=updates)
+    A->>DB: load thread state
+    A->>LF: trace starts (langfuse_session_id)
+    A-->>X: AIMessage with tool_calls
+    X-->>CL: tool_call event
+    A->>DB: tool reads/writes files
+    A-->>X: final AIMessage
+    A->>LF: usage_metadata + trace end
+    A->>DB: persist checkpoint
+    X-->>CL: artifact + final status
+    X->>L: release
+```
+
+The lock is acquired **after** the immediate acknowledgement, and that ordering
+is what makes the concurrency behaviour readable: a second client sees
+`Waiting in execution queue...` straight away instead of appearing to hang.
+
+What the serialisation does and does not buy, stated precisely:
+
+- It serialises **the agent invocation only**. Task creation and queueing happen
+  before the acquire, and the backing `InMemoryTaskStore` is a plain dict with no
+  cap, so queue depth is unbounded.
+- Each waiting task re-announces every 30s with **no total timeout**, so a queued
+  task never expires.
+- There is **no per-task token ceiling**. `recursion_limit` bounds graph steps,
+  not spend.
+- It is **per-process**. A second worker or a second server instance is a second
+  lock.
+- `InMemoryTaskStore` is **in memory**. Restarting the server empties
+  `tasks/list` even though the agent's memory in Postgres is intact.
+- The final status string is **emitted unconditionally**, so it is not evidence
+  that a report was written.
+
+On client disconnect the handler catches `CancelledError` / `GeneratorExit` and
+spawns a **background consumer**, which keeps persisting events while the producer
+keeps running. So the work is not lost when a viewer vanishes — and resubscribing
+is not required for the task to finish, only for the client to see the result.
+Say that precisely; "you can reattach" undersells it.
+
 #### Binding
 
 Loopback by default. The bind address and the URL advertised in the agent card
@@ -442,6 +527,27 @@ Everything the UI needs is behind the three Protocols in `interfaces.py`. That i
 what lets `tests/mock/mock_objects_streamlit.py` satisfy them and let the whole
 UI run with no services — note that **production code imports from `tests/`** for
 the mock implementations, which is unusual and load-bearing.
+
+```mermaid
+flowchart TD
+    APP["app.py - synchronous script"] --> SVC["PenTestAgentService"]
+    SVC --> IFACE["3 Protocols"]
+    IFACE --> REAL["real_backend.py adapters"]
+    IFACE --> MOCK["tests/mock<br/>mock_objects_streamlit.py"]
+
+    REAL --> LOOP["EventLoopThread<br/>one persistent asyncio loop<br/>bridges sync UI to async agent"]
+    LOOP --> AD1["RealCheckpointerAdapter<br/>checkpoint_ns = 'ui'<br/>fixed id 'ui'<br/>metadata source=ui"]
+    LOOP --> AD2["RealFileStoreAdapter<br/>slash-prefixed keys"]
+    LOOP --> AD3["RealAgentRunnerAdapter<br/>queue -> event generator"]
+
+    AD1 --> CP[("Checkpointer<br/>UI history in its OWN namespace")]
+    AD2 --> ST[("Store<br/>files")]
+    AD3 --> EV["events: tool_call / tool_result<br/>token / message / error"]
+```
+
+The `checkpoint_ns` split in that diagram is Invariant 2 below, and it is the one
+that destroys data if it is violated: the UI writes its display history into the
+agent's own namespace, the agent's state is gone.
 
 ### The sync/async bridge
 
