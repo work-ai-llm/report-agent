@@ -36,6 +36,43 @@ The two surfaces share **only** `AgentRuntime`. They do not share transport,
 state, session identity, or a persistence convention — which is deliberate, and
 is why either can be developed, broken, or removed without touching the other.
 
+The same shape again, showing what each surface reaches for on its way through:
+
+```mermaid
+flowchart LR
+    subgraph entrypoints["Entry points"]
+        A2A["A2A server<br/>a2a_connector.py"]
+        UI["Streamlit UI<br/>streamlit_ui/"]
+        CLI["dev_tools CLIs<br/>a2a_cli / store_cli"]
+    end
+
+    RT["AgentRuntime<br/>report_agent.py"]
+
+    subgraph agentcore["Agent core"]
+        LLM["Chat model<br/>1 per call"]
+        MW["Middleware stack"]
+        TOOLS["8 tools"]
+        GRAPH["LangGraph agent<br/>create_agent"]
+    end
+
+    subgraph persist["Persistence"]
+        CP["Checkpointer<br/>conversation per thread_id"]
+        ST["Store<br/>virtual filesystem"]
+    end
+
+    LF["Langfuse<br/>tracing"]
+
+    A2A --> RT
+    UI --> RT
+    CLI --> RT
+    RT --> LLM --> GRAPH
+    GRAPH <--> MW
+    GRAPH <--> TOOLS
+    GRAPH <--> CP
+    GRAPH <--> ST
+    GRAPH -. callbacks .-> LF
+```
+
 Cite symbols rather than line numbers in this file. Line numbers rot on every
 edit above them, and they are the main reason this document was wrong for months.
 
@@ -58,6 +95,73 @@ asserts that.
 | `_init_pool` | Checkpointer + store. Postgres if reachable, SQLite otherwise. |
 | `_create_agent` | Compiles the LangGraph agent via `create_agent`. |
 | `_reload_llm_credential` | Re-reads the API key after an auth failure and patches the live clients. |
+
+One turn, end to end:
+
+```mermaid
+flowchart TD
+    Q["query + thread_id"] --> A
+
+    subgraph A["AgentRuntime._init_llm - built ONCE per process"]
+        direction TB
+        SEL{"LLM_BACKEND"}
+        SEL -->|"openai_local"| OAI["ReasoningChatOpenAI<br/>base_url from env<br/>stream_usage=True"]
+        SEL -->|"openrouter"| OR["ChatOpenRouter<br/>timeout in MILLISECONDS"]
+        SEL -->|"mistral"| MI["ChatMistralAI"]
+        OAI --> SMALL
+        OR --> SMALL
+        MI --> SMALL
+        SMALL["llm_small<br/>built but only used<br/>when debug_mode=True"]
+    end
+
+    subgraph M["Middleware stack"]
+        direction LR
+        M1["SkillsMiddleware<br/>always · injects only<br/>name + description"]
+        M2["LLMToolEmulator<br/>debug_mode only"]
+        M3["FilesystemMiddleware<br/>always"]
+        M4["CredentialRefresh<br/>RetryMiddleware<br/>always"]
+    end
+
+    subgraph T["8 tools advertised to the model"]
+        direction LR
+        T1["ls / read_file<br/>write_file / edit_file"]
+        T2["glob / grep"]
+        T3["export_report_to_local_disk"]
+        T4["execute<br/>ADVERTISED BUT INERT"]
+    end
+
+    subgraph V["Virtual filesystem - 3 routes"]
+        direction LR
+        V1["/context/<br/>PERSISTENT store<br/>namespace filesystem"]
+        V2["/skills/<br/>REAL DISK<br/>agent/skills/"]
+        V3["everything else<br/>EPHEMERAL<br/>/scratchpad/"]
+    end
+
+    CP[("Checkpointer<br/>messages per thread_id")]
+    ST[("Store<br/>files")]
+
+    A --> MW --> G["LangGraph graph<br/>stream_mode=updates"]
+    G -->|tool_calls| T
+    T -->|filesystem ops| V
+    V1 <--> ST
+    V2 <--> DISK2[("agent/skills/<br/>real local disk")]
+    V3 -->|"ephemeral drafts"| CP
+    T3 -->|"write to real disk"| DISK[("agent/exported_reports/")]
+    G <-->|"resume state"| CP
+    G --> LF["Langfuse<br/>CallbackHandler"]
+```
+
+`execute` is worth a note, because it is advertised and cannot work.
+`FilesystemMiddleware` lists it among its tools, but `CompositeBackend.execute()`
+delegates to whatever the *default* backend is and raises `NotImplementedError`
+unless that backend implements `SandboxBackendProtocol` — ours is `StateBackend`,
+which does not. So the model can call it and will always get
+`Default backend doesn't support command execution (SandboxBackendProtocol)`.
+
+That is a wasted turn today, and a latent capability tomorrow: the moment
+someone routes a sandbox backend in as the default, the agent silently gains
+shell execution with no code change and no review. Worth a guard before that
+happens rather than after.
 
 ### Model selection
 
@@ -139,6 +243,43 @@ it up, wire it per backend rather than globally.
 (`connect_timeout=3`, pool open wrapped in a 4s `wait_for`) so an unreachable
 database degrades fast instead of hanging boot.
 
+```mermaid
+flowchart TD
+    INIT["_init_pool"] --> CHECK
+
+    CHECK{"POSTGRES_URI set<br/>AND not forced to SQLite?"}
+
+    CHECK -->|"yes"| POOL["AsyncConnectionPool<br/>connect_timeout=3<br/>open wrapped in wait_for 4.0"]
+    POOL --> PSAV["AsyncPostgresSaver"]
+    POOL --> PSTORE["AsyncPostgresStore"]
+    PSAV --> PG[("Postgres")]
+    PSTORE --> PG
+    PSAV -.->|"runtime.pool"| CLOSE1["pool.close()<br/>closes EVERYTHING"]
+
+    CHECK -->|"no / unreachable"| WARN["print warning<br/>fall through"]
+    WARN --> CONN1["aiosqlite connection 1<br/>-> checkpointer"]
+    WARN --> CONN2["aiosqlite connection 2<br/>-> store"]
+    CONN1 --> SQLITE[("agent_session.db<br/>WAL mode")]
+    CONN2 --> SQLITE
+    CONN1 -.->|"saver.conn"| CLOSE2["conn.close()<br/>ONE AT A TIME"]
+    CONN2 -.->|"store.conn"| CLOSE2
+    SQLITE -.->|"pool is None"| CLOSE1
+```
+
+**The two backends are not symmetric at shutdown**, and that is the trap here.
+On Postgres there is one object to close and closing it is sufficient. On SQLite
+there are two independent `aiosqlite` connections, and each owns a **non-daemon**
+worker thread parked in `while True: tx.get()`, which only exits when its
+connection object is finalised. Close neither and the interpreter blocks forever
+in `threading._shutdown()` waiting on their thread sentinels — after uvicorn has
+already printed `Finished server process` and released the port, so the process
+looks hung and Ctrl-C does nothing, because there is no application code left to
+interrupt.
+
+`dev_tools/store_cli.py` has always closed these two connections for exactly this
+reason. The A2A lifespan did not, which is why `agent/a2a_connector.py` now tears
+down each connection individually.
+
 Two namespaces matter:
 
 - **`""`** — owned by the agent. Its conversation state.
@@ -184,6 +325,37 @@ handler rather than failing startup.
 Token counts require `stream_usage=True` on the `ChatOpenAI` branch only. The
 OpenRouter and Mistral branches do not request usage, so their generations report
 no token counts.
+
+```mermaid
+flowchart LR
+    GRAPH["LangGraph graph"] --> CB["config callbacks"]
+
+    CB --> LH["Langfuse CallbackHandler<br/>bound via with_config"]
+    CB --> OTEL["OpenTelemetry<br/>a2a SDK telemetry"]
+
+    LH -->|startup| AUTH["auth_check()<br/>BLOCKING network call<br/>before the model is built"]
+    AUTH -->|"fail / offline"| NOOP["no-op handler<br/>runs without observability"]
+
+    LH --> SESSION["session grouping<br/>metadata: langfuse_session_id<br/>= context_id"]
+
+    GRAPH --> TOK["AIMessage.usage_metadata<br/>input_tokens / output_tokens<br/>input_token_details.cache_read"]
+    TOK --> LH
+    LH --> CALC["Langfuse computes<br/>input = input_tokens - cache_read"]
+
+    CALC --> UIVIEW["Langfuse UI:<br/>trace per turn<br/>usage, cost, latency"]
+```
+
+Three things worth being candid about:
+
+- **Grouping a turn into one session depends on one metadata key.** `session.id`
+  is not recognised by the handler, so using it silently yields one trace per
+  model call. `langfuse_session_id` is the key that works.
+- **`auth_check()` is a blocking network call at startup**, before the model is
+  even constructed, so an unreachable Langfuse adds latency to boot rather than
+  failing it.
+- **`input` in Langfuse is net of cached prompt tokens.** With heavy prompt
+  caching the raw `input_tokens` badly overstates cost; the handler already
+  subtracts for you, so cost math does not need to correct for it.
 
 ---
 
